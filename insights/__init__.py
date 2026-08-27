@@ -1,1 +1,3 @@
-"""Insights service — precomputed analytics and music trends."""
+"""Scheduled and precomputed analytics for GrooveMap."""
+
+__version__ = "0.1.0"

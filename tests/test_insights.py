@@ -4,10 +4,10 @@ import asyncio
 from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from fastapi.testclient import TestClient
 import pytest
+from fastapi.testclient import TestClient
 
-from tests.insights.conftest import TEST_CACHE_GENERATION
+from tests.conftest import TEST_CACHE_GENERATION
 
 
 class TestHealthEndpoint:

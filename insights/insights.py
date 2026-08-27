@@ -7,22 +7,22 @@ API endpoints.
 """
 
 import asyncio
-from collections.abc import AsyncGenerator
 import contextlib
+import os
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-import os
 from pathlib import Path
 from typing import Any, cast
 
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
 import httpx
 import redis.asyncio as aioredis
 import structlog
 import uvicorn
-
 from common import AsyncPostgreSQLPool, HealthServer, parse_postgres_host_port, setup_logging
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
+
 from insights.cache import InsightsCache
 from insights.computations import endpoint_timeout, run_all_computations
 from insights.config import InsightsConfig
@@ -196,7 +196,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
 
 
 app = FastAPI(
-    title="Discogsography Insights",
+    title="GrooveMap Analytics Engine",
     version="0.1.0",
     description="Precomputed analytics and music trends",
     default_response_class=JSONResponse,

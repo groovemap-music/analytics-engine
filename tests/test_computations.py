@@ -772,14 +772,13 @@ class TestEndpointTimeouts:
         assert read >= 1200.0
 
     def test_community_enrichment_budget_covers_the_capped_batch(self) -> None:
-        """1 Discogs req/s * MAX_ENRICHMENT_RELEASES must fit inside the read budget."""
-        from api.routers.insights_compute import _ENRICHMENT_DELAY_SECONDS, MAX_ENRICHMENT_RELEASES
+        """The producer-published processing budget must fit inside the read budget."""
+        from insights.catalog_api_contract import COMMUNITY_ENRICHMENT_MAX_PROCESSING_SECONDS
         from insights.computations import endpoint_timeout
 
         read = endpoint_timeout("/api/internal/insights/community-enrichment").read
         assert read is not None
-        worst_case = MAX_ENRICHMENT_RELEASES * _ENRICHMENT_DELAY_SECONDS
-        assert read > worst_case, f"read budget {read}s does not cover worst case {worst_case}s"
+        assert read > COMMUNITY_ENRICHMENT_MAX_PROCESSING_SECONDS
 
     def test_rarity_read_budget_clears_the_neo4j_transaction_timeout(self) -> None:
         """Must outlast the server-side db.transaction.timeout (600s) plus overhead."""

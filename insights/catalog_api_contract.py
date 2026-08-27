@@ -8,3 +8,4 @@ DATA_COMPLETENESS_PATH = "/api/internal/insights/data-completeness"
 GENRE_TRENDS_PATH = "/api/internal/insights/genre-trends"
 LABEL_LONGEVITY_PATH = "/api/internal/insights/label-longevity"
 RARITY_SCORES_PATH = "/api/internal/insights/rarity-scores"
+COMMUNITY_ENRICHMENT_MAX_PROCESSING_SECONDS = 1500

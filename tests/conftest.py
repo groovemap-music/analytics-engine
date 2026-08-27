@@ -2,9 +2,9 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
-from fastapi.testclient import TestClient
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 
 # Arbitrary non-zero generation — proves endpoints use the value they read.

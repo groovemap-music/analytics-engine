@@ -12,11 +12,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 import structlog
-
 from common import describe_exception
+
 from insights.catalog_api_contract import (
     ANNIVERSARIES_PATH,
     ARTIST_CENTRALITY_PATH,
+    COMMUNITY_ENRICHMENT_MAX_PROCESSING_SECONDS,
     COMMUNITY_ENRICHMENT_PATH,
     DATA_COMPLETENESS_PATH,
     GENRE_TRENDS_PATH,
@@ -50,8 +51,8 @@ logger = structlog.get_logger(__name__)
 #   data-completeness     ~400s releases seq scan (>600s on bad         1800s
 #                         days); API caches the result for 6h
 #   rarity-scores         chunked full-graph Neo4j scans                1800s
-#   community-enrichment  1 Discogs request/second, capped at           3600s
-#                         MAX_ENRICHMENT_RELEASES per invocation
+#   community-enrichment  API-published bounded processing time plus    1800s
+#                         20% transport/storage headroom
 #   everything else       full-graph Neo4j aggregations                  900s
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _WRITE_TIMEOUT_SECONDS = 30.0
@@ -61,7 +62,7 @@ DEFAULT_READ_TIMEOUT_SECONDS = 900.0
 ENDPOINT_READ_TIMEOUTS: dict[str, float] = {
     DATA_COMPLETENESS_PATH: 1800.0,
     RARITY_SCORES_PATH: 1800.0,
-    COMMUNITY_ENRICHMENT_PATH: 3600.0,
+    COMMUNITY_ENRICHMENT_PATH: COMMUNITY_ENRICHMENT_MAX_PROCESSING_SECONDS * 1.2,
 }
 
 
