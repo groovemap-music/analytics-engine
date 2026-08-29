@@ -23,7 +23,7 @@ typecheck:
     uv run mypy
 
 test:
-    uv run pytest --cov=insights --cov-report=term-missing
+    uv run pytest --cov=insights --cov-report=term-missing --cov-report=xml
 
 build:
     uv build --out-dir dist --clear
@@ -41,7 +41,7 @@ audit:
 prepare-runtime-wheel:
     bash scripts/prepare-runtime-wheel.sh
 
-image: prepare-runtime-wheel
+image: build prepare-runtime-wheel
     bash scripts/build-image.sh
     docker run --rm --entrypoint /app/.venv/bin/python analytics-engine:local -c 'import insights.insights'
     test "$(docker run --rm --entrypoint /usr/bin/id analytics-engine:local -u):$(docker run --rm --entrypoint /usr/bin/id analytics-engine:local -g)" = "1000:1000"

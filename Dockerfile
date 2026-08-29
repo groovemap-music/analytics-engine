@@ -8,15 +8,12 @@ RUN pip install --no-cache-dir uv==0.12.5
 WORKDIR /app
 
 COPY .build/runtime/*.whl /wheels/
-COPY pyproject.toml README.md LICENSE ./
-COPY insights/ ./insights/
+COPY .build/requirements.txt /wheels/
+COPY dist/groovemap_analytics_engine-*.whl /wheels/
 
 RUN uv venv /app/.venv && \
-    uv pip install --python /app/.venv/bin/python \
-      "/wheels/$(basename "$(find /wheels -name '*.whl' -print -quit)")[postgres]" \
-      "fastapi==0.141.1" "httpx==0.28.1" "pydantic==2.13.4" \
-      "redis[hiredis]==8.1.0" "structlog==26.1.0" "uvicorn[standard]==0.52.4" && \
-    uv pip install --python /app/.venv/bin/python --no-deps . && \
+    uv pip install --python /app/.venv/bin/python --require-hashes --requirements /wheels/requirements.txt && \
+    uv pip install --python /app/.venv/bin/python --no-deps /wheels/*.whl && \
     find /app/.venv -type f -name '*.py[co]' -delete && \
     find /app/.venv -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
@@ -26,7 +23,7 @@ ARG BUILD_DATE
 ARG BUILD_VERSION=0.1.0
 ARG VCS_REF
 
-LABEL org.opencontainers.image.title="GrooveMap analytics engine" \
+LABEL org.opencontainers.image.title="analytics-engine" \
       org.opencontainers.image.description="Compute and cache scheduled music analytics" \
       org.opencontainers.image.authors="Robert Wlodarczyk <robert@simplicityguy.com>" \
       org.opencontainers.image.url="https://groovemap.music" \

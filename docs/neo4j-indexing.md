@@ -232,6 +232,6 @@ All schema objects are defined in `schema-init/neo4j_schema.py` in the `SCHEMA_S
 
 ## Related Documentation
 
-- [Database Schema](./database-schema.md)
+- [Database Schema](https://github.com/groovemap-music/database-schema)
 - [Performance Guide](./performance-guide.md)
 - [Query Performance Optimizations](./query-performance-optimizations.md)

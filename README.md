@@ -44,4 +44,5 @@ The Docker build only needs this repository plus a locally prepared wheel for th
 
 The project is independently versioned from PEP 621 metadata with Commitizen and `v$version` annotated tags. Migration verification is deliberately non-publishing. A hosted release workflow remains disabled until a short-lived GitHub App installation token can read the private runtime repository and an approved artifact publishing identity is designed.
 
-See [docs/extraction.md](docs/extraction.md) for source-history provenance and the retained path set.
+See the [documentation index](docs/README.md) for database behavior, performance guidance,
+and retained design records.
