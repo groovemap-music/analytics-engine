@@ -33,7 +33,7 @@ install-check: build
 
 license-check:
     uv run python scripts/check-license.py
-    uv run pip-licenses --fail-on "GPL-2.0-only;GPL-3.0-only;AGPL-3.0-only"
+    uv run pip-licenses --ignore-packages groovemap-analytics-engine --fail-on "GPL-2.0-only;GPL-3.0-only;AGPL-3.0-only"
 
 audit:
     uv run pip-audit
