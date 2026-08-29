@@ -2,7 +2,9 @@
 
 Private, independently versioned service for scheduled music analytics. It obtains raw graph and catalog inputs from `catalog-api`, stores precomputed results in PostgreSQL, uses Redis for cache-aside reads, and exposes an internal FastAPI service on port 8008 with health checks on port 8009.
 
-This source is available under the [PolyForm Noncommercial License 1.0.0](LICENSE). Commercial use requires a separate license.
+This project is licensed under the [GNU Affero General Public License v3.0 only](LICENSE). Commercial use is permitted under the AGPL when its terms are followed; [alternative commercial terms may be negotiated](COMMERCIAL-LICENSING.md).
+
+External contributions are temporarily paused until a relicensing-capable contributor agreement is approved. See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes.
 
 ## Development
 
