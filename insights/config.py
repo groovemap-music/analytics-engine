@@ -1,4 +1,4 @@
-"""Analytics engine configuration owned by the insights service."""
+"""Configuration for the GrooveMap analytics engine."""
 
 from dataclasses import dataclass, field
 from os import getenv

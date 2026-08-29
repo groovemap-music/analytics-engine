@@ -1,31 +1,15 @@
 # Extraction provenance
 
-This repository was extracted without modifying the source monorepo. Its `main` history contains 103 commits relevant to the analytics service before the standalone-establishment commit.
+`analytics-engine` was extracted from the former GrooveMap monolith as an independently versioned service. The extraction retained service-owned implementation and tests while replacing source-tree imports with explicit repository contracts.
 
-Source: `SimplicityGuy/discogsography`, bead branch `wt/bead/issue/discogsography-2kpm.19`.
+## Ownership after extraction
 
-The reproducible extraction used an isolated clone and `git-filter-repo`:
+- This repository owns scheduled computation, PostgreSQL result persistence, Redis cache behavior, and read-only analytics endpoints.
+- `catalog-api` owns raw graph and catalog queries. This service consumes its promoted internal HTTP contract from `contracts/catalog-api/internal-insights/v1/`.
+- `database-schema` owns PostgreSQL schema initialization.
+- `python-libraries` owns shared runtime, resilience, configuration, and health-server helpers.
+- `deployment` owns service orchestration, secret delivery, and environment-specific configuration.
 
-```bash
-git clone --no-local --branch wt/bead/issue/discogsography-2kpm.19 \
-  /Users/Robert/workspaces/github/SimplicityGuy/discogsography analytics-engine
-cd analytics-engine
-git filter-repo --force \
-  --path insights/ \
-  --path tests/insights/ \
-  --path LICENSE \
-  --path docs/database-resilience.md \
-  --path docs/neo4j-indexing.md \
-  --path docs/performance-guide.md \
-  --path docs/postgres-pool-exhaustion-analysis.md \
-  --path docs/query-performance-optimizations.md \
-  --path docs/superpowers/plans/2026-03-25-release-rarity-scoring-phase1.md \
-  --path docs/superpowers/specs/2026-03-25-release-rarity-scoring-phase1-design.md \
-  --path docs/superpowers/plans/2026-04-11-community-enrichment-rarity.md \
-  --path docs/superpowers/specs/2026-04-11-community-enrichment-rarity-design.md \
-  --path docs/superpowers/plans/2026-05-21-neo4j-bolt-tls.md \
-  --path docs/superpowers/specs/2026-05-21-neo4j-bolt-tls-design.md \
-  --path-rename tests/insights/:tests/
-```
+The service does not import from sibling checkouts or require a monorepo build context. `scripts/prepare-runtime-wheel.sh` verifies the exact `python-libraries` revision before staging its wheel for installation and image builds.
 
-No source tags were copied because the monorepo tags do not unambiguously version this service. API query implementation tests were assigned to `catalog-api`, while service-owned tests remain here. The source PolyForm Noncommercial 1.0.0 license was retained.
+Historical licensing is recorded in [NOTICE](../NOTICE). Historical implementation plans are preserved privately; the current architecture decisions that remain operative are documented in [architecture.md](architecture.md).

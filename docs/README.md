@@ -1,10 +1,10 @@
-# Analytics engine documentation
+# Analytics-engine documentation
 
-- [Database resilience](database-resilience.md)
-- [Neo4j indexing](neo4j-indexing.md)
-- [Performance guide](performance-guide.md)
-- [PostgreSQL pool exhaustion analysis](postgres-pool-exhaustion-analysis.md)
-- [Query performance optimizations](query-performance-optimizations.md)
-- [Source-history provenance](extraction.md)
-- [Plans](superpowers/plans/) and [design specifications](superpowers/specs/) retained from
-  feature development
+This directory documents the responsibilities and operating contract of the `analytics-engine` repository.
+
+- [Architecture](architecture.md) — service boundaries, data flow, precomputation, and cache consistency.
+- [Operations](operations.md) — configuration, health, scheduling, shutdown, and failure behavior.
+- [Release compliance](release-compliance.md) — package, image, automation, dependency, and publication-readiness checks.
+- [Extraction provenance](extraction.md) — what moved from the monolith and which repositories own adjacent responsibilities.
+
+The complete HTTP request and response schema consumed from `catalog-api` is promoted under `contracts/catalog-api/internal-insights/v1/`. Historical implementation plans are preserved in the private organization planning archive rather than published as current product documentation.

@@ -23,9 +23,6 @@ ARG BUILD_DATE
 ARG BUILD_VERSION=0.1.0
 ARG VCS_REF
 
-RUN case "${VCS_REF}" in *[!0-9a-f]*|"") exit 1 ;; esac && \
-    [ "${#VCS_REF}" -eq 40 ]
-
 LABEL org.opencontainers.image.title="analytics-engine" \
       org.opencontainers.image.description="Compute and cache scheduled music analytics" \
       org.opencontainers.image.authors="Robert Wlodarczyk <robert@simplicityguy.com>" \

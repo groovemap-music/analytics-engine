@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   publish:
-    uses: groovemap-music/.github/.github/workflows/reusable-image-release.yml@main
+    uses: groovemap-music/.github/.github/workflows/reusable-image-release.yml@c5bf723cad17fa10c0b758a005d6565f47f04f36
     with:
       image-name: analytics-engine
       requires-private-library: true

@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: "0 1 * * 6"
+    - cron: "0 4 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -11,7 +14,7 @@ permissions:
 
 jobs:
   ci:
-    uses: groovemap-music/.github/.github/workflows/reusable-ci.yml@main
+    uses: groovemap-music/.github/.github/workflows/reusable-ci.yml@c5bf723cad17fa10c0b758a005d6565f47f04f36
     with:
       runner: ubuntu-24.04
       requires-private-library: true

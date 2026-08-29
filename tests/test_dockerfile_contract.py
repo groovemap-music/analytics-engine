@@ -38,6 +38,11 @@ def test_image_metadata_identifies_license_and_exact_source_revision() -> None:
     assert '--build-arg "VCS_REF=${vcs_ref}"' in BUILD_SCRIPT
 
 
+def test_wheel_is_available_to_the_docker_build_context() -> None:
+    ignored = {line.strip().removeprefix("/") for line in (ROOT / ".dockerignore").read_text().splitlines()}
+    assert "dist" not in ignored
+
+
 def test_runtime_user_is_numeric_and_non_root() -> None:
     users = [line.removeprefix("USER ") for line in _instructions() if line.startswith("USER ")]
     assert users

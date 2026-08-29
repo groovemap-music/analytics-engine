@@ -1,4 +1,4 @@
-"""Insights microservice — precomputed analytics and music trends.
+"""GrooveMap analytics engine — precomputed analytics and music trends.
 
 Runs scheduled batch computations by fetching raw query results
 from the API service over HTTP, stores precomputed results in
@@ -23,6 +23,7 @@ from common import AsyncPostgreSQLPool, HealthServer, parse_postgres_host_port, 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
+from insights import __version__
 from insights.cache import InsightsCache
 from insights.computations import endpoint_timeout, run_all_computations
 from insights.config import InsightsConfig
@@ -38,6 +39,10 @@ from insights.models import (
 
 
 logger = structlog.get_logger(__name__)
+
+SERVICE_NAME = "analytics-engine"
+SOURCE_URL = "https://github.com/groovemap-music/analytics-engine"
+USER_AGENT = f"{SERVICE_NAME}/{__version__} (+{SOURCE_URL})"
 
 STARTUP_BANNER = r"""
                 _      _   _                         _
@@ -64,7 +69,7 @@ _last_computation: datetime | None = None
 def get_health_data() -> dict[str, Any]:
     """Return health data for the health server."""
     return {
-        "service": "insights",
+        "service": SERVICE_NAME,
         "status": "healthy" if _pool and _http_client else "starting",
         "timestamp": datetime.now(UTC).isoformat(),
         "last_computation": _last_computation.isoformat() if _last_computation else None,
@@ -110,8 +115,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     """Manage service lifecycle — connect to databases and start scheduler."""
     global _config, _pool, _http_client, _redis, _cache, _scheduler_task
 
-    setup_logging("insights", log_file=Path("/logs/insights.log"))
-    logger.info("🚀 Insights service starting...")
+    setup_logging(SERVICE_NAME, log_file=Path(f"/logs/{SERVICE_NAME}.log"))
+    logger.info("🚀 Analytics engine starting...")
 
     _config = InsightsConfig.from_env()
 
@@ -138,7 +143,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
 
     # Initialize HTTP client for API service. The API's /api/internal/insights/*
     # endpoints are gated by a shared secret; present it on every request.
-    _client_headers: dict[str, str] = {}
+    _client_headers = {"User-Agent": USER_AGENT}
     if _config.internal_secret:
         _client_headers["X-Internal-Secret"] = _config.internal_secret
     else:
@@ -185,11 +190,11 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     )
     logger.info("🔄 Scheduler started", interval_hours=_config.schedule_hours)
 
-    logger.info("✅ Insights service ready", port=INSIGHTS_PORT)
+    logger.info("✅ Analytics engine ready", port=INSIGHTS_PORT)
     yield
 
     # Shutdown
-    logger.info("🔧 Insights service shutting down...")
+    logger.info("🔧 Analytics engine shutting down...")
     if _scheduler_task:
         _scheduler_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -201,7 +206,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     if _pool:
         await _pool.close()
     health_srv.stop()
-    logger.info("✅ Insights service stopped")
+    logger.info("✅ Analytics engine stopped")
 
 
 app = FastAPI(
@@ -513,7 +518,7 @@ async def computation_status() -> JSONResponse:
 
 
 def main() -> None:  # pragma: no cover
-    """Entry point for the Insights service."""
+    """Run the GrooveMap analytics engine."""
     print(STARTUP_BANNER)
     uvicorn.run(app, host="0.0.0.0", port=INSIGHTS_PORT, log_level=os.getenv("LOG_LEVEL", "INFO").lower())  # noqa: S104  # nosec B104
 
