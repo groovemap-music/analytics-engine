@@ -18,7 +18,13 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 license = "AGPL-3.0-only"
-license-files = ["LICENSE"]
+license-files = [
+    "COMMERCIAL-LICENSING.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
+]
 dependencies = [
     "fastapi>=0.141.1",
     "groovemap-runtime[postgres]==0.1.0",
