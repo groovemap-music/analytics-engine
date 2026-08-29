@@ -5,7 +5,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FULL_REVISION = re.compile(r"^[0-9a-f]{40}$")
+AUTOMATION_REVISION = "2f34a4da5c552bc23c75edd3d8d81be0a4b3271c"
+PRIVATE_LIBRARY_REVISION = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
 
 
 def workflow_jobs(text: str) -> set[str]:
@@ -18,19 +19,46 @@ ci = (ROOT / ".github/workflows/ci.yml").read_text()
 assert re.search(r"(?m)^  pull_request:\s*$", ci)
 assert 'cron: "0 1 * * 6"' in ci
 assert 'cron: "0 4 * * 1"' in ci
-assert workflow_jobs(ci) == {"ci"}
 assert "github.actor" not in ci
 assert "dependabot" not in ci.lower()
-ci_target = re.search(r"reusable-ci\.yml@([^\s]+)", ci)
-assert ci_target is not None and FULL_REVISION.fullmatch(ci_target.group(1))
+assert "fallback-command" not in ci
+assert workflow_jobs(ci) == {"required"}
+ci_target = re.search(r"groovemap-music/automation/\.github/workflows/reusable-ci\.yml@([^\s]+)", ci)
+assert ci_target is not None and ci_target.group(1) == AUTOMATION_REVISION
+assert f"private-library-revision: {PRIVATE_LIBRARY_REVISION}" in ci
+assert "private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}" in ci
+assert "PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}" in ci
+assert "CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}" in ci
+assert "secrets: inherit" not in ci
 
 release = (ROOT / ".github/workflows/release.yml").read_text()
-release_target = re.search(r"reusable-image-release\.yml@([^\s]+)", release)
-assert release_target is not None and FULL_REVISION.fullmatch(release_target.group(1))
+release_target = re.search(r"groovemap-music/automation/\.github/workflows/reusable-release\.yml@([^\s]+)", release)
+assert release_target is not None and release_target.group(1) == AUTOMATION_REVISION
+assert f"private-library-revision: {PRIVATE_LIBRARY_REVISION}" in release
+assert "private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}" in release
+assert "PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}" in release
+assert "secrets: inherit" not in release
+
+release_script = (ROOT / "scripts/release-dry-run.sh").read_text()
+assert "--require-hashes" in release_script
+assert "--requirements .build/requirements.txt" in release_script
+assert "--no-deps" in release_script
+assert '"${notices_tmp}/venv/bin/python"' in release_script
 
 workflow_names = {path.name.lower() for path in (ROOT / ".github/workflows").iterdir()}
 assert not any("renovate" in name or "claude" in name for name in workflow_names)
 assert not any(path.name.lower().startswith("renovate") for path in ROOT.iterdir())
+
+legacy_project_name = "discogs" + "ography"
+ignored_scan_directories = {".build", ".git", ".venv", "dist"}
+text_suffixes = {".md", ".py", ".sh", ".toml", ".yaml", ".yml"}
+text_names = {"Dockerfile", "Justfile", "LICENSE", "NOTICE"}
+for path in ROOT.rglob("*"):
+    if not path.is_file() or ignored_scan_directories.intersection(path.parts):
+        continue
+    if path.suffix not in text_suffixes and path.name not in text_names:
+        continue
+    assert legacy_project_name not in path.read_text(errors="ignore").lower(), path.relative_to(ROOT)
 
 private_planning = (
     ROOT / ".planning",

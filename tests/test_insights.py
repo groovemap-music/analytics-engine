@@ -173,7 +173,7 @@ class TestGenreTrendsCacheIntegration:
         test_client_with_cache: TestClient,
         mock_cache: AsyncMock,
     ) -> None:
-        """Regression discogsography-qjri: a prior `.replace(':', '_')` sanitization
+        """A prior `.replace(':', '_')` sanitization
         was non-injective — genre="A:B" and genre="A_B" both produced cache key
         "insights:genre-trends:A_B" and were served each other's cached response.
         The cache key must preserve the raw genre value (interior colons are
@@ -611,7 +611,7 @@ class TestLifespan:
 
     @pytest.mark.asyncio
     async def test_lifespan_closes_redis_client_when_ping_fails(self) -> None:
-        """discogsography-v1g8: from_url() is lazy — ping() is what actually
+        """from_url() is lazy — ping() is what actually
         opens the socket. If ping() raises (e.g. requirepass with a missing/
         wrong REDIS_PASSWORD), the client built by from_url() must still be
         closed before the reference is dropped — otherwise the connection
@@ -788,7 +788,7 @@ _CACHED_ENDPOINTS = [
 
 
 class TestCacheGenerationThreading:
-    """discogsography-cu2.109: every read endpoint must write back to the
+    """Every read endpoint must write back to the
     generation it read from, so a request straddling a recompute cannot
     re-cache pre-update data over freshly computed results.
     """

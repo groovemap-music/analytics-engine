@@ -171,7 +171,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         # this, the reference is dropped with no deterministic cleanup and
         # the module's own shutdown convention (line 179: `if _redis: await
         # _redis.aclose()`) becomes a no-op here since _redis is already None
-        # (discogsography-v1g8).
+        # (redis-client-cleanup regression).
         if _redis is not None:
             with contextlib.suppress(Exception):
                 await _redis.aclose()
@@ -270,7 +270,7 @@ async def genre_trends(genre: str = Query(...)) -> JSONResponse:
     # colons in `genre` are harmless. A prior `.replace(':', '_')` was a lossy,
     # non-injective mapping ("A:B" and "A_B" collided onto one key) that
     # defended against nothing while corrupting distinct genres' cached
-    # responses (discogsography-qjri).
+    # responses (genre-cache-key collision regression).
     cache_key = f"insights:genre-trends:{genre}"
     # Read the generation BEFORE the DB read — see insights/cache.py.
     generation = await _cache.generation() if _cache else 0

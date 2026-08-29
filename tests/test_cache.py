@@ -105,7 +105,7 @@ class TestCacheGeneration:
 
 
 class TestCacheAsideRace:
-    """discogsography-cu2.109: a request straddling a recompute must not re-cache stale data.
+    """A request straddling a recompute must not re-cache stale data.
 
     Interleaving that used to poison the cache for a full schedule interval:
       1. endpoint reads OLD rows from Postgres,

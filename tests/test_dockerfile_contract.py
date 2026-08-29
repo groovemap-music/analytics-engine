@@ -36,6 +36,8 @@ def test_image_metadata_identifies_license_and_exact_source_revision() -> None:
     assert 'org.opencontainers.image.revision="${VCS_REF}"' in DOCKERFILE
     assert "rev-parse --verify 'HEAD^{commit}'" in BUILD_SCRIPT
     assert '--build-arg "VCS_REF=${vcs_ref}"' in BUILD_SCRIPT
+    assert 'case "${VCS_REF}" in *[!0-9a-f]*|"") exit 1 ;; esac' in DOCKERFILE
+    assert '[ "${#VCS_REF}" -eq 40 ]' in DOCKERFILE
 
 
 def test_wheel_is_available_to_the_docker_build_context() -> None:

@@ -13,15 +13,26 @@ permissions:
   contents: read
 
 jobs:
-  ci:
-    uses: groovemap-music/.github/.github/workflows/reusable-ci.yml@c5bf723cad17fa10c0b758a005d6565f47f04f36
+  required:
+    uses: groovemap-music/automation/.github/workflows/reusable-ci.yml@2f34a4da5c552bc23c75edd3d8d81be0a4b3271c
     with:
       runner: ubuntu-24.04
-      requires-private-library: true
+      language: python
       setup-command: just setup
       check-command: just check
-      fallback-command: just source-check
+      coverage-command: just test
       audit-command: just audit
+      license-command: just license-check
+      secret-scan-command: just source-check
+      package-command: just build
+      install-command: just install-check
       image-command: just image
+      coverage-files: coverage.xml
       coverage-flags: python,analytics
-    secrets: inherit
+      upload-codecov: true
+      requires-private-library: true
+      private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}
+      private-library-revision: 28fa329702bc76896cc54ab8d05ec5b1bd3d929e
+    secrets:
+      PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
