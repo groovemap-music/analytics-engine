@@ -378,6 +378,22 @@ class TestThisMonthCacheWithData:
 
 
 class TestLifespan:
+    def test_lifespan_annotations_resolve_at_runtime(self) -> None:
+        """Keep Python 3.14's lazy lifespan annotations runtime-resolvable."""
+        import inspect
+        from collections.abc import AsyncGenerator
+        from typing import get_type_hints
+
+        from fastapi import FastAPI
+
+        import insights.insights as _module
+
+        expected = {"_app": FastAPI, "return": AsyncGenerator[None]}
+
+        assert _module.lifespan.__annotations__ == expected
+        assert inspect.get_annotations(_module.lifespan, eval_str=True) == expected
+        assert get_type_hints(_module.lifespan) == expected
+
     @pytest.mark.asyncio
     async def test_lifespan_startup_and_shutdown(self) -> None:
         """Test the full lifespan context manager startup and shutdown paths."""
