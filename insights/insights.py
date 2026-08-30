@@ -9,7 +9,7 @@ API endpoints.
 import asyncio
 import contextlib
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator  # noqa: TC003  # Python 3.14 resolves lifespan annotations at runtime.
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path

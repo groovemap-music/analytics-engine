@@ -24,7 +24,7 @@ class InsightsConfig:
     internal_secret: str | None = field(default=None, repr=False)
 
     @classmethod
-    def from_env(cls) -> "InsightsConfig":
+    def from_env(cls) -> InsightsConfig:
         """Create configuration from environment variables."""
         postgres_username = get_secret("POSTGRES_USERNAME")
         postgres_password = get_secret("POSTGRES_PASSWORD")

@@ -1,6 +1,6 @@
 """Pydantic response models for the insights service."""
 
-from datetime import datetime
+from datetime import datetime  # noqa: TC003  # Pydantic resolves this annotation at runtime.
 
 from pydantic import BaseModel
 
