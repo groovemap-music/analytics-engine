@@ -1,4 +1,4 @@
-"""Pydantic response models for the insights service."""
+"""Pydantic response models for the GrooveMap analytics engine."""
 
 from datetime import datetime
 

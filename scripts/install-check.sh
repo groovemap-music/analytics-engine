@@ -6,5 +6,13 @@ install_tmp="$(mktemp -d)"
 trap 'rm -rf "${install_tmp}"' EXIT
 
 uv venv "${install_tmp}/venv"
-uv pip install --python "${install_tmp}/venv/bin/python" --find-links .build/runtime dist/*.whl
+uv pip install \
+  --python "${install_tmp}/venv/bin/python" \
+  --require-hashes \
+  --requirements .build/requirements.txt
+uv pip install \
+  --python "${install_tmp}/venv/bin/python" \
+  --no-deps \
+  .build/runtime/*.whl \
+  dist/*.whl
 "${install_tmp}/venv/bin/python" -c 'import insights.insights; import insights.config'

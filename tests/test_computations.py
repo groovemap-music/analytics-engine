@@ -153,7 +153,7 @@ _COMPUTATION_ENTRY_POINTS = [
 
 
 class TestReadTimeoutIsDiagnosable:
-    """Regression for the blank error="" production logs (discogsography-ggz6)."""
+    """Regression for blank error text in production timeout logs."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(("func_name", "insight_type"), _COMPUTATION_ENTRY_POINTS)
@@ -748,7 +748,7 @@ class TestComputeAndStoreCommunityEnrichment:
 
 
 class TestEndpointTimeouts:
-    """Regression for ReadTimeout failures on the heavy endpoints (discogsography-1cxi)."""
+    """Regression for ReadTimeout failures on the heavy endpoints."""
 
     def test_connect_budget_is_short_so_a_dead_api_fails_fast(self) -> None:
         from insights.computations import endpoint_timeout

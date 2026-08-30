@@ -61,7 +61,7 @@ def mock_cache() -> AsyncMock:
     """Mock InsightsCache."""
     cache = AsyncMock()
     # A real int, not an AsyncMock sentinel: endpoints must thread this exact
-    # value from generation() through get() and set() (discogsography-cu2.109).
+    # value from generation() through get() and set() (cache-generation regression).
     cache.generation = AsyncMock(return_value=TEST_CACHE_GENERATION)
     cache.get = AsyncMock(return_value=None)
     cache.set = AsyncMock()
