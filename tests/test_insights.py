@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import UTC
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,8 +16,20 @@ class TestHealthEndpoint:
         response = test_client.get("/health")
         assert response.status_code == 200
         data = response.json()
-        assert data["service"] == "insights"
+        assert data["service"] == "analytics-engine"
         assert "status" in data
+
+
+class TestServiceIdentity:
+    def test_runtime_identity_uses_repository_name(self) -> None:
+        from insights import __version__
+        from insights.insights import SERVICE_NAME, SOURCE_URL, STARTUP_BANNER, USER_AGENT, app
+
+        assert SERVICE_NAME == "analytics-engine"
+        assert "analytics-engine" in STARTUP_BANNER
+        assert app.title == "GrooveMap Analytics Engine"
+        assert f"analytics-engine/{__version__} (+https://github.com/groovemap-music/analytics-engine)" == USER_AGENT
+        assert SOURCE_URL == "https://github.com/groovemap-music/analytics-engine"
 
 
 class TestTopArtistsEndpoint:
@@ -160,7 +173,7 @@ class TestGenreTrendsCacheIntegration:
         test_client_with_cache: TestClient,
         mock_cache: AsyncMock,
     ) -> None:
-        """Regression discogsography-qjri: a prior `.replace(':', '_')` sanitization
+        """A prior `.replace(':', '_')` sanitization
         was non-injective — genre="A:B" and genre="A_B" both produced cache key
         "insights:genre-trends:A_B" and were served each other's cached response.
         The cache key must preserve the raw genre value (interior colons are
@@ -435,7 +448,7 @@ class TestLifespan:
         fake_app = FastAPI()
 
         with (
-            patch.object(_module, "setup_logging"),
+            patch.object(_module, "setup_logging") as mock_setup_logging,
             patch.object(_module.InsightsConfig, "from_env", return_value=mock_config),
             patch.object(_module, "HealthServer", return_value=mock_health_srv),
             patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
@@ -449,6 +462,7 @@ class TestLifespan:
                 mock_health_srv.start_background.assert_called_once()
                 mock_pool.initialize.assert_awaited_once()
                 assert _module._cache is mock_cache
+                mock_setup_logging.assert_called_once_with("analytics-engine", log_file=Path("/logs/analytics-engine.log"))
 
             # Verify shutdown
             mock_health_srv.stop.assert_called_once()
@@ -557,6 +571,7 @@ class TestLifespan:
                 # HTTP client built without the internal-secret header.
                 headers = mock_client_cls.call_args.kwargs["headers"]
                 assert "X-Internal-Secret" not in headers
+                assert headers["User-Agent"] == _module.USER_AGENT
 
             # The missing-secret warning was emitted.
             assert any("INSIGHTS_INTERNAL_SECRET is not set" in str(c.args[0]) for c in mock_warning.call_args_list)
@@ -612,7 +627,7 @@ class TestLifespan:
 
     @pytest.mark.asyncio
     async def test_lifespan_closes_redis_client_when_ping_fails(self) -> None:
-        """discogsography-v1g8: from_url() is lazy — ping() is what actually
+        """from_url() is lazy — ping() is what actually
         opens the socket. If ping() raises (e.g. requirepass with a missing/
         wrong REDIS_PASSWORD), the client built by from_url() must still be
         closed before the reference is dropped — otherwise the connection
@@ -789,7 +804,7 @@ _CACHED_ENDPOINTS = [
 
 
 class TestCacheGenerationThreading:
-    """discogsography-cu2.109: every read endpoint must write back to the
+    """Every read endpoint must write back to the
     generation it read from, so a request straddling a recompute cannot
     re-cache pre-update data over freshly computed results.
     """

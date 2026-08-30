@@ -10,10 +10,11 @@ source-check:
     uvx --from ruff==0.16.4 ruff format --check .
     uvx --from ruff==0.16.4 ruff check .
     python scripts/check-contracts.py
+    python scripts/check-repository-compliance.py
     gitleaks git --redact --no-banner
     gitleaks dir . --redact --no-banner
 
-check: source-check typecheck test build install-check license-check bump-preview
+check: source-check typecheck test build install-check license-check release-artifacts bump-preview
 
 format:
     uv run ruff format .
@@ -31,9 +32,9 @@ build:
 install-check: build
     bash scripts/install-check.sh
 
-license-check:
+license-check: build
     uv run python scripts/check-license.py
-    uv run pip-licenses --fail-on "GPL-2.0-only;GPL-3.0-only;AGPL-3.0-only"
+    uv run pip-licenses --ignore-packages groovemap-analytics-engine --fail-on "GPL-2.0-only;GPL-3.0-only;AGPL-3.0-only"
 
 audit:
     uv run pip-audit
@@ -45,6 +46,7 @@ image: build prepare-runtime-wheel
     bash scripts/build-image.sh
     docker run --rm --entrypoint /app/.venv/bin/python analytics-engine:local -c 'import insights.insights'
     test "$(docker run --rm --entrypoint /usr/bin/id analytics-engine:local -u):$(docker run --rm --entrypoint /usr/bin/id analytics-engine:local -g)" = "1000:1000"
+    uv run python scripts/check-image-metadata.py analytics-engine:local
 
 bump-preview:
     uv run cz bump --dry-run --changelog --yes --check-consistency
@@ -54,5 +56,7 @@ bump:
     uv run cz bump --version-files-only --changelog --yes --check-consistency
     uv lock
 
-release-dry-run: check
+release-artifacts: build install-check
     bash scripts/release-dry-run.sh
+
+release-dry-run: check

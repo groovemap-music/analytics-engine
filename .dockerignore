@@ -2,7 +2,6 @@
 python-libraries
 .github
 .venv
-dist
 htmlcov
 **/__pycache__
 **/*.pyc

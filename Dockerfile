@@ -23,6 +23,9 @@ ARG BUILD_DATE
 ARG BUILD_VERSION=0.1.0
 ARG VCS_REF
 
+RUN case "${VCS_REF}" in *[!0-9a-f]*|"") exit 1 ;; esac && \
+    [ "${#VCS_REF}" -eq 40 ]
+
 LABEL org.opencontainers.image.title="analytics-engine" \
       org.opencontainers.image.description="Compute and cache scheduled music analytics" \
       org.opencontainers.image.authors="Robert Wlodarczyk <robert@simplicityguy.com>" \
@@ -30,7 +33,7 @@ LABEL org.opencontainers.image.title="analytics-engine" \
       org.opencontainers.image.documentation="https://github.com/groovemap-music/analytics-engine/blob/main/README.md" \
       org.opencontainers.image.source="https://github.com/groovemap-music/analytics-engine" \
       org.opencontainers.image.vendor="GrooveMap" \
-      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.version="${BUILD_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
