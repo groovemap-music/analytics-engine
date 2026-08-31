@@ -1,12 +1,47 @@
 """Validate repository identity, documentation, and automation policy."""
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 AUTOMATION_REVISION = "2f34a4da5c552bc23c75edd3d8d81be0a4b3271c"
 PRIVATE_LIBRARY_REVISION = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
+GIT = shutil.which("git")
+if GIT is None:
+    raise RuntimeError("git is required to establish the tracked first-party source boundary")
+
+
+def tracked_files(root: Path = ROOT) -> tuple[Path, ...]:
+    """Return the repository's committed-source candidates in Git index order."""
+    result = subprocess.run(  # noqa: S603 - resolved executable and fixed arguments
+        [GIT, "ls-files", "-z"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    return tuple(root / os.fsdecode(name) for name in result.stdout.split(b"\0") if name)
+
+
+def legacy_branding_violations(root: Path = ROOT) -> tuple[Path, ...]:
+    """Return tracked first-party text files that retain the legacy project name."""
+    legacy_project_name = "discogs" + "ography"
+    ignored_scan_directories = {".build", ".git", ".venv", "dist"}
+    text_suffixes = {".md", ".py", ".sh", ".toml", ".yaml", ".yml"}
+    text_names = {"Dockerfile", "Justfile", "LICENSE", "NOTICE"}
+    violations = []
+    for path in tracked_files(root):
+        relative_path = path.relative_to(root)
+        if not path.is_file() or ignored_scan_directories.intersection(relative_path.parts):
+            continue
+        if path.suffix not in text_suffixes and path.name not in text_names:
+            continue
+        if legacy_project_name in path.read_text(errors="ignore").lower():
+            violations.append(relative_path)
+    return tuple(violations)
 
 
 def workflow_jobs(text: str) -> set[str]:
@@ -49,16 +84,10 @@ workflow_names = {path.name.lower() for path in (ROOT / ".github/workflows").ite
 assert not any("renovate" in name or "claude" in name for name in workflow_names)
 assert not any(path.name.lower().startswith("renovate") for path in ROOT.iterdir())
 
-legacy_project_name = "discogs" + "ography"
-ignored_scan_directories = {".build", ".git", ".venv", "dist"}
-text_suffixes = {".md", ".py", ".sh", ".toml", ".yaml", ".yml"}
-text_names = {"Dockerfile", "Justfile", "LICENSE", "NOTICE"}
-for path in ROOT.rglob("*"):
-    if not path.is_file() or ignored_scan_directories.intersection(path.parts):
-        continue
-    if path.suffix not in text_suffixes and path.name not in text_names:
-        continue
-    assert legacy_project_name not in path.read_text(errors="ignore").lower(), path.relative_to(ROOT)
+assert not legacy_branding_violations(), legacy_branding_violations()
+
+build_image = (ROOT / "scripts/build-image.sh").read_text()
+assert 'bash "${repo_root}/scripts/check-image-source.sh"' in build_image
 
 private_planning = (
     ROOT / ".planning",

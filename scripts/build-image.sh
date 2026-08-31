@@ -2,10 +2,7 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
-if [[ -n "$(git -C "${repo_root}" status --short)" ]]; then
-  echo "Refusing to label an image from a dirty source tree." >&2
-  exit 2
-fi
+bash "${repo_root}/scripts/check-image-source.sh"
 
 vcs_ref="$(git -C "${repo_root}" rev-parse --verify 'HEAD^{commit}')"
 if [[ ! "${vcs_ref}" =~ ^[0-9a-f]{40}$ ]]; then
