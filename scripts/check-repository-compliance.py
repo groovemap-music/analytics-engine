@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 AUTOMATION_REVISION = "2f34a4da5c552bc23c75edd3d8d81be0a4b3271c"
-PRIVATE_LIBRARY_REVISION = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
+PYTHON_LIBRARIES_REVISION = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
 GIT = shutil.which("git")
 if GIT is None:
     raise RuntimeError("git is required to establish the tracked first-party source boundary")
@@ -60,9 +60,6 @@ assert "fallback-command" not in ci
 assert workflow_jobs(ci) == {"required"}
 ci_target = re.search(r"groovemap-music/automation/\.github/workflows/reusable-ci\.yml@([^\s]+)", ci)
 assert ci_target is not None and ci_target.group(1) == AUTOMATION_REVISION
-assert f"private-library-revision: {PRIVATE_LIBRARY_REVISION}" in ci
-assert "private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}" in ci
-assert "PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}" in ci
 assert "CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}" in ci
 assert "secrets: inherit" not in ci
 
@@ -70,10 +67,22 @@ release = (ROOT / ".github/workflows/release.yml").read_text()
 assert "attestations: write" in release
 release_target = re.search(r"groovemap-music/automation/\.github/workflows/reusable-release\.yml@([^\s]+)", release)
 assert release_target is not None and release_target.group(1) == AUTOMATION_REVISION
-assert f"private-library-revision: {PRIVATE_LIBRARY_REVISION}" in release
-assert "private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}" in release
-assert "PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}" in release
 assert "secrets: inherit" not in release
+
+private_library_markers = (
+    "requires-private-library",
+    "private-library-client-id",
+    "private-library-revision",
+    "PRIVATE_LIBRARY_PRIVATE_KEY",
+    "GROOVEMAP_CI_APP_CLIENT_ID",
+    "GROOVEMAP_CI_APP_PRIVATE_KEY",
+)
+assert not any(marker in ci for marker in private_library_markers)
+assert not any(marker in release for marker in private_library_markers)
+
+pyproject = (ROOT / "pyproject.toml").read_text()
+assert 'git = "https://github.com/groovemap-music/python-libraries.git"' in pyproject
+assert f'rev = "{PYTHON_LIBRARIES_REVISION}"' in pyproject
 
 release_script = (ROOT / "scripts/release-dry-run.sh").read_text()
 assert "--require-hashes" in release_script
