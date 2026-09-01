@@ -67,6 +67,7 @@ assert "CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}" in ci
 assert "secrets: inherit" not in ci
 
 release = (ROOT / ".github/workflows/release.yml").read_text()
+assert "attestations: write" in release
 release_target = re.search(r"groovemap-music/automation/\.github/workflows/reusable-release\.yml@([^\s]+)", release)
 assert release_target is not None and release_target.group(1) == AUTOMATION_REVISION
 assert f"private-library-revision: {PRIVATE_LIBRARY_REVISION}" in release
