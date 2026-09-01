@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "groovemap-analytics-engine"
-version = "0.1.0"
+version = "0.1.1"
 description = "Compute and cache scheduled music analytics for GrooveMap"
 authors = [{name = "Robert Wlodarczyk", email = "robert@simplicityguy.com"}]
 readme = "README.md"
