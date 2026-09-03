@@ -36,6 +36,8 @@ from typing import Any
 
 import structlog
 
+from insights.telemetry import record_cache_read
+
 
 logger = structlog.get_logger(__name__)
 
@@ -88,15 +90,22 @@ class InsightsCache:
             return 0
 
     async def get(self, key: str, generation: int) -> dict[str, Any] | None:
-        """Get a cached value from ``generation``. Returns None on miss or Redis error."""
+        """Get a cached value from ``generation``. Returns None on miss or Redis error.
+
+        Records ``groovemap.api.cache`` for every read; a Redis error counts as a miss,
+        matching this method's own fall-through-to-database behavior.
+        """
         try:
             raw = await self._redis.get(self.versioned_key(key, generation))
             if raw is None:
+                record_cache_read(hit=False)
                 return None
             result: dict[str, Any] = json.loads(raw)
+            record_cache_read(hit=True)
             return result
         except Exception:
             logger.debug("⚠️ Cache get failed, falling through to database", key=key)
+            record_cache_read(hit=False)
             return None
 
     async def set(self, key: str, value: dict[str, Any], generation: int) -> None:

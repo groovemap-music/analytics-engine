@@ -36,6 +36,8 @@ uv run analytics-engine
 
 Required configuration includes PostgreSQL credentials (`POSTGRES_HOST`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DATABASE`). Optional settings include `API_BASE_URL`, `REDIS_HOST`, `INSIGHTS_INTERNAL_SECRET`, `INSIGHTS_SCHEDULE_HOURS`, `INSIGHTS_MILESTONE_YEARS`, and `LOG_LEVEL`. Supply real secrets through the deployment layer; never commit them here.
 
+OpenTelemetry metrics export to a collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; see [docs/operations.md](docs/operations.md#telemetry) for the full variable list and the metrics this service emits. With no endpoint configured, telemetry is a no-op and the service behaves exactly as it does today.
+
 ## Repository boundary
 
 `catalog-api` owns the internal HTTP interface and query implementations. This repository consumes the promoted contract in `contracts/catalog-api/internal-insights/v1/`; it does not import API source or rely on a sibling checkout. Database schema ownership belongs to `database-schema`; runtime and resilience helpers belong to `python-libraries`; service orchestration and secret examples belong to `deployment`.
