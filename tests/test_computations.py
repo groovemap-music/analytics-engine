@@ -721,6 +721,62 @@ class TestRunAllComputations:
 
         mock_anniv.assert_called_once_with(mock_client, mock_pool, milestone_years=custom_milestones)
 
+    @pytest.mark.asyncio
+    async def test_records_a_success_outcome_for_every_computation(self) -> None:
+        from insights.computations import run_all_computations
+
+        mock_client = AsyncMock()
+        mock_pool = _make_mock_pool()
+
+        with (
+            patch("insights.computations.compute_and_store_artist_centrality", return_value=10),
+            patch("insights.computations.compute_and_store_genre_trends", return_value=20),
+            patch("insights.computations.compute_and_store_label_longevity", return_value=5),
+            patch("insights.computations.compute_and_store_anniversaries", return_value=3),
+            patch("insights.computations.compute_and_store_data_completeness", return_value=4),
+            patch("insights.computations.compute_and_store_community_enrichment", return_value=100),
+            patch("insights.computations.compute_and_store_rarity", return_value=7),
+            patch("insights.computations.record_computation") as mock_record,
+        ):
+            await run_all_computations(mock_client, mock_pool)
+
+        recorded = {call.args[0]: (call.args[1], call.kwargs["success"]) for call in mock_record.call_args_list}
+        assert set(recorded) == {
+            "artist_centrality",
+            "genre_trends",
+            "label_longevity",
+            "anniversaries",
+            "data_completeness",
+            "community_enrichment",
+            "release_rarity",
+        }
+        assert all(success for _duration, success in recorded.values())
+        assert all(duration >= 0 for duration, _success in recorded.values())
+
+    @pytest.mark.asyncio
+    async def test_records_a_failure_outcome_for_a_failed_member_and_still_reports_the_rest(self) -> None:
+        from insights.computations import run_all_computations
+
+        mock_client = AsyncMock()
+        mock_pool = _make_mock_pool()
+
+        with (
+            patch("insights.computations.compute_and_store_artist_centrality", side_effect=RuntimeError("boom")),
+            patch("insights.computations.compute_and_store_genre_trends", return_value=20),
+            patch("insights.computations.compute_and_store_label_longevity", return_value=5),
+            patch("insights.computations.compute_and_store_anniversaries", return_value=3),
+            patch("insights.computations.compute_and_store_data_completeness", return_value=4),
+            patch("insights.computations.compute_and_store_community_enrichment", return_value=100),
+            patch("insights.computations.compute_and_store_rarity", return_value=7),
+            patch("insights.computations.record_computation") as mock_record,
+        ):
+            results = await run_all_computations(mock_client, mock_pool)
+
+        assert "artist_centrality" not in results
+        recorded = {call.args[0]: call.kwargs["success"] for call in mock_record.call_args_list}
+        assert recorded["artist_centrality"] is False
+        assert recorded["genre_trends"] is True
+
 
 class TestComputeAndStoreCommunityEnrichment:
     @pytest.mark.asyncio

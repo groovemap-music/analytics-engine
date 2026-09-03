@@ -7,6 +7,7 @@ Each compute_and_store_* function:
 4. Returns the number of rows written
 """
 
+import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -24,6 +25,7 @@ from insights.catalog_api_contract import (
     LABEL_LONGEVITY_PATH,
     RARITY_SCORES_PATH,
 )
+from insights.telemetry import record_computation
 
 
 if TYPE_CHECKING:
@@ -472,11 +474,15 @@ async def run_all_computations(
     ]
 
     for name, factory in computations:
+        started = time.perf_counter()
         try:
             results[name] = await factory()
         except Exception as e:
+            record_computation(name, time.perf_counter() - started, success=False)
             logger.error("❌ Computation failed — continuing with remaining computations", computation=name, error=describe_exception(e))
             errors[name] = describe_exception(e)
+        else:
+            record_computation(name, time.perf_counter() - started, success=True)
 
     total = sum(results.values())
     logger.info("✅ All insight computations complete", total_rows=total, breakdown=results, failed=list(errors.keys()) or None)
