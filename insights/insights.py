@@ -19,7 +19,16 @@ import httpx
 import redis.asyncio as aioredis
 import structlog
 import uvicorn
-from common import AsyncPostgreSQLPool, HealthServer, parse_postgres_host_port, setup_logging
+from common import (
+    AsyncPostgreSQLPool,
+    HealthServer,
+    instrument_fastapi_app,
+    instrument_httpx,
+    parse_postgres_host_port,
+    setup_logging,
+    setup_telemetry,
+    shutdown_telemetry,
+)
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
@@ -116,6 +125,9 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     global _config, _pool, _http_client, _redis, _cache, _scheduler_task
 
     setup_logging(SERVICE_NAME, log_file=Path(f"/logs/{SERVICE_NAME}.log"))
+    setup_telemetry(SERVICE_NAME)
+    instrument_fastapi_app(_app)
+    instrument_httpx()
     logger.info("🚀 Analytics engine starting...")
 
     _config = InsightsConfig.from_env()
@@ -206,6 +218,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     if _pool:
         await _pool.close()
     health_srv.stop()
+    shutdown_telemetry()
     logger.info("✅ Analytics engine stopped")
 
 

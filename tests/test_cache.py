@@ -1,7 +1,7 @@
 """Tests for insights cache module."""
 
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import fakeredis.aioredis as aioredis_fake
 import pytest
@@ -69,6 +69,30 @@ class TestCacheGet:
     async def test_returns_none_on_redis_error(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
         mock_redis.get.side_effect = ConnectionError("Redis down")
         assert await cache.get("insights:top-artists:10", 0) is None
+
+
+class TestCacheGetTelemetry:
+    """`groovemap.api.cache` must record one outcome per read call, never more or fewer."""
+
+    @pytest.mark.asyncio
+    async def test_records_a_hit(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
+        mock_redis.get.return_value = '{"items": [], "count": 0}'
+        with patch("insights.cache.record_cache_read") as mock_record:
+            await cache.get("insights:top-artists:10", 0)
+        mock_record.assert_called_once_with(hit=True)
+
+    @pytest.mark.asyncio
+    async def test_records_a_miss(self, cache: InsightsCache) -> None:
+        with patch("insights.cache.record_cache_read") as mock_record:
+            await cache.get("insights:top-artists:10", 0)
+        mock_record.assert_called_once_with(hit=False)
+
+    @pytest.mark.asyncio
+    async def test_records_a_miss_on_redis_error(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
+        mock_redis.get.side_effect = ConnectionError("Redis down")
+        with patch("insights.cache.record_cache_read") as mock_record:
+            await cache.get("insights:top-artists:10", 0)
+        mock_record.assert_called_once_with(hit=False)
 
 
 class TestCacheSet:

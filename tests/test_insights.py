@@ -469,6 +469,121 @@ class TestLifespan:
             mock_pool.close.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_lifespan_calls_setup_telemetry_right_after_setup_logging_and_instruments_http(self) -> None:
+        """setup_telemetry runs immediately after setup_logging; both HTTP surfaces are instrumented."""
+        from fastapi import FastAPI
+
+        import insights.insights as _module
+
+        mock_pool = AsyncMock()
+        mock_pool.initialize = AsyncMock()
+        mock_pool.close = AsyncMock()
+
+        mock_redis = AsyncMock()
+        mock_redis.ping = AsyncMock()
+        mock_redis.aclose = AsyncMock()
+
+        mock_http_client = AsyncMock()
+        mock_http_client.aclose = AsyncMock()
+
+        mock_health_srv = MagicMock()
+
+        mock_config = MagicMock()
+        mock_config.postgres_host = "localhost:5432"
+        mock_config.postgres_database = "test"
+        mock_config.postgres_username = "user"
+        mock_config.postgres_password = "pass"
+        mock_config.api_base_url = "http://localhost:8004"
+        mock_config.redis_host = "redis://localhost"
+        mock_config.schedule_hours = 24
+        mock_config.milestone_years = [25, 50]
+
+        async def fake_scheduler(*_args: object, **_kwargs: object) -> None:
+            await asyncio.sleep(100)
+
+        fake_app = FastAPI()
+        call_order: list[str] = []
+
+        with (
+            patch.object(_module, "setup_logging", side_effect=lambda *_a, **_kw: call_order.append("setup_logging")),
+            patch.object(_module, "setup_telemetry", side_effect=lambda *_a, **_kw: call_order.append("setup_telemetry")) as mock_setup_telemetry,
+            patch.object(_module, "instrument_fastapi_app") as mock_instrument_fastapi,
+            patch.object(_module, "instrument_httpx") as mock_instrument_httpx,
+            patch.object(_module, "shutdown_telemetry") as mock_shutdown_telemetry,
+            patch.object(_module.InsightsConfig, "from_env", return_value=mock_config),
+            patch.object(_module, "HealthServer", return_value=mock_health_srv),
+            patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
+            patch("httpx.AsyncClient", return_value=mock_http_client),
+            patch("redis.asyncio.from_url", new_callable=AsyncMock, return_value=mock_redis),
+            patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
+        ):
+            async with _module.lifespan(fake_app):
+                mock_setup_telemetry.assert_called_once_with("analytics-engine")
+                mock_instrument_fastapi.assert_called_once_with(fake_app)
+                mock_instrument_httpx.assert_called_once_with()
+                mock_shutdown_telemetry.assert_not_called()
+
+            # setup_telemetry must run immediately after setup_logging.
+            assert call_order == ["setup_logging", "setup_telemetry"]
+            mock_shutdown_telemetry.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_lifespan_telemetry_is_a_noop_without_an_otel_endpoint(self) -> None:
+        """Regression: with OTEL_EXPORTER_OTLP_ENDPOINT unset, startup/shutdown behave exactly as before.
+
+        setup_telemetry, instrument_fastapi_app, instrument_httpx, and shutdown_telemetry run for
+        real here (unpatched) — conftest's isolated_otel_environment fixture guarantees no OTEL_*
+        variable is set, so every one of them must degrade to a no-op and never raise.
+        """
+        from fastapi import FastAPI
+
+        import insights.insights as _module
+
+        mock_pool = AsyncMock()
+        mock_pool.initialize = AsyncMock()
+        mock_pool.close = AsyncMock()
+
+        mock_redis = AsyncMock()
+        mock_redis.ping = AsyncMock()
+        mock_redis.aclose = AsyncMock()
+
+        mock_http_client = AsyncMock()
+        mock_http_client.aclose = AsyncMock()
+
+        mock_health_srv = MagicMock()
+
+        mock_config = MagicMock()
+        mock_config.postgres_host = "localhost:5432"
+        mock_config.postgres_database = "test"
+        mock_config.postgres_username = "user"
+        mock_config.postgres_password = "pass"
+        mock_config.api_base_url = "http://localhost:8004"
+        mock_config.redis_host = "redis://localhost"
+        mock_config.schedule_hours = 24
+        mock_config.milestone_years = [25, 50]
+
+        async def fake_scheduler(*_args: object, **_kwargs: object) -> None:
+            await asyncio.sleep(100)
+
+        fake_app = FastAPI()
+
+        with (
+            patch.object(_module, "setup_logging"),
+            patch.object(_module.InsightsConfig, "from_env", return_value=mock_config),
+            patch.object(_module, "HealthServer", return_value=mock_health_srv),
+            patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
+            patch("httpx.AsyncClient", return_value=mock_http_client),
+            patch("redis.asyncio.from_url", new_callable=AsyncMock, return_value=mock_redis),
+            patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
+        ):
+            async with _module.lifespan(fake_app):
+                mock_pool.initialize.assert_awaited_once()
+                assert _module._cache is not None
+
+            mock_health_srv.stop.assert_called_once()
+            mock_pool.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_lifespan_postgres_host_without_port(self) -> None:
         """When POSTGRES_HOST has no port suffix, default to port 5432."""
         from fastapi import FastAPI
