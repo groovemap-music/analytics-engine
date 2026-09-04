@@ -2,7 +2,7 @@
 
 from datetime import datetime  # noqa: TC003  # Pydantic resolves this annotation at runtime.
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ArtistCentralityItem(BaseModel):
@@ -63,6 +63,43 @@ class DataCompletenessItem(BaseModel):
     with_country: int = 0
     with_genre: int = 0
     completeness_pct: float = 0.0
+
+
+class ReleaseRarity(BaseModel):
+    """A single release's precomputed rarity score (ADR 0007 media-neutral core plus family extensions)."""
+
+    release_id: int
+    title: str
+    artist_name: str
+    year: int | None
+    rarity_score: float
+    tier: str
+    hidden_gem_score: float
+    pressing_scarcity: float | None = Field(
+        default=None,
+        description="Grooved-only signal (vinyl, shellac, grooved_other); null when no family extension claims the release.",
+    )
+    label_catalog: float
+    format_rarity: float = Field(
+        default=0.0,
+        deprecated=True,
+        description="Deprecated for one minor version: raw Discogs format name signal, superseded by medium_rarity.",
+    )
+    temporal_scarcity: float
+    graph_isolation: float
+    collection_prevalence: float
+    medium_rarity: float | None = Field(
+        default=None,
+        description="Canonical-medium rarity score (ADR 0007); replaces format_rarity.",
+    )
+    media_families: list[str] = Field(
+        default_factory=list,
+        description="Canonical ADR 0007 media family ids the release covers.",
+    )
+    family_signals: dict[str, dict[str, float]] = Field(
+        default_factory=dict,
+        description="Per-family-extension signal scores, keyed by module id (e.g. grooved) to a signal-name-to-score mapping.",
+    )
 
 
 class ComputationStatus(BaseModel):

@@ -326,7 +326,28 @@ class TestReleaseRarityCacheIntegration:
 
         # Return non-empty rows so caching is triggered
         mock_cursor = mock_pg_pool.connection.return_value.__aenter__.return_value.cursor.return_value.__aenter__.return_value
-        mock_cursor.fetchall = AsyncMock(return_value=[(1, "Title", "Artist", 1990, 95.0, "ultra-rare", 80.0, 90.0, 85.0, 70.0, 60.0, 50.0, 40.0)])
+        mock_cursor.fetchall = AsyncMock(
+            return_value=[
+                (
+                    1,
+                    "Title",
+                    "Artist",
+                    1990,
+                    95.0,
+                    "ultra-rare",
+                    80.0,
+                    90.0,
+                    85.0,
+                    70.0,
+                    60.0,
+                    50.0,
+                    40.0,
+                    ["vinyl"],
+                    {"grooved": {"pressing_scarcity": 88.0}},
+                    72.0,
+                )
+            ]
+        )
 
         mock_cache.get.return_value = None
 
@@ -340,6 +361,109 @@ class TestReleaseRarityCacheIntegration:
         assert data["items"][0]["release_id"] == 1
         mock_cache.get.assert_called_once_with("insights:release-rarity:10", TEST_CACHE_GENERATION)
         mock_cache.set.assert_called_once()
+
+    def test_grooved_release_carries_pressing_scarcity_and_family_signals(
+        self,
+        mock_http_client: AsyncMock,
+        mock_pg_pool: AsyncMock,
+        mock_cache: AsyncMock,
+    ) -> None:
+        """A grooved release (vinyl/shellac/grooved_other) carries a populated
+        pressing_scarcity signal alongside its family breakdown (ADR 0007)."""
+        import insights.insights as _module
+
+        _module._http_client = mock_http_client
+        _module._pool = mock_pg_pool
+        _module._cache = mock_cache
+
+        mock_cursor = mock_pg_pool.connection.return_value.__aenter__.return_value.cursor.return_value.__aenter__.return_value
+        mock_cursor.fetchall = AsyncMock(
+            return_value=[
+                (
+                    101,
+                    "Grooved Title",
+                    "Grooved Artist",
+                    1975,
+                    91.0,
+                    "ultra-rare",
+                    77.0,
+                    93.5,  # pressing_scarcity: populated for a grooved medium
+                    82.0,
+                    5.0,  # format_rarity: deprecated, still present at low weight
+                    65.0,
+                    58.0,
+                    41.0,
+                    ["vinyl", "shellac"],
+                    {"grooved": {"pressing_scarcity": 90.0}},
+                    74.0,
+                )
+            ]
+        )
+        mock_cache.get.return_value = None
+
+        from insights.insights import app
+
+        client = TestClient(app)
+        response = client.get("/api/insights/release-rarity?limit=10")
+        assert response.status_code == 200
+        item = response.json()["items"][0]
+        assert item["release_id"] == 101
+        assert item["pressing_scarcity"] == 93.5
+        assert item["media_families"] == ["vinyl", "shellac"]
+        assert item["family_signals"] == {"grooved": {"pressing_scarcity": 90.0}}
+        assert item["medium_rarity"] == 74.0
+        assert item["format_rarity"] == 5.0
+
+    def test_non_grooved_release_has_null_pressing_scarcity_and_empty_family_signals(
+        self,
+        mock_http_client: AsyncMock,
+        mock_pg_pool: AsyncMock,
+        mock_cache: AsyncMock,
+    ) -> None:
+        """A non-grooved release (e.g. digital) has no grooved extension, so
+        pressing_scarcity is null and family_signals carries no entries (ADR 0007)."""
+        import insights.insights as _module
+
+        _module._http_client = mock_http_client
+        _module._pool = mock_pg_pool
+        _module._cache = mock_cache
+
+        mock_cursor = mock_pg_pool.connection.return_value.__aenter__.return_value.cursor.return_value.__aenter__.return_value
+        mock_cursor.fetchall = AsyncMock(
+            return_value=[
+                (
+                    102,
+                    "Digital Title",
+                    "Digital Artist",
+                    2020,
+                    48.0,
+                    "common",
+                    12.0,
+                    None,  # pressing_scarcity: null, no grooved extension claims this release
+                    30.0,
+                    0.0,  # format_rarity: deprecated, at weight 0.0
+                    20.0,
+                    15.0,
+                    55.0,
+                    ["digital"],
+                    {},
+                    38.0,
+                )
+            ]
+        )
+        mock_cache.get.return_value = None
+
+        from insights.insights import app
+
+        client = TestClient(app)
+        response = client.get("/api/insights/release-rarity?limit=10")
+        assert response.status_code == 200
+        item = response.json()["items"][0]
+        assert item["release_id"] == 102
+        assert item["pressing_scarcity"] is None
+        assert item["media_families"] == ["digital"]
+        assert item["family_signals"] == {}
+        assert item["medium_rarity"] == 38.0
 
     def test_cache_hit_returns_cached_data(
         self,
