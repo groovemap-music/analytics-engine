@@ -1,6 +1,6 @@
 """Generated from api/contracts/internal-insights/v1/openapi.yaml; do not edit."""
 
-CONTRACT_VERSION = "1.0.0"
+CONTRACT_VERSION = "1.1.0"
 ANNIVERSARIES_PATH = "/api/internal/insights/anniversaries"
 ARTIST_CENTRALITY_PATH = "/api/internal/insights/artist-centrality"
 COMMUNITY_ENRICHMENT_PATH = "/api/internal/insights/community-enrichment"
