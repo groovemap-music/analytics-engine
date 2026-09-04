@@ -44,6 +44,7 @@ from insights.models import (
     GenreTrendItem,
     GenreTrendsResponse,
     LabelLongevityItem,
+    ReleaseRarity,
 )
 
 
@@ -373,28 +374,31 @@ async def release_rarity(limit: int = Query(50, ge=1, le=500)) -> JSONResponse:
             "SELECT release_id, title, artist_name, year, rarity_score, tier, "
             "hidden_gem_score, pressing_scarcity, label_catalog, "
             "format_rarity, temporal_scarcity, graph_isolation, "
-            "collection_prevalence "
+            "collection_prevalence, media_families, family_signals, medium_rarity "
             "FROM insights.release_rarity ORDER BY rarity_score DESC LIMIT %s",
             (limit,),
         )
         rows = await cursor.fetchall()
 
     items = [
-        {
-            "release_id": r[0],
-            "title": r[1],
-            "artist_name": r[2],
-            "year": r[3],
-            "rarity_score": r[4],
-            "tier": r[5],
-            "hidden_gem_score": r[6],
-            "pressing_scarcity": r[7],
-            "label_catalog": r[8],
-            "format_rarity": r[9],
-            "temporal_scarcity": r[10],
-            "graph_isolation": r[11],
-            "collection_prevalence": r[12],
-        }
+        ReleaseRarity(
+            release_id=r[0],
+            title=r[1],
+            artist_name=r[2],
+            year=r[3],
+            rarity_score=r[4],
+            tier=r[5],
+            hidden_gem_score=r[6],
+            pressing_scarcity=r[7],
+            label_catalog=r[8],
+            format_rarity=r[9],
+            temporal_scarcity=r[10],
+            graph_isolation=r[11],
+            collection_prevalence=r[12],
+            media_families=r[13] or [],
+            family_signals=r[14] or {},
+            medium_rarity=r[15],
+        ).model_dump()
         for r in rows
     ]
     result = {"items": items, "count": len(items)}

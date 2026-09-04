@@ -2,7 +2,7 @@
 openapi: 3.1.0
 info:
   title: GrooveMap internal insights API
-  version: 1.0.0
+  version: 1.1.0
   description: Catalog API-owned contract consumed by the analytics engine.
 security:
   - InternalSecret: []
@@ -50,7 +50,7 @@ paths:
     get:
       operationId: rarity_scores
       responses:
-        "200": {$ref: "#/components/responses/Items"}
+        "200": {$ref: "#/components/responses/RarityScores"}
 components:
   securitySchemes:
     InternalSecret:
@@ -96,6 +96,62 @@ components:
           type: string
           enum: [no_credentials]
       additionalProperties: false
+    RarityScoreItem:
+      description: >-
+        One release's rarity computation. Per ADR 0007 the core score is media-neutral;
+        `pressing_scarcity` is populated only for grooved media (vinyl, shellac,
+        grooved_other) and is `null` otherwise. `format_rarity` is deprecated for one
+        minor version: still computed and present at weight `0.0`, superseded by
+        `medium_rarity`.
+      type: object
+      required:
+        - release_id
+        - title
+        - artist_name
+        - year
+        - rarity_score
+        - tier
+        - hidden_gem_score
+        - pressing_scarcity
+        - label_catalog
+        - format_rarity
+        - temporal_scarcity
+        - graph_isolation
+        - collection_prevalence
+        - medium_rarity
+        - media_families
+        - family_signals
+      properties:
+        release_id: {type: string}
+        title: {type: string}
+        artist_name: {type: string}
+        year: {type: [integer, "null"]}
+        rarity_score: {type: number}
+        tier: {type: string}
+        hidden_gem_score: {type: number}
+        pressing_scarcity:
+          type: [number, "null"]
+          description: Grooved-only signal; `null` when no family extension claims the release.
+        label_catalog: {type: number}
+        format_rarity:
+          type: number
+          deprecated: true
+          description: Raw Discogs format name signal, kept for one minor version at weight 0.0.
+        temporal_scarcity: {type: number}
+        graph_isolation: {type: number}
+        collection_prevalence: {type: number}
+        medium_rarity:
+          type: [number, "null"]
+          description: Canonical-medium rarity score (ADR 0007); replaces `format_rarity`.
+        media_families:
+          type: array
+          items: {type: string}
+          description: Canonical ADR 0007 media family ids the release covers.
+        family_signals:
+          type: object
+          additionalProperties: true
+          description: Per-family-extension signal scores keyed by module id (e.g. `grooved`).
+      additionalProperties: true
   responses:
     Items:
       description: A successful computation input response.
@@ -114,3 +170,15 @@ components:
       content:
         application/json:
           schema: {$ref: "#/components/schemas/CommunityEnrichmentResult"}
+    RarityScores:
+      description: Rarity score data for every release, media-neutral core plus family extensions.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [items]
+            properties:
+              items:
+                type: array
+                items: {$ref: "#/components/schemas/RarityScoreItem"}
+            additionalProperties: false
