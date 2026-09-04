@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, cast
 import httpx
 import structlog
 from common import describe_exception
+from psycopg.types.json import Jsonb
 
 from insights.catalog_api_contract import (
     ANNIVERSARIES_PATH,
@@ -418,8 +419,9 @@ async def compute_and_store_rarity(client: httpx.AsyncClient, pool: Any) -> int:
                                 (release_id, title, artist_name, year, rarity_score, tier,
                                  hidden_gem_score, pressing_scarcity, label_catalog,
                                  format_rarity, temporal_scarcity, graph_isolation,
-                                 collection_prevalence)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                 collection_prevalence, media_families, family_signals,
+                                 medium_rarity)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             """,
                         (
                             row["release_id"],
@@ -429,12 +431,16 @@ async def compute_and_store_rarity(client: httpx.AsyncClient, pool: Any) -> int:
                             row["rarity_score"],
                             row["tier"],
                             row.get("hidden_gem_score"),
+                            # Grooved-only per ADR 0007; null when no family extension claims the release.
                             row.get("pressing_scarcity"),
                             row.get("label_catalog"),
                             row.get("format_rarity"),
                             row.get("temporal_scarcity"),
                             row.get("graph_isolation"),
                             row.get("collection_prevalence"),
+                            Jsonb(row.get("media_families") or []),
+                            Jsonb(row.get("family_signals") or {}),
+                            row.get("medium_rarity"),
                         ),
                     )
         logger.info("💾 Release rarity scores stored", count=len(results))
