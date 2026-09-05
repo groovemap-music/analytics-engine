@@ -1,6 +1,7 @@
 """Tests for insights FastAPI endpoints."""
 
 import asyncio
+import contextlib
 from datetime import UTC
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -633,6 +634,11 @@ class TestLifespan:
             patch.object(_module, "setup_telemetry", side_effect=lambda *_a, **_kw: call_order.append("setup_telemetry")) as mock_setup_telemetry,
             patch.object(_module, "instrument_fastapi_app") as mock_instrument_fastapi,
             patch.object(_module, "instrument_httpx") as mock_instrument_httpx,
+            patch.object(
+                _module,
+                "start_event_loop_monitor",
+                side_effect=lambda *_a, **_kw: call_order.append("start_event_loop_monitor"),
+            ) as mock_start_event_loop_monitor,
             patch.object(_module, "shutdown_telemetry") as mock_shutdown_telemetry,
             patch.object(_module.InsightsConfig, "from_env", return_value=mock_config),
             patch.object(_module, "HealthServer", return_value=mock_health_srv),
@@ -645,11 +651,91 @@ class TestLifespan:
                 mock_setup_telemetry.assert_called_once_with("analytics-engine")
                 mock_instrument_fastapi.assert_called_once_with(fake_app)
                 mock_instrument_httpx.assert_called_once_with()
+                mock_start_event_loop_monitor.assert_called_once_with()
                 mock_shutdown_telemetry.assert_not_called()
 
-            # setup_telemetry must run immediately after setup_logging.
-            assert call_order == ["setup_logging", "setup_telemetry"]
+            # setup_telemetry must run immediately after setup_logging, and the event-loop
+            # monitor only once the providers it samples into are installed.
+            assert call_order == ["setup_logging", "setup_telemetry", "start_event_loop_monitor"]
             mock_shutdown_telemetry.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_lifespan_starts_a_live_event_loop_monitor_on_its_own_loop(self) -> None:
+        """With metrics exporting, the real monitor is started as a task on the lifespan's loop.
+
+        `start_event_loop_monitor` is unpatched here: it is the library call that turns
+        groovemap.runtime.event_loop.lag on, it only samples from a running loop, and it only
+        samples when a metrics provider is installed — so both conditions are asserted through
+        the value it hands back rather than through a mock.
+        """
+        from common import telemetry as common_telemetry
+        from fastapi import FastAPI
+        from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
+        from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+        import insights.insights as _module
+
+        mock_pool = AsyncMock()
+        mock_pool.initialize = AsyncMock()
+        mock_pool.close = AsyncMock()
+
+        mock_redis = AsyncMock()
+        mock_redis.ping = AsyncMock()
+        mock_redis.aclose = AsyncMock()
+
+        mock_http_client = AsyncMock()
+        mock_http_client.aclose = AsyncMock()
+
+        mock_health_srv = MagicMock()
+
+        mock_config = MagicMock()
+        mock_config.postgres_host = "localhost:5432"
+        mock_config.postgres_database = "test"
+        mock_config.postgres_username = "user"
+        mock_config.postgres_password = "pass"
+        mock_config.api_base_url = "http://localhost:8004"
+        mock_config.redis_host = "redis://localhost"
+        mock_config.schedule_hours = 24
+        mock_config.milestone_years = [25, 50]
+
+        async def fake_scheduler(*_args: object, **_kwargs: object) -> None:
+            await asyncio.sleep(100)
+
+        fake_app = FastAPI()
+        provider = SdkMeterProvider(metric_readers=[InMemoryMetricReader()])
+        monitors: list[object] = []
+
+        def capture(*args: object, **kwargs: object) -> object:
+            monitor = common_telemetry.start_event_loop_monitor(*args, **kwargs)
+            monitors.append(monitor)
+            return monitor
+
+        with (
+            patch.object(_module, "setup_logging"),
+            patch.object(_module, "setup_telemetry"),
+            patch.object(_module, "shutdown_telemetry"),
+            patch.object(_module, "start_event_loop_monitor", side_effect=capture),
+            # The library only samples into an installed metrics provider; stand one up in
+            # memory so the real monitor takes its live path without a collector.
+            patch.object(common_telemetry, "_provider", provider),
+            patch.object(common_telemetry, "_sdk_provider", provider),
+            patch.object(_module.InsightsConfig, "from_env", return_value=mock_config),
+            patch.object(_module, "HealthServer", return_value=mock_health_srv),
+            patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
+            patch("httpx.AsyncClient", return_value=mock_http_client),
+            patch("redis.asyncio.from_url", new_callable=AsyncMock, return_value=mock_redis),
+            patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
+        ):
+            async with _module.lifespan(fake_app):
+                assert len(monitors) == 1
+                monitor = monitors[0]
+                assert isinstance(monitor, asyncio.Task)
+                assert not monitor.done()
+                assert monitor.get_loop() is asyncio.get_running_loop()
+
+            monitor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor
 
     @pytest.mark.asyncio
     async def test_lifespan_telemetry_is_a_noop_without_an_otel_endpoint(self) -> None:

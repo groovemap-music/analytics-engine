@@ -28,6 +28,7 @@ from common import (
     setup_logging,
     setup_telemetry,
     shutdown_telemetry,
+    start_event_loop_monitor,
 )
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
@@ -129,6 +130,10 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     setup_telemetry(SERVICE_NAME)
     instrument_fastapi_app(_app)
     instrument_httpx()
+    # Sample this loop's scheduling delay into groovemap.runtime.event_loop.lag. It must run
+    # from the running loop and after setup_telemetry; it returns None and samples nothing when
+    # metrics export is off, and shutdown_telemetry cancels the task.
+    start_event_loop_monitor()
     logger.info("🚀 Analytics engine starting...")
 
     _config = InsightsConfig.from_env()

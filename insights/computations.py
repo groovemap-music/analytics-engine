@@ -26,7 +26,7 @@ from insights.catalog_api_contract import (
     LABEL_LONGEVITY_PATH,
     RARITY_SCORES_PATH,
 )
-from insights.telemetry import record_computation
+from insights.telemetry import computation_span, record_computation
 
 
 if TYPE_CHECKING:
@@ -482,7 +482,12 @@ async def run_all_computations(
     for name, factory in computations:
         started = time.perf_counter()
         try:
-            results[name] = await factory()
+            # The `insights {computation}` root span wraps exactly what the duration histogram
+            # measures, so a slow computation is attributable to the calls it made. The
+            # exception is re-raised through the span (which marks it ERROR) and caught here,
+            # because one failed computation must not stop the remaining ones.
+            with computation_span(name):
+                results[name] = await factory()
         except Exception as e:
             record_computation(name, time.perf_counter() - started, success=False)
             logger.error("❌ Computation failed — continuing with remaining computations", computation=name, error=describe_exception(e))
