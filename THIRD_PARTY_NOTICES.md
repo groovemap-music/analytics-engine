@@ -8,7 +8,7 @@ The analytics-engine wheel declares dependencies but does not bundle their code.
 
 - `certifi` 2026.7.22 is licensed under `MPL-2.0` and is included through HTTPX. Source: <https://github.com/certifi/python-certifi>.
 - `orjson` 3.12.0 declares `MPL-2.0 AND (Apache-2.0 OR MIT)` and is included through `groovemap-runtime`. Source: <https://github.com/ijl/orjson>.
-- `psycopg` 3.3.4 and `psycopg-binary` 3.3.4 are licensed under `LGPL-3.0-only` and are included through the PostgreSQL extra of `groovemap-runtime`. Source: <https://github.com/psycopg/psycopg>.
+- `psycopg` 3.3.5 and `psycopg-binary` 3.3.5 are licensed under `LGPL-3.0-only` and are included through the PostgreSQL extra of `groovemap-runtime`. Source: <https://github.com/psycopg/psycopg>.
 
 For MPL-covered files, preserve license and copyright notices and make the source form of any distributed modifications to those files available under MPL-2.0. For the LGPL-covered Psycopg libraries, preserve their notices and license texts, provide the applicable covered source, and do not prevent replacement or reverse engineering for debugging modifications. Reassess these obligations before modifying, statically combining, vendoring, or changing how any covered dependency is distributed.
 
