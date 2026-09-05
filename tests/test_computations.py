@@ -1,8 +1,28 @@
 """Tests for insights computation orchestration."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from opentelemetry.trace import StatusCode
+
+
+if TYPE_CHECKING:
+    from tests.conftest import SpanCollector
+
+
+# Every computation run_all_computations drives, in the order it drives them.
+COMPUTATION_NAMES = (
+    "artist_centrality",
+    "genre_trends",
+    "label_longevity",
+    "anniversaries",
+    "data_completeness",
+    "community_enrichment",
+    "release_rarity",
+)
 
 
 def _make_failing_pool() -> AsyncMock:
@@ -776,6 +796,92 @@ class TestRunAllComputations:
         recorded = {call.args[0]: call.kwargs["success"] for call in mock_record.call_args_list}
         assert recorded["artist_centrality"] is False
         assert recorded["genre_trends"] is True
+
+    @pytest.mark.asyncio
+    async def test_opens_one_root_span_per_computation(self, spans: SpanCollector) -> None:
+        from insights.computations import run_all_computations
+
+        mock_client = AsyncMock()
+        mock_pool = _make_mock_pool()
+
+        with (
+            patch("insights.computations.compute_and_store_artist_centrality", return_value=10),
+            patch("insights.computations.compute_and_store_genre_trends", return_value=20),
+            patch("insights.computations.compute_and_store_label_longevity", return_value=5),
+            patch("insights.computations.compute_and_store_anniversaries", return_value=3),
+            patch("insights.computations.compute_and_store_data_completeness", return_value=4),
+            patch("insights.computations.compute_and_store_community_enrichment", return_value=100),
+            patch("insights.computations.compute_and_store_rarity", return_value=7),
+        ):
+            await run_all_computations(mock_client, mock_pool)
+
+        assert spans.names() == [f"insights {name}" for name in COMPUTATION_NAMES]
+        for name in COMPUTATION_NAMES:
+            span = spans.only(f"insights {name}")
+            assert span.parent is None, "each computation is the root of its own trace"
+            assert dict(span.attributes) == {"computation": name, "outcome": "success"}
+            assert span.status.status_code is not StatusCode.ERROR
+
+    @pytest.mark.asyncio
+    async def test_a_failed_computation_fails_its_span_and_the_rest_still_get_theirs(self, spans: SpanCollector) -> None:
+        import httpx
+
+        from insights.computations import run_all_computations
+
+        mock_client = AsyncMock()
+        mock_pool = _make_mock_pool()
+
+        with (
+            patch("insights.computations.compute_and_store_artist_centrality", side_effect=httpx.ReadTimeout("")),
+            patch("insights.computations.compute_and_store_genre_trends", return_value=20),
+            patch("insights.computations.compute_and_store_label_longevity", return_value=5),
+            patch("insights.computations.compute_and_store_anniversaries", return_value=3),
+            patch("insights.computations.compute_and_store_data_completeness", return_value=4),
+            patch("insights.computations.compute_and_store_community_enrichment", return_value=100),
+            patch("insights.computations.compute_and_store_rarity", return_value=7),
+        ):
+            await run_all_computations(mock_client, mock_pool)
+
+        assert spans.names() == [f"insights {name}" for name in COMPUTATION_NAMES]
+        failed = spans.only("insights artist_centrality")
+        assert dict(failed.attributes) == {
+            "computation": "artist_centrality",
+            "outcome": "failure",
+            "error.type": "ReadTimeout",
+        }
+        assert failed.status.status_code is StatusCode.ERROR
+        assert spans.only("insights genre_trends").status.status_code is not StatusCode.ERROR
+
+    @pytest.mark.asyncio
+    async def test_the_span_wraps_the_computation_so_its_own_spans_are_children(self, spans: SpanCollector) -> None:
+        """A slow computation is attributable: whatever it traces hangs off its root span."""
+        from common.tracing import db_span
+
+        from insights.computations import run_all_computations
+
+        async def traced_centrality(*_args: object, **_kwargs: object) -> int:
+            with db_span("postgresql", "execute"):
+                pass
+            return 1
+
+        mock_client = AsyncMock()
+        mock_pool = _make_mock_pool()
+
+        with (
+            patch("insights.computations.compute_and_store_artist_centrality", side_effect=traced_centrality),
+            patch("insights.computations.compute_and_store_genre_trends", return_value=0),
+            patch("insights.computations.compute_and_store_label_longevity", return_value=0),
+            patch("insights.computations.compute_and_store_anniversaries", return_value=0),
+            patch("insights.computations.compute_and_store_data_completeness", return_value=0),
+            patch("insights.computations.compute_and_store_community_enrichment", return_value=0),
+            patch("insights.computations.compute_and_store_rarity", return_value=0),
+        ):
+            await run_all_computations(mock_client, mock_pool)
+
+        child = spans.only("execute postgresql")
+        root = spans.only("insights artist_centrality")
+        assert child.parent is not None
+        assert child.parent.span_id == root.context.span_id
 
 
 class TestComputeAndStoreCommunityEnrichment:
