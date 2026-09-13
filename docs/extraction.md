@@ -1,5 +1,7 @@
 # Extraction provenance
 
+> Historical context: this page records the completed extraction boundary. The current runtime and operator contracts are documented in [architecture.md](architecture.md) and [operations.md](operations.md).
+
 `analytics-engine` was extracted from the former GrooveMap monolith as an independently versioned service. The extraction retained service-owned implementation and tests while replacing source-tree imports with explicit repository contracts.
 
 ## Ownership after extraction

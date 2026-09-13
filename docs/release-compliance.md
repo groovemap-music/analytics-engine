@@ -10,12 +10,12 @@ The wheel carries the AGPL license expression and every repository legal file. T
 
 ## Automation
 
-The thin CI and release callers pin the public organization reusable workflows by full commit. CI runs for pushes to `main`, ordinary and Dependabot-authored pull requests, manual dispatches, and the two weekly full/security schedules inherited from the monolith. There is one required CI job graph for all pull requests and no actor-specific skip.
+The thin CI and release callers pin the public organization reusable workflows by full commit. CI runs for pushes to `main`, all pull requests, manual dispatches, and the two retained weekly schedules. There is one required CI job graph for all pull requests and no actor-specific skip.
 
-Full validation currently requires read access to the pinned `python-libraries` revision. The GitHub App client ID must be available as an Actions variable, and its private key must be configured in both Actions secrets and Dependabot secrets. Without the Dependabot copy, GitHub withholds the Actions secret from Dependabot-authored pull requests and the shared workflow can only run its credential-free fallback; that is not release-compliant parity.
+Full validation fetches the public `python-libraries` repository at the immutable revision recorded in `pyproject.toml`. The CI caller passes no first-party repository credential and uses only an explicit `CODECOV_TOKEN`; the release caller passes no inherited secrets. Repository policy rejects the retired GitHub App credential markers and `secrets: inherit`.
 
-## Historical planning privacy
+## Historical publication note
 
-Historical implementation plans are preserved in the private `planning-archive` before they are removed from this repository. Deleting them from the current tree is not sufficient: before publication, a backed-up separate clone must remove `.planning/**`, `docs/superpowers/plans/**`, and `docs/superpowers/specs/**` from every ref. The rehearsal must retain an old-to-new commit map and pass complete reachable-object and secret scans.
+Before this repository became public, historical implementation plans were preserved in the private `planning-archive` and `.planning/**`, `docs/superpowers/plans/**`, and `docs/superpowers/specs/**` were removed from every published ref. The retained `scripts/rehearse-history-sanitization.sh` documents and tests that one-time boundary against a separate clone; it is not part of ordinary runtime or release operation.
 
-The separate filtered clone is the only permissible rewrite target. Replacing the private remote from that clone and making the repository public are distinct operator-approved actions; neither is performed by repository validation.
+No validation or release recipe rewrites repository history or changes remote visibility.
