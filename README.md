@@ -1,6 +1,6 @@
 # GrooveMap analytics engine
 
-Independently versioned service for scheduled music analytics. It obtains raw graph and catalog inputs from `catalog-api`, stores precomputed results in PostgreSQL, uses Redis for cache-aside reads, and exposes a FastAPI service on port 8008 with health checks on port 8009.
+Independently versioned service for scheduled music analytics. It obtains raw graph and catalog inputs from `catalog-api`, stores precomputed results in PostgreSQL, uses Redis for cache-aside reads, and exposes a FastAPI service on port 8008 with a separate health listener on port 8009.
 
 This project is licensed under the [GNU Affero General Public License v3.0 only](LICENSE). Commercial use is permitted under the AGPL when its terms are followed; [alternative commercial terms may be negotiated](COMMERCIAL-LICENSING.md).
 
@@ -8,7 +8,7 @@ External contributions are temporarily paused until a relicensing-capable contri
 
 ## Development
 
-Prerequisites are pinned in `.mise.toml`. The private `groovemap-runtime` dependency is fixed to an immutable `python-libraries` commit.
+Prerequisites are pinned in `.mise.toml`. The first-party `groovemap-runtime` dependency is fixed to an immutable `python-libraries` commit.
 
 ```bash
 mise install
@@ -21,6 +21,9 @@ The stable repository interface is:
 - `just setup` — install the locked development environment.
 - `just check` — run the authoritative pre-merge gate.
 - `just test` — run the isolated test suite with coverage.
+- `just coverage` — produce the same test coverage report used by CI.
+- `just contract-check` — verify the promoted `catalog-api` contract and generated binding.
+- `just secret-scan` — scan Git history and the working tree with Gitleaks.
 - `just build` — create wheel and source distributions.
 - `just image` — build and inspect the non-root production image.
 - `just release-dry-run` — build checksums, SBOM, notices, and provenance without publishing.
@@ -34,7 +37,7 @@ Run locally after setup:
 uv run analytics-engine
 ```
 
-Required configuration includes PostgreSQL credentials (`POSTGRES_HOST`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DATABASE`). Optional settings include `API_BASE_URL`, `REDIS_HOST`, `INSIGHTS_INTERNAL_SECRET`, `INSIGHTS_SCHEDULE_HOURS`, `INSIGHTS_MILESTONE_YEARS`, and `LOG_LEVEL`. Supply real secrets through the deployment layer; never commit them here.
+Required configuration includes `POSTGRES_HOST`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DATABASE`. Username, password, Redis password, and the internal API secret support the shared `_FILE` secret convention. The complete runtime and telemetry variable table, including defaults and validation behavior, is in [the operations guide](docs/operations.md#configuration). Supply real secrets through the deployment layer; never commit them here.
 
 OpenTelemetry metrics and traces export to a collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Alongside the HTTP, database, and computation metrics, the service reports the process view and its event-loop lag, and opens one `insights {computation}` root span per scheduled computation so a slow insight is attributable to the calls it made. See [docs/operations.md](docs/operations.md#telemetry) for the full variable list, the metrics, and the spans this service emits. Each signal can be turned off on its own, and with no endpoint configured telemetry is a no-op and the service behaves exactly as it does today.
 
