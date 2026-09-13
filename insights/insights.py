@@ -67,7 +67,6 @@ STARTUP_BANNER = r"""
 INSIGHTS_PORT = 8008
 INSIGHTS_HEALTH_PORT = 8009
 
-# Module-level state
 _config: InsightsConfig | None = None
 _pool: AsyncPostgreSQLPool | None = None
 _http_client: httpx.AsyncClient | None = None
@@ -98,7 +97,6 @@ async def _scheduler_loop(
     global _last_computation
     interval_seconds = interval_hours * 3600
 
-    # Wait for dependent services (API) to be ready before first computation
     await asyncio.sleep(30)
 
     while True:
@@ -121,6 +119,79 @@ async def _scheduler_loop(
         await asyncio.sleep(sleep_time)
 
 
+async def _initialize_pool(config: InsightsConfig) -> AsyncPostgreSQLPool:
+    """Connect the runtime database pool."""
+    host, port = parse_postgres_host_port(config.postgres_host)
+    pool = AsyncPostgreSQLPool(
+        connection_params={
+            "host": host,
+            "port": port,
+            "dbname": config.postgres_database,
+            "user": config.postgres_username,
+            "password": config.postgres_password,
+        },
+        max_connections=config.postgres_pool_max_size,
+        min_connections=config.postgres_pool_min_size,
+    )
+    await pool.initialize()
+    logger.info("🐘 PostgreSQL pool initialized")
+    return pool
+
+
+def _initialize_http_client(config: InsightsConfig) -> httpx.AsyncClient:
+    """Build the authenticated client used by scheduled computations."""
+    headers = {"User-Agent": USER_AGENT}
+    if config.internal_secret:
+        headers["X-Internal-Secret"] = config.internal_secret
+    else:
+        logger.warning("⚠️ INSIGHTS_INTERNAL_SECRET is not set — internal API calls will be rejected by the API")
+
+    # Individual computations override this fallback with endpoint-specific read budgets.
+    client = httpx.AsyncClient(base_url=config.api_base_url, timeout=endpoint_timeout(), headers=headers)
+    logger.info("🔧 API HTTP client initialized", base_url=config.api_base_url)
+    return client
+
+
+async def _initialize_cache(config: InsightsConfig) -> tuple[aioredis.Redis | None, InsightsCache | None]:
+    """Connect Redis, closing a partially connected client on degradation."""
+    redis_client: aioredis.Redis | None = None
+    try:
+        redis_client = await aioredis.from_url(config.redis_host, decode_responses=True)
+        await redis_client.ping()
+        cache = InsightsCache(redis_client, ttl_seconds=config.schedule_hours * 3600)
+        logger.info("✅ Redis cache initialized", ttl_hours=config.schedule_hours)
+        return redis_client, cache
+    except Exception:
+        logger.warning("⚠️ Redis unavailable — caching disabled, falling back to PostgreSQL")
+        # from_url() is lazy, so a failed ping may still leave a live connection pool.
+        if redis_client is not None:
+            with contextlib.suppress(Exception):
+                await redis_client.aclose()
+        return None, None
+
+
+async def _shutdown_runtime(
+    scheduler_task: asyncio.Task[None] | None,
+    redis_client: aioredis.Redis | None,
+    http_client: httpx.AsyncClient | None,
+    pool: AsyncPostgreSQLPool | None,
+    health_server: HealthServer,
+) -> None:
+    """Release runtime resources in dependency order."""
+    if scheduler_task:
+        scheduler_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await scheduler_task
+    if redis_client:
+        await redis_client.aclose()
+    if http_client:
+        await http_client.aclose()
+    if pool:
+        await pool.close()
+    health_server.stop()
+    shutdown_telemetry()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     """Manage service lifecycle — connect to databases and start scheduler."""
@@ -130,73 +201,20 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     setup_telemetry(SERVICE_NAME)
     instrument_fastapi_app(_app)
     instrument_httpx()
-    # Sample this loop's scheduling delay into groovemap.runtime.event_loop.lag. It must run
-    # from the running loop and after setup_telemetry; it returns None and samples nothing when
-    # metrics export is off, and shutdown_telemetry cancels the task.
+    # The event-loop monitor must start from the running loop after telemetry setup.
     start_event_loop_monitor()
     logger.info("🚀 Analytics engine starting...")
 
     _config = InsightsConfig.from_env()
 
-    # Start health server
     health_srv = HealthServer(INSIGHTS_HEALTH_PORT, get_health_data)
     health_srv.start_background()
     logger.info("🏥 Health server started", port=INSIGHTS_HEALTH_PORT)
 
-    # Initialize PostgreSQL (POSTGRES_HOST may embed a port, e.g. a pooler)
-    host, port = parse_postgres_host_port(_config.postgres_host)
-    _pool = AsyncPostgreSQLPool(
-        connection_params={
-            "host": host,
-            "port": port,
-            "dbname": _config.postgres_database,
-            "user": _config.postgres_username,
-            "password": _config.postgres_password,
-        },
-        max_connections=_config.postgres_pool_max_size,
-        min_connections=_config.postgres_pool_min_size,
-    )
-    await _pool.initialize()
-    logger.info("🐘 PostgreSQL pool initialized")
+    _pool = await _initialize_pool(_config)
+    _http_client = _initialize_http_client(_config)
+    _redis, _cache = await _initialize_cache(_config)
 
-    # Initialize HTTP client for API service. The API's /api/internal/insights/*
-    # endpoints are gated by a shared secret; present it on every request.
-    _client_headers = {"User-Agent": USER_AGENT}
-    if _config.internal_secret:
-        _client_headers["X-Internal-Secret"] = _config.internal_secret
-    else:
-        logger.warning("⚠️ INSIGHTS_INTERNAL_SECRET is not set — internal API calls will be rejected by the API")
-    # A scalar timeout would also apply to *connect* (a dead API must fail in
-    # seconds, not minutes) and is far too tight for the heavy computation
-    # endpoints. Every request overrides this with its per-endpoint budget from
-    # computations.endpoint_timeout(); this is only the fallback for anything
-    # that does not.
-    _http_client = httpx.AsyncClient(base_url=_config.api_base_url, timeout=endpoint_timeout(), headers=_client_headers)
-    logger.info("🔧 API HTTP client initialized", base_url=_config.api_base_url)
-
-    # Initialize Redis cache
-    try:
-        _redis = await aioredis.from_url(_config.redis_host, decode_responses=True)
-        await _redis.ping()
-        ttl_seconds = _config.schedule_hours * 3600
-        _cache = InsightsCache(_redis, ttl_seconds=ttl_seconds)
-        logger.info("✅ Redis cache initialized", ttl_hours=_config.schedule_hours)
-    except Exception:
-        logger.warning("⚠️ Redis unavailable — caching disabled, falling back to PostgreSQL")
-        # from_url() is lazy — ping() is what actually opens the socket, so a
-        # failure here (e.g. requirepass with a missing/wrong REDIS_PASSWORD)
-        # still leaves a live client + pooled connection to close. Without
-        # this, the reference is dropped with no deterministic cleanup and
-        # the module's own shutdown convention (line 179: `if _redis: await
-        # _redis.aclose()`) becomes a no-op here since _redis is already None
-        # (redis-client-cleanup regression).
-        if _redis is not None:
-            with contextlib.suppress(Exception):
-                await _redis.aclose()
-        _redis = None
-        _cache = None
-
-    # Start scheduler
     _scheduler_task = asyncio.create_task(
         _scheduler_loop(
             _http_client,
@@ -211,20 +229,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     logger.info("✅ Analytics engine ready", port=INSIGHTS_PORT)
     yield
 
-    # Shutdown
     logger.info("🔧 Analytics engine shutting down...")
-    if _scheduler_task:
-        _scheduler_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await _scheduler_task
-    if _redis:
-        await _redis.aclose()
-    if _http_client:
-        await _http_client.aclose()
-    if _pool:
-        await _pool.close()
-    health_srv.stop()
-    shutdown_telemetry()
+    await _shutdown_runtime(_scheduler_task, _redis, _http_client, _pool, health_srv)
     logger.info("✅ Analytics engine stopped")
 
 

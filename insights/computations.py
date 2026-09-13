@@ -1,15 +1,11 @@
-"""Computation orchestration for insights.
+"""Fetch, transform, and persist scheduled insight computations."""
 
-Each compute_and_store_* function:
-1. Fetches raw query results from the API service over HTTP
-2. Clears the previous results from the insights table
-3. Inserts the new results
-4. Returns the number of rows written
-"""
+from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, cast
 
 import httpx
 import structlog
@@ -34,6 +30,7 @@ if TYPE_CHECKING:
 
 
 logger = structlog.get_logger(__name__)
+P = ParamSpec("P")
 
 
 # ── Per-endpoint HTTP timeouts ──────────────────────────────────────────────
@@ -112,6 +109,39 @@ async def _log_computation(
         )
 
 
+def _record_lifecycle(
+    insight_type: str,
+    failure_message: str,
+) -> Callable[
+    [Callable[Concatenate[httpx.AsyncClient, Any, P], Coroutine[Any, Any, int]]],
+    Callable[Concatenate[httpx.AsyncClient, Any, P], Coroutine[Any, Any, int]],
+]:
+    """Keep persistence and error reporting consistent across computations."""
+
+    def decorate(
+        operation: Callable[Concatenate[httpx.AsyncClient, Any, P], Coroutine[Any, Any, int]],
+    ) -> Callable[Concatenate[httpx.AsyncClient, Any, P], Coroutine[Any, Any, int]]:
+        @wraps(operation)
+        async def wrapped(client: httpx.AsyncClient, pool: Any, *args: P.args, **kwargs: P.kwargs) -> int:
+            started_at = datetime.now(UTC)
+            try:
+                rows_affected = await operation(client, pool, *args, **kwargs)
+                await _log_computation(pool, insight_type, "completed", started_at, rows_affected)
+                return rows_affected
+            except Exception as error:
+                description = describe_exception(error)
+                logger.error(failure_message, error=description)
+                try:
+                    await _log_computation(pool, insight_type, "failed", started_at, error_message=description)
+                except Exception as log_error:
+                    logger.warning("⚠️ Failed to log computation error", error=describe_exception(log_error))
+                raise
+
+        return wrapped
+
+    return decorate
+
+
 async def _fetch_from_api(
     client: httpx.AsyncClient,
     path: str,
@@ -134,130 +164,99 @@ async def _fetch_from_api(
     return items
 
 
+@_record_lifecycle("artist_centrality", "❌ Artist centrality computation failed")
 async def compute_and_store_artist_centrality(client: httpx.AsyncClient, pool: Any, limit: int = 100) -> int:
     """Compute artist centrality and store results."""
-    started_at = datetime.now(UTC)
-    try:
-        results = await _fetch_from_api(client, ARTIST_CENTRALITY_PATH, {"limit": limit})
-        if not results:
-            logger.info("📊 No artist centrality results to store")
-            await _log_computation(pool, "artist_centrality", "completed", started_at, 0)
-            return 0
+    results = await _fetch_from_api(client, ARTIST_CENTRALITY_PATH, {"limit": limit})
+    if not results:
+        logger.info("📊 No artist centrality results to store")
+        return 0
 
-        # Filter out artists with missing names (Neo4j nodes without a name property)
-        results = [r for r in results if r.get("artist_name")]
-        if not results:
-            logger.info("📊 No artist centrality results with valid names")
-            await _log_computation(pool, "artist_centrality", "completed", started_at, 0)
-            return 0
+    results = [row for row in results if row.get("artist_name")]
+    if not results:
+        logger.info("📊 No artist centrality results with valid names")
+        return 0
 
-        async with pool.connection() as conn:
-            await conn.set_autocommit(False)
-            async with conn.transaction(), conn.cursor() as cursor:
-                cursor = cast("Any", cursor)
-                await cursor.execute("DELETE FROM insights.artist_centrality")
-                for rank, row in enumerate(results, 1):
-                    await cursor.execute(
-                        """
-                            INSERT INTO insights.artist_centrality (rank, artist_id, artist_name, edge_count)
-                            VALUES (%s, %s, %s, %s)
-                            """,
-                        (rank, row["artist_id"], row["artist_name"], row["edge_count"]),
-                    )
-        logger.info("💾 Artist centrality stored", count=len(results))
-        await _log_computation(pool, "artist_centrality", "completed", started_at, len(results))
-        return len(results)
-    except Exception as e:
-        logger.error("❌ Artist centrality computation failed", error=describe_exception(e))
-        try:
-            await _log_computation(pool, "artist_centrality", "failed", started_at, error_message=describe_exception(e))
-        except Exception as log_err:
-            logger.warning("⚠️ Failed to log computation error", error=describe_exception(log_err))
-        raise
+    async with pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute("DELETE FROM insights.artist_centrality")
+            for rank, row in enumerate(results, 1):
+                await cursor.execute(
+                    """
+                        INSERT INTO insights.artist_centrality (rank, artist_id, artist_name, edge_count)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                    (rank, row["artist_id"], row["artist_name"], row["edge_count"]),
+                )
+    logger.info("💾 Artist centrality stored", count=len(results))
+    return len(results)
 
 
+@_record_lifecycle("genre_trends", "❌ Genre trends computation failed")
 async def compute_and_store_genre_trends(client: httpx.AsyncClient, pool: Any) -> int:
     """Compute genre trends and store results."""
-    started_at = datetime.now(UTC)
-    try:
-        results = await _fetch_from_api(client, GENRE_TRENDS_PATH)
-        if not results:
-            await _log_computation(pool, "genre_trends", "completed", started_at, 0)
-            return 0
+    results = await _fetch_from_api(client, GENRE_TRENDS_PATH)
+    if not results:
+        return 0
 
-        async with pool.connection() as conn:
-            await conn.set_autocommit(False)
-            async with conn.transaction(), conn.cursor() as cursor:
-                cursor = cast("Any", cursor)
-                await cursor.execute("DELETE FROM insights.genre_trends")
-                for row in results:
-                    await cursor.execute(
-                        """
-                            INSERT INTO insights.genre_trends (genre, decade, release_count)
-                            VALUES (%s, %s, %s)
-                            """,
-                        (row["genre"], row["decade"], row["release_count"]),
-                    )
-        logger.info("💾 Genre trends stored", count=len(results))
-        await _log_computation(pool, "genre_trends", "completed", started_at, len(results))
-        return len(results)
-    except Exception as e:
-        logger.error("❌ Genre trends computation failed", error=describe_exception(e))
-        try:
-            await _log_computation(pool, "genre_trends", "failed", started_at, error_message=describe_exception(e))
-        except Exception as log_err:
-            logger.warning("⚠️ Failed to log computation error", error=describe_exception(log_err))
-        raise
+    async with pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute("DELETE FROM insights.genre_trends")
+            for row in results:
+                await cursor.execute(
+                    """
+                        INSERT INTO insights.genre_trends (genre, decade, release_count)
+                        VALUES (%s, %s, %s)
+                        """,
+                    (row["genre"], row["decade"], row["release_count"]),
+                )
+    logger.info("💾 Genre trends stored", count=len(results))
+    return len(results)
 
 
+@_record_lifecycle("label_longevity", "❌ Label longevity computation failed")
 async def compute_and_store_label_longevity(client: httpx.AsyncClient, pool: Any, limit: int = 50) -> int:
     """Compute label longevity and store results."""
-    started_at = datetime.now(UTC)
-    try:
-        results = await _fetch_from_api(client, LABEL_LONGEVITY_PATH, {"limit": limit})
-        if not results:
-            await _log_computation(pool, "label_longevity", "completed", started_at, 0)
-            return 0
+    results = await _fetch_from_api(client, LABEL_LONGEVITY_PATH, {"limit": limit})
+    if not results:
+        return 0
 
-        current_year = datetime.now(UTC).year
-        async with pool.connection() as conn:
-            await conn.set_autocommit(False)
-            async with conn.transaction(), conn.cursor() as cursor:
-                cursor = cast("Any", cursor)
-                await cursor.execute("DELETE FROM insights.label_longevity")
-                for rank, row in enumerate(results, 1):
-                    still_active = row["last_year"] is not None and row["last_year"] >= current_year - 2
-                    await cursor.execute(
-                        """
-                            INSERT INTO insights.label_longevity
-                                (rank, label_id, label_name, first_year, last_year,
-                                 years_active, total_releases, peak_decade, still_active)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            """,
-                        (
-                            rank,
-                            row["label_id"],
-                            row["label_name"],
-                            row["first_year"],
-                            row["last_year"],
-                            row["years_active"],
-                            row["total_releases"],
-                            row.get("peak_decade"),
-                            still_active,
-                        ),
-                    )
-        logger.info("💾 Label longevity stored", count=len(results))
-        await _log_computation(pool, "label_longevity", "completed", started_at, len(results))
-        return len(results)
-    except Exception as e:
-        logger.error("❌ Label longevity computation failed", error=describe_exception(e))
-        try:
-            await _log_computation(pool, "label_longevity", "failed", started_at, error_message=describe_exception(e))
-        except Exception as log_err:
-            logger.warning("⚠️ Failed to log computation error", error=describe_exception(log_err))
-        raise
+    current_year = datetime.now(UTC).year
+    async with pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute("DELETE FROM insights.label_longevity")
+            for rank, row in enumerate(results, 1):
+                still_active = row["last_year"] is not None and row["last_year"] >= current_year - 2
+                await cursor.execute(
+                    """
+                        INSERT INTO insights.label_longevity
+                            (rank, label_id, label_name, first_year, last_year,
+                             years_active, total_releases, peak_decade, still_active)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                    (
+                        rank,
+                        row["label_id"],
+                        row["label_name"],
+                        row["first_year"],
+                        row["last_year"],
+                        row["years_active"],
+                        row["total_releases"],
+                        row.get("peak_decade"),
+                        still_active,
+                    ),
+                )
+    logger.info("💾 Label longevity stored", count=len(results))
+    return len(results)
 
 
+@_record_lifecycle("anniversaries", "❌ Anniversaries computation failed")
 async def compute_and_store_anniversaries(
     client: httpx.AsyncClient,
     pool: Any,
@@ -266,7 +265,6 @@ async def compute_and_store_anniversaries(
     milestone_years: list[int] | None = None,
 ) -> int:
     """Compute monthly anniversaries and store results."""
-    started_at = datetime.now(UTC)
     now = datetime.now(UTC)
     year = current_year or now.year
     month = current_month or now.month
@@ -274,185 +272,145 @@ async def compute_and_store_anniversaries(
     if milestone_years is None:
         milestone_years = [25, 30, 40, 50, 75, 100]
 
-    try:
-        milestones_str = ",".join(str(m) for m in milestone_years)
-        results = await _fetch_from_api(
-            client,
-            ANNIVERSARIES_PATH,
-            {"year": year, "month": month, "milestones": milestones_str},
-        )
-        if not results:
-            await _log_computation(pool, "anniversaries", "completed", started_at, 0)
-            return 0
-        rows_written = 0
-        async with pool.connection() as conn:
-            await conn.set_autocommit(False)
-            async with conn.transaction(), conn.cursor() as cursor:
-                cursor = cast("Any", cursor)
-                await cursor.execute(
-                    "DELETE FROM insights.monthly_anniversaries WHERE computed_year = %s AND computed_month = %s",
-                    (year, month),
-                )
-                for row in results:
-                    anniversary = year - int(row["release_year"])
-                    if anniversary not in milestone_years:
-                        logger.warning(
-                            "⚠️ Skipping anniversary row — computed anniversary not in milestones",
-                            master_id=row.get("master_id"),
-                            anniversary=anniversary,
-                        )
-                        continue
-                    await cursor.execute(
-                        """
-                            INSERT INTO insights.monthly_anniversaries
-                                (master_id, title, artist_name, release_year, anniversary,
-                                 computed_month, computed_year)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (master_id, computed_year, computed_month) DO UPDATE
-                            SET title = EXCLUDED.title, artist_name = EXCLUDED.artist_name,
-                                anniversary = EXCLUDED.anniversary, computed_at = NOW()
-                            """,
-                        (row["master_id"], row["title"], row.get("artist_name"), int(row["release_year"]), anniversary, month, year),
+    milestones_str = ",".join(str(m) for m in milestone_years)
+    results = await _fetch_from_api(
+        client,
+        ANNIVERSARIES_PATH,
+        {"year": year, "month": month, "milestones": milestones_str},
+    )
+    if not results:
+        return 0
+
+    rows_written = 0
+    async with pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute(
+                "DELETE FROM insights.monthly_anniversaries WHERE computed_year = %s AND computed_month = %s",
+                (year, month),
+            )
+            for row in results:
+                anniversary = year - int(row["release_year"])
+                if anniversary not in milestone_years:
+                    logger.warning(
+                        "⚠️ Skipping anniversary row — computed anniversary not in milestones",
+                        master_id=row.get("master_id"),
+                        anniversary=anniversary,
                     )
-                    rows_written += 1
-        logger.info("💾 Monthly anniversaries stored", count=rows_written, year=year, month=month)
-        await _log_computation(pool, "anniversaries", "completed", started_at, rows_written)
-        return rows_written
-    except Exception as e:
-        logger.error("❌ Anniversaries computation failed", error=describe_exception(e))
-        try:
-            await _log_computation(pool, "anniversaries", "failed", started_at, error_message=describe_exception(e))
-        except Exception as log_err:
-            logger.warning("⚠️ Failed to log computation error", error=describe_exception(log_err))
-        raise
+                    continue
+                await cursor.execute(
+                    """
+                        INSERT INTO insights.monthly_anniversaries
+                            (master_id, title, artist_name, release_year, anniversary,
+                             computed_month, computed_year)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (master_id, computed_year, computed_month) DO UPDATE
+                        SET title = EXCLUDED.title, artist_name = EXCLUDED.artist_name,
+                            anniversary = EXCLUDED.anniversary, computed_at = NOW()
+                        """,
+                    (row["master_id"], row["title"], row.get("artist_name"), int(row["release_year"]), anniversary, month, year),
+                )
+                rows_written += 1
+    logger.info("💾 Monthly anniversaries stored", count=rows_written, year=year, month=month)
+    return rows_written
 
 
+@_record_lifecycle("data_completeness", "❌ Data completeness computation failed")
 async def compute_and_store_data_completeness(client: httpx.AsyncClient, pool: Any) -> int:
     """Compute data completeness and store results."""
-    started_at = datetime.now(UTC)
-    try:
-        # Full sequential scans whose duration varies widely (~230s warm, over
-        # 600s on bad days). The endpoint caches in Redis for 6h, so only the
-        # cold path is slow — see ENDPOINT_READ_TIMEOUTS for the budget.
-        results = await _fetch_from_api(client, DATA_COMPLETENESS_PATH)
-        if not results:
-            await _log_computation(pool, "data_completeness", "completed", started_at, 0)
-            return 0
+    # This endpoint's cold full scans need the extended read budget above.
+    results = await _fetch_from_api(client, DATA_COMPLETENESS_PATH)
+    if not results:
+        return 0
 
-        async with pool.connection() as conn:
-            await conn.set_autocommit(False)
-            async with conn.transaction(), conn.cursor() as cursor:
-                cursor = cast("Any", cursor)
-                await cursor.execute("DELETE FROM insights.data_completeness")
-                for row in results:
-                    await cursor.execute(
-                        """
-                            INSERT INTO insights.data_completeness
-                                (entity_type, total_count, with_image, with_year,
-                                 with_country, with_genre, completeness_pct)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                            """,
-                        (
-                            row["entity_type"],
-                            row["total_count"],
-                            row["with_image"],
-                            row["with_year"],
-                            row["with_country"],
-                            row["with_genre"],
-                            row["completeness_pct"],
-                        ),
-                    )
-        logger.info("💾 Data completeness stored", count=len(results))
-        await _log_computation(pool, "data_completeness", "completed", started_at, len(results))
-        return len(results)
-    except Exception as e:
-        logger.error("❌ Data completeness computation failed", error=describe_exception(e))
-        try:
-            await _log_computation(pool, "data_completeness", "failed", started_at, error_message=describe_exception(e))
-        except Exception as log_err:
-            logger.warning("⚠️ Failed to log computation error", error=describe_exception(log_err))
-        raise
+    async with pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute("DELETE FROM insights.data_completeness")
+            for row in results:
+                await cursor.execute(
+                    """
+                        INSERT INTO insights.data_completeness
+                            (entity_type, total_count, with_image, with_year,
+                             with_country, with_genre, completeness_pct)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                    (
+                        row["entity_type"],
+                        row["total_count"],
+                        row["with_image"],
+                        row["with_year"],
+                        row["with_country"],
+                        row["with_genre"],
+                        row["completeness_pct"],
+                    ),
+                )
+    logger.info("💾 Data completeness stored", count=len(results))
+    return len(results)
 
 
+@_record_lifecycle("community_enrichment", "❌ Community enrichment failed")
 async def compute_and_store_community_enrichment(client: httpx.AsyncClient, pool: Any) -> int:
     """Trigger community enrichment via the API internal endpoint."""
-    started_at = datetime.now(UTC)
-    try:
-        path = COMMUNITY_ENRICHMENT_PATH
-        response = await client.get(path, timeout=endpoint_timeout(path))
-        response.raise_for_status()
-        data: dict[str, Any] = response.json()
-        enriched = int(data.get("enriched", 0))
-        logger.info("📊 Community enrichment complete", enriched=enriched)
-        await _log_computation(pool, "community_enrichment", "completed", started_at, enriched)
-        return enriched
-    except Exception as e:
-        logger.error("❌ Community enrichment failed", error=describe_exception(e))
-        try:
-            await _log_computation(pool, "community_enrichment", "failed", started_at, error_message=describe_exception(e))
-        except Exception as log_err:
-            logger.warning("⚠️ Failed to log computation error", error=describe_exception(log_err))
-        raise
+    del pool
+    path = COMMUNITY_ENRICHMENT_PATH
+    response = await client.get(path, timeout=endpoint_timeout(path))
+    response.raise_for_status()
+    data: dict[str, Any] = response.json()
+    enriched = int(data.get("enriched", 0))
+    logger.info("📊 Community enrichment complete", enriched=enriched)
+    return enriched
 
 
+@_record_lifecycle("release_rarity", "❌ Release rarity computation failed")
 async def compute_and_store_rarity(client: httpx.AsyncClient, pool: Any) -> int:
     """Compute release rarity scores and store results."""
-    started_at = datetime.now(UTC)
-    try:
-        # The API runs the rarity signal scans chunked and sequentially (to cap
-        # transaction memory) — see ENDPOINT_READ_TIMEOUTS for the budget.
-        results = await _fetch_from_api(client, RARITY_SCORES_PATH)
-        if not results:
-            logger.info("📊 No rarity score results to store")
-            await _log_computation(pool, "release_rarity", "completed", started_at, 0)
-            return 0
+    # Chunked, sequential rarity scans need the extended read budget above.
+    results = await _fetch_from_api(client, RARITY_SCORES_PATH)
+    if not results:
+        logger.info("📊 No rarity score results to store")
+        return 0
 
-        async with pool.connection() as conn:
-            await conn.set_autocommit(False)
-            async with conn.transaction(), conn.cursor() as cursor:
-                cursor = cast("Any", cursor)
-                await cursor.execute("DELETE FROM insights.release_rarity")
-                for row in results:
-                    await cursor.execute(
-                        """
-                            INSERT INTO insights.release_rarity
-                                (release_id, title, artist_name, year, rarity_score, tier,
-                                 hidden_gem_score, pressing_scarcity, label_catalog,
-                                 format_rarity, temporal_scarcity, graph_isolation,
-                                 collection_prevalence, media_families, family_signals,
-                                 medium_rarity)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            """,
-                        (
-                            row["release_id"],
-                            row.get("title", ""),
-                            row.get("artist_name", ""),
-                            row.get("year"),
-                            row["rarity_score"],
-                            row["tier"],
-                            row.get("hidden_gem_score"),
-                            # Grooved-only per ADR 0007; null when no family extension claims the release.
-                            row.get("pressing_scarcity"),
-                            row.get("label_catalog"),
-                            row.get("format_rarity"),
-                            row.get("temporal_scarcity"),
-                            row.get("graph_isolation"),
-                            row.get("collection_prevalence"),
-                            Jsonb(row.get("media_families") or []),
-                            Jsonb(row.get("family_signals") or {}),
-                            row.get("medium_rarity"),
-                        ),
-                    )
-        logger.info("💾 Release rarity scores stored", count=len(results))
-        await _log_computation(pool, "release_rarity", "completed", started_at, len(results))
-        return len(results)
-    except Exception as e:
-        logger.error("❌ Release rarity computation failed", error=describe_exception(e))
-        try:
-            await _log_computation(pool, "release_rarity", "failed", started_at, error_message=describe_exception(e))
-        except Exception as log_err:
-            logger.warning("⚠️ Failed to log computation error", error=describe_exception(log_err))
-        raise
+    async with pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute("DELETE FROM insights.release_rarity")
+            for row in results:
+                await cursor.execute(
+                    """
+                        INSERT INTO insights.release_rarity
+                            (release_id, title, artist_name, year, rarity_score, tier,
+                             hidden_gem_score, pressing_scarcity, label_catalog,
+                             format_rarity, temporal_scarcity, graph_isolation,
+                             collection_prevalence, media_families, family_signals,
+                             medium_rarity)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                    (
+                        row["release_id"],
+                        row.get("title", ""),
+                        row.get("artist_name", ""),
+                        row.get("year"),
+                        row["rarity_score"],
+                        row["tier"],
+                        row.get("hidden_gem_score"),
+                        # Grooved-only per ADR 0007; null when no family extension claims the release.
+                        row.get("pressing_scarcity"),
+                        row.get("label_catalog"),
+                        row.get("format_rarity"),
+                        row.get("temporal_scarcity"),
+                        row.get("graph_isolation"),
+                        row.get("collection_prevalence"),
+                        Jsonb(row.get("media_families") or []),
+                        Jsonb(row.get("family_signals") or {}),
+                        row.get("medium_rarity"),
+                    ),
+                )
+    logger.info("💾 Release rarity scores stored", count=len(results))
+    return len(results)
 
 
 async def run_all_computations(
