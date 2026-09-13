@@ -110,6 +110,11 @@ assert (ROOT / "scripts/rehearse-history-sanitization.sh").is_file()
 readme = (ROOT / "README.md").read_text()
 assert "docs/README.md" in readme
 assert "Private, independently" not in readme
+assert "**Public-library cutover: complete.**" in readme
+assert "public `python-libraries` repository" in readme
+assert "require no private-package credentials" in readme
+assert "pinned private runtime" not in readme
+assert "`GROOVEMAP_RUNTIME_REPO` override" in readme
 
 active_docs = "\n".join(path.read_text() for path in sorted((ROOT / "docs").glob("*.md")))
 for legacy_service in ("Graphinator", "Tableinator", "Brainzgraphinator", "Brainztableinator", "Dashboard Service"):
