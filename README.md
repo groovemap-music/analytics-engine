@@ -8,7 +8,9 @@ External contributions are temporarily paused until a relicensing-capable contri
 
 ## Development
 
-Prerequisites are pinned in `.mise.toml`. The first-party `groovemap-runtime` dependency is fixed to an immutable `python-libraries` commit.
+**Public-library cutover: complete.** Prerequisites are pinned in `.mise.toml`, and the
+first-party `groovemap-runtime` dependency comes from the public `python-libraries` repository at
+an immutable commit. Local setup and CI require no private-package credentials.
 
 ```bash
 mise install
@@ -45,7 +47,11 @@ OpenTelemetry metrics and traces export to a collector when `OTEL_EXPORTER_OTLP_
 
 `catalog-api` owns the internal HTTP interface and query implementations. This repository consumes the promoted contract in `contracts/catalog-api/internal-insights/v1/`; it does not import API source or rely on a sibling checkout. Database schema ownership belongs to `database-schema`; runtime and resilience helpers belong to `python-libraries`; service orchestration and secret examples belong to `deployment`.
 
-The Docker build only needs this repository plus a locally prepared wheel for the pinned private runtime. `scripts/prepare-runtime-wheel.sh` verifies the adjacent runtime checkout is both clean and at the expected commit before staging that wheel in the ignored `.build/` directory.
+The Docker build only needs this repository plus a locally prepared wheel for the pinned public
+runtime. `scripts/prepare-runtime-wheel.sh` verifies the source checkout is clean and at the
+expected commit before staging that wheel in the ignored `.build/` directory. Its optional
+`GROOVEMAP_RUNTIME_REPO` override accepts an explicit matching checkout; without the override, the
+script uses a matching adjacent checkout or creates a temporary checkout from the public source.
 
 ## Releases
 
