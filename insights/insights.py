@@ -11,7 +11,7 @@ import contextlib
 import os
 from collections.abc import AsyncGenerator  # noqa: TC003  # Python 3.14 resolves lifespan annotations at runtime.
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -35,9 +35,10 @@ from fastapi.responses import JSONResponse
 
 from insights import __version__
 from insights.cache import InsightsCache
-from insights.computations import endpoint_timeout, run_all_computations
+from insights.computations import ACTIVITY_SUMMARY_DEFAULT_DAYS, endpoint_timeout, run_all_computations
 from insights.config import InsightsConfig
 from insights.models import (
+    ActivitySummaryItem,
     AnniversaryItem,
     ArtistCentralityItem,
     ComputationStatus,
@@ -503,6 +504,54 @@ async def data_completeness() -> JSONResponse:
     return JSONResponse(content=result)
 
 
+@app.get("/api/insights/activity-summary")
+async def activity_summary(days: int = Query(ACTIVITY_SUMMARY_DEFAULT_DAYS, ge=1, le=90)) -> JSONResponse:
+    """Return consented first-party activity per day, by event type and by ranking policy.
+
+    Reads only the precomputed summary. The raw `activity` tables are never touched on a
+    request path: the consent filter runs in the scheduled computation, and what an operator
+    sees here is its output.
+    """
+    if not _pool:
+        return JSONResponse(content={"error": "Service not ready"}, status_code=503)
+
+    cutoff = (datetime.now(UTC) - timedelta(days=days - 1)).date()
+    cache_key = f"insights:activity-summary:{days}"
+    # Read the generation BEFORE the DB read — see insights/cache.py.
+    generation = await _cache.generation() if _cache else 0
+    if _cache:
+        cached = await _cache.get(cache_key, generation)
+        if cached is not None:
+            return JSONResponse(content=cached)
+
+    async with _pool.connection() as conn, conn.cursor() as cursor:
+        cursor = cast("Any", cursor)
+        await cursor.execute(
+            "SELECT summary_date, dimension, dimension_key, record_count, subject_count, candidate_set_count "
+            "FROM insights.activity_summary "
+            "WHERE summary_date >= %s "
+            "ORDER BY summary_date DESC, dimension, dimension_key",
+            (cutoff,),
+        )
+        rows = await cursor.fetchall()
+
+    items = [
+        ActivitySummaryItem(
+            summary_date=r[0],
+            dimension=r[1],
+            dimension_key=r[2],
+            record_count=r[3],
+            subject_count=r[4],
+            candidate_set_count=r[5],
+        ).model_dump(mode="json")
+        for r in rows
+    ]
+    result = {"days": days, "since": cutoff.isoformat(), "items": items, "count": len(items)}
+    if _cache:
+        await _cache.set(cache_key, result, generation)
+    return JSONResponse(content=result)
+
+
 @app.get("/api/insights/status")
 async def computation_status() -> JSONResponse:
     """Return the latest computation status for each insight type."""
@@ -517,6 +566,7 @@ async def computation_status() -> JSONResponse:
         "data_completeness",
         "community_enrichment",
         "release_rarity",
+        "activity_summary",
     ]
     statuses: list[dict[str, Any]] = []
 

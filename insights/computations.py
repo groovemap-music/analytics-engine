@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, cast
+from typing import TYPE_CHECKING, Any, Concatenate, Final, ParamSpec, cast
 
 import httpx
 import structlog
 from common import describe_exception
 from psycopg.types.json import Jsonb
 
+from insights.activity import PRODUCT_ANALYTICS, read_events, read_impressions
 from insights.catalog_api_contract import (
     ANNIVERSARIES_PATH,
     ARTIST_CENTRALITY_PATH,
@@ -26,7 +28,9 @@ from insights.telemetry import computation_span, record_computation
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine
+    from collections.abc import Callable, Coroutine, Iterable
+    from datetime import date
+    from uuid import UUID
 
 
 logger = structlog.get_logger(__name__)
@@ -413,6 +417,155 @@ async def compute_and_store_rarity(client: httpx.AsyncClient, pool: Any) -> int:
     return len(results)
 
 
+# ── Activity summary ────────────────────────────────────────────────────────
+#
+# The one computation that reads PostgreSQL rather than catalog-api. Its inputs are
+# `activity.events` and `activity.impressions`, reached only through insights/activity.py
+# so ADR 0010's two consent checks are both applied, and filtered on `product_analytics`:
+# counting what happened is product analytics, and a subject who consented to model
+# training has not thereby consented to being counted here.
+
+# The table this computation writes and `/api/insights/activity-summary` reads. It is
+# DECLARED IN `database-schema`, not here: this repository contains no DDL and every other
+# `insights.*` table is created by that repository's `_INSIGHTS_STATEMENTS`. Adding the
+# table there is the filed follow-on; `tests/test_activity_summary.py` documents it and
+# keeps the SQL below agreeing with this name.
+ACTIVITY_SUMMARY_TABLE: Final = "insights.activity_summary"
+
+# Whole UTC days of activity each run summarises. Seven covers a week of daily runs with
+# enough overlap that one skipped cycle leaves no gap.
+ACTIVITY_SUMMARY_DEFAULT_DAYS: Final = 7
+
+# The two groupings the summary carries, distinguished by the `dimension` column: events
+# grouped by type, impressions grouped by ranking policy.
+EVENT_TYPE_DIMENSION: Final = "event_type"
+POLICY_ID_DIMENSION: Final = "policy_id"
+
+
+@dataclass
+class _ActivityBucket:
+    """The running counts for one ``(day, dimension, key)`` group."""
+
+    records: int = 0
+    subjects: set[UUID] = field(default_factory=set)
+    candidate_sets: set[UUID] = field(default_factory=set)
+
+
+def activity_summary_window(days: int, now: datetime | None = None) -> tuple[datetime, datetime]:
+    """Return the half-open ``occurred_at`` bound covering the last ``days`` whole UTC days.
+
+    Whole days, because the summary is keyed by date and a window that started mid-day would
+    make the oldest row mean something different from the rest. The upper bound is the start
+    of tomorrow, so today is included in full and is simply incomplete until the day ends —
+    each run rewrites it.
+
+    Args:
+        days: Number of whole UTC days to cover, including today.
+        now: The moment to anchor on. Defaults to the current time.
+
+    Returns:
+        ``(since, until)``, inclusive lower and exclusive upper.
+
+    Raises:
+        ValueError: If ``days`` is not positive.
+    """
+    if days < 1:
+        raise ValueError(f"days must be positive, got {days}")
+    moment = now or datetime.now(UTC)
+    midnight = moment.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    until = midnight + timedelta(days=1)
+    return until - timedelta(days=days), until
+
+
+def _activity_summary_rows(buckets: dict[tuple[date, str, str], _ActivityBucket]) -> list[tuple[Any, ...]]:
+    """Flatten the accumulated buckets into insertable rows, in a stable order.
+
+    ``candidate_set_count`` is null for the event rows: a candidate set is a property of a
+    ranking decision, so counting them for an event would be counting nothing rather than
+    counting zero.
+    """
+    return [
+        (
+            summary_date,
+            dimension,
+            dimension_key,
+            bucket.records,
+            len(bucket.subjects),
+            len(bucket.candidate_sets) if dimension == POLICY_ID_DIMENSION else None,
+        )
+        for (summary_date, dimension, dimension_key), bucket in sorted(buckets.items())
+    ]
+
+
+async def _store_activity_summary(pool: Any, since: date, until: date, rows: Iterable[tuple[Any, ...]]) -> None:
+    """Replace the summary rows covering ``[since, until)`` with ``rows``.
+
+    The window is rewritten even when it is empty, which is where this differs from the
+    catalog-derived computations above: those leave the previous snapshot intact on an empty
+    producer result, because an empty result there means the producer had nothing to say. An
+    empty result here can mean a subject revoked consent, and the previous run's counts for
+    that subject must not survive it.
+    """
+    async with pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute(
+                "DELETE FROM insights.activity_summary WHERE summary_date >= %s AND summary_date < %s",
+                (since, until),
+            )
+            for row in rows:
+                await cursor.execute(
+                    """
+                        INSERT INTO insights.activity_summary
+                            (summary_date, dimension, dimension_key, record_count, subject_count, candidate_set_count)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                    row,
+                )
+
+
+@_record_lifecycle("activity_summary", "❌ Activity summary computation failed")
+async def compute_and_store_activity_summary(client: httpx.AsyncClient, pool: Any, days: int = ACTIVITY_SUMMARY_DEFAULT_DAYS) -> int:
+    """Summarise consented first-party activity, so operators can see it flowing.
+
+    Per day and event type, the number of events and the number of distinct subjects. Per
+    day and ranking policy, the number of impressions, the distinct subjects, and the
+    distinct candidate sets. Nothing here reaches a raw activity row: the summary is what
+    an operator reads, and the consent filter is what produced it.
+
+    Args:
+        client: Unused. Every other computation fetches from catalog-api; this one reads the
+            shared database, and keeps the signature so ``_record_lifecycle`` and
+            ``run_all_computations`` treat all eight computations identically.
+        pool: The shared PostgreSQL pool. The ``activity`` and ``insights`` schemas live in
+            the same database.
+        days: Whole UTC days to summarise, including today.
+
+    Returns:
+        The number of summary rows written.
+    """
+    del client
+    since, until = activity_summary_window(days)
+    buckets: dict[tuple[date, str, str], _ActivityBucket] = {}
+
+    async with pool.connection() as conn:
+        async for event in read_events(conn, since=since, until=until, purposes=(PRODUCT_ANALYTICS,)):
+            bucket = buckets.setdefault((event.occurred_at.astimezone(UTC).date(), EVENT_TYPE_DIMENSION, event.event_type), _ActivityBucket())
+            bucket.records += 1
+            bucket.subjects.add(event.subject_id)
+        async for impression in read_impressions(conn, since=since, until=until, purposes=(PRODUCT_ANALYTICS,)):
+            bucket = buckets.setdefault((impression.occurred_at.astimezone(UTC).date(), POLICY_ID_DIMENSION, impression.policy_id), _ActivityBucket())
+            bucket.records += 1
+            bucket.subjects.add(impression.subject_id)
+            bucket.candidate_sets.add(impression.candidate_set_id)
+
+    rows = _activity_summary_rows(buckets)
+    await _store_activity_summary(pool, since.date(), until.date(), rows)
+    logger.info("💾 Activity summary stored", count=len(rows), since=since.date().isoformat(), until=until.date().isoformat())
+    return len(rows)
+
+
 async def run_all_computations(
     client: httpx.AsyncClient,
     pool: Any,
@@ -435,6 +588,7 @@ async def run_all_computations(
         ("data_completeness", lambda: compute_and_store_data_completeness(client, pool)),
         ("community_enrichment", lambda: compute_and_store_community_enrichment(client, pool)),
         ("release_rarity", lambda: compute_and_store_rarity(client, pool)),
+        ("activity_summary", lambda: compute_and_store_activity_summary(client, pool)),
     ]
 
     for name, factory in computations:

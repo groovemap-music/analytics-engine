@@ -22,6 +22,7 @@ COMPUTATION_NAMES = (
     "data_completeness",
     "community_enrichment",
     "release_rarity",
+    "activity_summary",
 )
 
 
@@ -223,6 +224,7 @@ class TestReadTimeoutIsDiagnosable:
             patch.object(computations, "compute_and_store_data_completeness", return_value=0),
             patch.object(computations, "compute_and_store_community_enrichment", return_value=0),
             patch.object(computations, "compute_and_store_rarity", return_value=0),
+            patch.object(computations, "compute_and_store_activity_summary", return_value=0),
             patch.object(computations.logger, "error") as mock_log_error,
         ):
             await computations.run_all_computations(mock_client, mock_pool)
@@ -695,7 +697,7 @@ class TestLogComputationFailureDuringError:
 
 class TestRunAllComputations:
     @pytest.mark.asyncio
-    async def test_runs_all_five(self) -> None:
+    async def test_runs_every_computation(self) -> None:
         from insights.computations import run_all_computations
 
         mock_client = AsyncMock()
@@ -709,6 +711,7 @@ class TestRunAllComputations:
             patch("insights.computations.compute_and_store_data_completeness", return_value=4),
             patch("insights.computations.compute_and_store_community_enrichment", return_value=100),
             patch("insights.computations.compute_and_store_rarity", return_value=7),
+            patch("insights.computations.compute_and_store_activity_summary", return_value=7),
         ):
             results = await run_all_computations(mock_client, mock_pool)
 
@@ -719,6 +722,7 @@ class TestRunAllComputations:
         assert results["data_completeness"] == 4
         assert results["community_enrichment"] == 100
         assert results["release_rarity"] == 7
+        assert results["activity_summary"] == 7
 
     @pytest.mark.asyncio
     async def test_passes_milestone_years_to_anniversaries(self) -> None:
@@ -736,6 +740,7 @@ class TestRunAllComputations:
             patch("insights.computations.compute_and_store_data_completeness", return_value=0),
             patch("insights.computations.compute_and_store_community_enrichment", return_value=0),
             patch("insights.computations.compute_and_store_rarity", return_value=0),
+            patch("insights.computations.compute_and_store_activity_summary", return_value=0),
         ):
             await run_all_computations(mock_client, mock_pool, milestone_years=custom_milestones)
 
@@ -756,6 +761,7 @@ class TestRunAllComputations:
             patch("insights.computations.compute_and_store_data_completeness", return_value=4),
             patch("insights.computations.compute_and_store_community_enrichment", return_value=100),
             patch("insights.computations.compute_and_store_rarity", return_value=7),
+            patch("insights.computations.compute_and_store_activity_summary", return_value=7),
             patch("insights.computations.record_computation") as mock_record,
         ):
             await run_all_computations(mock_client, mock_pool)
@@ -769,6 +775,7 @@ class TestRunAllComputations:
             "data_completeness",
             "community_enrichment",
             "release_rarity",
+            "activity_summary",
         }
         assert all(success for _duration, success in recorded.values())
         assert all(duration >= 0 for duration, _success in recorded.values())
@@ -788,6 +795,7 @@ class TestRunAllComputations:
             patch("insights.computations.compute_and_store_data_completeness", return_value=4),
             patch("insights.computations.compute_and_store_community_enrichment", return_value=100),
             patch("insights.computations.compute_and_store_rarity", return_value=7),
+            patch("insights.computations.compute_and_store_activity_summary", return_value=7),
             patch("insights.computations.record_computation") as mock_record,
         ):
             results = await run_all_computations(mock_client, mock_pool)
@@ -812,6 +820,7 @@ class TestRunAllComputations:
             patch("insights.computations.compute_and_store_data_completeness", return_value=4),
             patch("insights.computations.compute_and_store_community_enrichment", return_value=100),
             patch("insights.computations.compute_and_store_rarity", return_value=7),
+            patch("insights.computations.compute_and_store_activity_summary", return_value=7),
         ):
             await run_all_computations(mock_client, mock_pool)
 
@@ -839,6 +848,7 @@ class TestRunAllComputations:
             patch("insights.computations.compute_and_store_data_completeness", return_value=4),
             patch("insights.computations.compute_and_store_community_enrichment", return_value=100),
             patch("insights.computations.compute_and_store_rarity", return_value=7),
+            patch("insights.computations.compute_and_store_activity_summary", return_value=7),
         ):
             await run_all_computations(mock_client, mock_pool)
 
@@ -875,6 +885,7 @@ class TestRunAllComputations:
             patch("insights.computations.compute_and_store_data_completeness", return_value=0),
             patch("insights.computations.compute_and_store_community_enrichment", return_value=0),
             patch("insights.computations.compute_and_store_rarity", return_value=0),
+            patch("insights.computations.compute_and_store_activity_summary", return_value=0),
         ):
             await run_all_computations(mock_client, mock_pool)
 
