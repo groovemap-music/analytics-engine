@@ -83,7 +83,7 @@ class TestComputationStatusEndpoint:
         data = response.json()
         assert "statuses" in data
         # All 7 insight types should show 'never_run' since fetchone returns None (includes community_enrichment)
-        assert len(data["statuses"]) == 7
+        assert len(data["statuses"]) == 8
         for status in data["statuses"]:
             assert status["status"] == "never_run"
 

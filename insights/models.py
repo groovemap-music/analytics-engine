@@ -1,6 +1,6 @@
 """Pydantic response models for the GrooveMap analytics engine."""
 
-from datetime import datetime  # noqa: TC003  # Pydantic resolves this annotation at runtime.
+from datetime import date, datetime  # noqa: TC003  # Pydantic resolves these annotations at runtime.
 
 from pydantic import BaseModel, Field
 
@@ -109,3 +109,26 @@ class ComputationStatus(BaseModel):
     last_computed: datetime | None = None
     status: str
     duration_ms: int | None = None
+
+
+class ActivitySummaryItem(BaseModel):
+    """One day's consented first-party activity for one dimension key.
+
+    Two row shapes share the table, told apart by ``dimension``. ``event_type`` rows count
+    events of that type; ``policy_id`` rows count impressions served by that ranking policy.
+    ``candidate_set_count`` is therefore populated only on the impression rows: a candidate
+    set describes a ranking decision, and an event has none to count.
+
+    Every count here was produced by the consent-aware read path, so a subject who has
+    revoked consent contributes to no row computed after the revocation.
+    """
+
+    summary_date: date
+    dimension: str = Field(description="Which grouping the row belongs to: event_type or policy_id.")
+    dimension_key: str = Field(description="The event type, or the ranking policy id.")
+    record_count: int = Field(description="Events of this type, or impressions served by this policy, on this day.")
+    subject_count: int = Field(description="Distinct consenting subjects behind those records.")
+    candidate_set_count: int | None = Field(
+        default=None,
+        description="Distinct candidate sets, on policy_id rows only; null on event_type rows.",
+    )

@@ -6,6 +6,7 @@ The analytics engine turns expensive catalog and graph queries into scheduled, r
 flowchart LR
     Scheduler[analytics-engine scheduler] --> Compute[analytics computations]
     Compute -->|GET promoted internal endpoints| Catalog[catalog-api]
+    Compute -->|consent-aware read| Activity[(PostgreSQL activity schema)]
     Catalog -->|versioned contract payloads| Compute
     Compute -->|transactional snapshot writes| Postgres[(PostgreSQL insights schema)]
     Clients[internal consumers] -->|HTTP :8008| API
@@ -30,14 +31,27 @@ The promoted OpenAPI document is the authority for the producer transport. This 
 | `data_completeness` | `/api/internal/insights/data-completeness` | `insights.data_completeness` | `/api/insights/data-completeness` |
 | `community_enrichment` | `/api/internal/insights/community-enrichment` | Triggers the producer-owned bounded enrichment batch | No dedicated read endpoint |
 | `release_rarity` | `/api/internal/insights/rarity-scores` | `insights.release_rarity` | `/api/insights/release-rarity` |
+| `activity_summary` | None — reads `activity.events` and `activity.impressions` directly | `insights.activity_summary` | `/api/insights/activity-summary` |
 
-`/api/insights/status` reads the latest `insights.computation_log` row for all seven computation keys. `/health` is also available on the FastAPI port; the independently served readiness probe is `GET /health` on port 8009.
+`/api/insights/status` reads the latest `insights.computation_log` row for all eight computation keys. `/health` is also available on the FastAPI port; the independently served readiness probe is `GET /health` on port 8009.
 
 ## Scheduled precomputation
 
-The scheduler waits 30 seconds after startup, then runs artist centrality, genre trends, label longevity, monthly anniversaries, data completeness, community enrichment, and release rarity sequentially. Each computation has an endpoint-specific HTTP read budget and records `completed` or `failed` in `insights.computation_log`. A failed computation does not prevent later computations from running. Non-empty result sets replace their corresponding rows transactionally; an empty producer result leaves the previous snapshot intact. Community enrichment is a producer-side operation and records its returned `enriched` count rather than writing a result table here.
+The scheduler waits 30 seconds after startup, then runs artist centrality, genre trends, label longevity, monthly anniversaries, data completeness, community enrichment, release rarity, and the activity summary sequentially. Each computation has an endpoint-specific HTTP read budget and records `completed` or `failed` in `insights.computation_log`. A failed computation does not prevent later computations from running. Non-empty result sets replace their corresponding rows transactionally; an empty producer result leaves the previous snapshot intact. Community enrichment is a producer-side operation and records its returned `enriched` count rather than writing a result table here. The activity summary is the one exception to the empty-result rule and rewrites its window either way, for the reason given below.
 
 The next cycle begins one configured interval after the preceding cycle started (or immediately if a cycle outlasts the interval). Precomputation is deliberate: expensive graph aggregation occurs on a schedule, while read endpoints perform bounded PostgreSQL queries. This separates computation latency from request latency and gives operators a durable status record for each computation.
+
+## Activity summary and the consent filter
+
+The activity summary is the one computation whose input is PostgreSQL rather than `catalog-api`. It reads the first-party behavioural tables ADR 0010 defines — `activity.events` and `activity.impressions` — and records, per UTC day, how many events of each type occurred and how many distinct subjects produced them, and how many impressions each ranking policy served together with the distinct subjects and candidate sets behind them. Operators can see that events and impressions are flowing, by type and by policy, without reading a raw behavioural row.
+
+Every read goes through [`insights/activity.py`](../insights/activity.py), which is the only place in this service that touches the `activity` schema. ADR 0010 enforces consent twice and says neither check replaces the other, so that module applies both: the row's write-time `consent_purposes` snapshot, which records what was permitted when the row was written, and a re-check against `activity.consent_grants`, which enforces what is permitted now. `training_eligible_subjects` is the second check; `read_events` and `read_impressions` compute it themselves rather than accepting a subject set from the caller, and their optional `subjects` argument narrows that set rather than replacing it, so no call shape reaches a subject the grant table does not currently allow. The module issues no `INSERT`, `UPDATE`, or `DELETE`, and never selects a user id — only the pseudonymous `subject_id` leaves it.
+
+Both reads are bounded half-open on `occurred_at`, because both tables are `PARTITION BY RANGE (occurred_at)` and the bound is what lets the planner prune to the months actually asked for. Within that bound they are keyset-paged on the tables' own primary keys, `(occurred_at, event_id)` and `(occurred_at, impression_id)`.
+
+The summary filters on the `product_analytics` purpose. Counting what happened is product analytics; a subject who consented to model training has not thereby consented to being counted here, and a training reader filters on `model_training` instead. Each run rewrites the whole window it covers, including when that window summarises nothing. This differs deliberately from the catalog-derived computations, which leave the previous snapshot intact on an empty producer result: an empty result there means the producer had nothing to say, while an empty result here can mean a subject revoked consent, and the previous run's counts for that subject must not survive it.
+
+`insights.activity_summary` is declared in `database-schema` like every other `insights.*` table; this repository holds no DDL. `tests/test_activity_summary.py` carries the table definition as the filed follow-on and fails if a `CREATE TABLE` is introduced here instead.
 
 ## Cache consistency
 
