@@ -16,11 +16,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from common import AsyncPostgreSQLPool
 from common import telemetry as _common_telemetry
 from fastapi.testclient import TestClient
 from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from psycopg import AsyncConnection, AsyncCursor, AsyncTransaction
 
 from insights import telemetry as _telemetry
 
@@ -114,26 +116,24 @@ def mock_http_client() -> AsyncMock:
 
 
 @pytest.fixture
-def mock_pg_pool() -> AsyncMock:
-    """Mock PostgreSQL pool."""
-    mock_cursor = AsyncMock()
-    mock_cursor.execute = AsyncMock()
-    mock_cursor.fetchall = AsyncMock(return_value=[])
-    mock_cursor.fetchone = AsyncMock(return_value=None)
-    mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
-    mock_cursor.__aexit__ = AsyncMock(return_value=False)
+def mock_pg_pool() -> MagicMock:
+    """Return a strict pool with faithful Psycopg async context boundaries."""
+    mock_cursor = AsyncMock(spec_set=AsyncCursor)
+    mock_cursor.fetchall.return_value = []
+    mock_cursor.fetchone.return_value = None
+    mock_cursor.__aenter__.return_value = mock_cursor
+    mock_cursor.__aexit__.return_value = False
 
-    mock_conn = AsyncMock()
+    mock_conn = AsyncMock(spec_set=AsyncConnection)
     mock_conn.cursor = MagicMock(return_value=mock_cursor)
-    # Support conn.transaction() as an async context manager
-    mock_tx_cm = AsyncMock()
-    mock_tx_cm.__aenter__ = AsyncMock(return_value=None)
-    mock_tx_cm.__aexit__ = AsyncMock(return_value=None)
+    mock_tx_cm = AsyncMock(spec_set=AsyncTransaction)
+    mock_tx_cm.__aenter__.return_value = mock_tx_cm
+    mock_tx_cm.__aexit__.return_value = False
     mock_conn.transaction = MagicMock(return_value=mock_tx_cm)
-    mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
-    mock_conn.__aexit__ = AsyncMock(return_value=False)
+    mock_conn.__aenter__.return_value = mock_conn
+    mock_conn.__aexit__.return_value = False
 
-    pool = AsyncMock()
+    pool = MagicMock(spec_set=AsyncPostgreSQLPool)
     pool.connection = MagicMock(return_value=mock_conn)
     return pool
 
