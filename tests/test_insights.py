@@ -82,7 +82,6 @@ class TestComputationStatusEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "statuses" in data
-        # All 7 insight types should show 'never_run' since fetchone returns None (includes community_enrichment)
         assert len(data["statuses"]) == 8
         for status in data["statuses"]:
             assert status["status"] == "never_run"
@@ -108,7 +107,6 @@ class TestComputationStatusEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "statuses" in data
-        # Each status should have "completed"
         for status in data["statuses"]:
             assert status["status"] == "completed"
 
@@ -814,7 +812,7 @@ class TestLifespan:
         mock_cache = MagicMock()
 
         mock_config = MagicMock()
-        mock_config.postgres_host = "postgres"  # No port
+        mock_config.postgres_host = "postgres"  # Use the default PostgreSQL port.
         mock_config.postgres_database = "test"
         mock_config.postgres_username = "user"
         mock_config.postgres_password = "pass"
@@ -898,7 +896,6 @@ class TestLifespan:
                 assert "X-Internal-Secret" not in headers
                 assert headers["User-Agent"] == _module.USER_AGENT
 
-            # The missing-secret warning was emitted.
             assert any("INSIGHTS_INTERNAL_SECRET is not set" in str(c.args[0]) for c in mock_warning.call_args_list)
 
     @pytest.mark.asyncio
