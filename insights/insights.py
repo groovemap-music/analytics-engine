@@ -298,7 +298,7 @@ async def genre_trends(genre: str = Query(...)) -> JSONResponse:
     # defended against nothing while corrupting distinct genres' cached
     # responses (genre-cache-key collision regression).
     cache_key = f"insights:genre-trends:{genre}"
-    # Read the generation BEFORE the DB read — see insights/cache.py.
+    # Capture the generation before the DB read so cache writes use one snapshot.
     generation = await _cache.generation() if _cache else 0
     if _cache:
         cached = await _cache.get(cache_key, generation)
