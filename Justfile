@@ -34,9 +34,19 @@ typecheck:
     uv run mypy
 
 test:
-    uv run pytest --cov=insights --cov-report=term-missing --cov-report=xml
+    uv run pytest -m "not integration" --cov=insights --cov-report=term-missing --cov-report=xml
 
 coverage: test
+
+# Advisory tier: applies a minimal stand-in for ADR 0013's schema (embedding_pipeline role
+# and grants, the vector extension, public.artist_embeddings, and the graph edges this
+# pipeline reads — see tests/integration/conftest.py) to the existing local PG19+pgvector
+# image, and runs the embedding-pipeline suite that needs a live embedding_pipeline-scoped
+# connection. Never builds the image itself — reuses database-schema's own
+# `database-schema-postgres19-pgvector:local` tag, built by that repository's
+# `test-integration-pg19` recipe.
+test-integration-pg19:
+    bash scripts/test-integration-pg19.sh
 
 build:
     uv build --out-dir dist --clear

@@ -39,6 +39,7 @@ dependencies = [
 
 [project.scripts]
 analytics-engine = "insights.insights:main"
+analytics-engine-embeddings = "insights.embedding_pipeline:main"
 
 [project.urls]
 Homepage = "https://groovemap.music"
