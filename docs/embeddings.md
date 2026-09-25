@@ -138,14 +138,22 @@ upsert, since the stored value already differs per dump.
 **No index DDL, ever.** `embedding_pipeline` holds no DDL privilege and no ownership of
 `public.artist_embeddings` — building or rebuilding the ANN index over a stored `model_version`
 is always a separate, more privileged, human- or automation-driven operator step, run after this
-job's transaction commits. The job logs the statement that step should run (a stored-
+job's transaction commits. The job logs the statement that step should run: a stored-
 `model_version`-filtered `CREATE INDEX CONCURRENTLY ... USING hnsw (embedding
-halfvec_cosine_ops) WHERE model_version = '...'`, with the value safely quoted and the index
-name derived through `_index_name_slug` since a dump id can carry characters that are not valid
-in an unquoted identifier); per-`model_version` partial indexes (`gm-database-schema-19g5`) are
-not landed as of this writing, so the statement logged is the forward-looking shape the
-maintainer specified rather than something database-schema documents today. Retiring a
-superseded `model_version`'s rows and index, once `catalog-api` has switched to the new one, is
+halfvec_cosine_ops) WITH (m = 16, ef_construction = 64) WHERE model_version = '...'` — the
+`WITH` clause states ADR 0013's fixed HNSW parameters explicitly rather than leaving them to
+pgvector's own defaults. The `WHERE` value is safely quoted (`_sql_string_literal`); the index
+name comes from `_index_name`, not a plain truncated slug of the stored value —
+`FastRPConfig.model_version` alone is already well past PostgreSQL's 63-byte identifier limit
+(NAMEDATALEN - 1), so a naive slug would silently truncate before ever reaching the `@dump_id`
+suffix that makes two months distinct, giving every month the *same*, colliding index name
+(the round-2 review regression). `_index_name` instead composes a short, human-legible dump-id
+fragment with a hash of the *entire* stored value, so two different stored versions can never
+collide on one name, and the same stored version is always named the same thing. Per-
+`model_version` partial indexes (`gm-database-schema-19g5`) are not landed as of this writing,
+so the statement logged is the forward-looking shape the maintainer specified rather than
+something database-schema documents today. Retiring a superseded `model_version`'s rows and
+index, once `catalog-api` has switched to the new one, is
 that follow-on's business, never this job's.
 
 **Metrics.** `groovemap.insights.computation.duration` (histogram, `computation=

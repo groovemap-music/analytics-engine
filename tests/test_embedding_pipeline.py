@@ -285,10 +285,62 @@ class TestIndexNameSlug:
     def test_handles_a_stored_version_with_a_dump_id_suffix(self) -> None:
         stored = pipeline.stored_model_version(FastRPConfig(), "discogs-2026-09")
 
-        slug = pipeline._index_name_slug(stored)
+        slug = pipeline._index_name_slug(stored, max_length=48)
 
         assert slug
         assert all(character.isalnum() or character == "_" for character in slug)
+
+
+class TestIndexName:
+    """`FastRPConfig().model_version` alone is already 112 characters — well past what a
+    naive 48-byte slug of the stored value could ever preserve a dump-id suffix through. This
+    is the review-round-2 regression: every dump silently got the same, truncated index name.
+    """
+
+    def test_two_dumps_under_the_same_long_method_version_get_distinct_names(self) -> None:
+        config = FastRPConfig()
+        assert len(config.model_version) > pipeline._INDEX_NAME_MAX_LENGTH  # the bug's precondition
+
+        first = pipeline._index_name(pipeline.stored_model_version(config, "discogs-2026-09"))
+        second = pipeline._index_name(pipeline.stored_model_version(config, "discogs-2026-10"))
+
+        assert first != second
+
+    def test_is_deterministic_for_the_same_stored_version(self) -> None:
+        stored = pipeline.stored_model_version(FastRPConfig(), "discogs-2026-09")
+
+        assert pipeline._index_name(stored) == pipeline._index_name(stored)
+
+    @pytest.mark.parametrize(
+        "dump_id",
+        [
+            "d" * 500,
+            "dump/with/slashes/and spaces!!",
+            "",
+            "@" * 5 + "weird",
+        ],
+    )
+    def test_stays_within_the_postgres_identifier_limit(self, dump_id: str) -> None:
+        # A literal "@" can't appear in a real dump_id (stored_model_version rejects it), but
+        # the name-generation budget math must not go negative for any dump-id-shaped input
+        # that reaches it through the rsplit fallback either way.
+        stored = f"{FastRPConfig().model_version}@{dump_id}"
+
+        name = pipeline._index_name(stored)
+
+        assert len(name) <= pipeline._INDEX_NAME_MAX_LENGTH
+        assert name.startswith(pipeline._INDEX_NAME_PREFIX)
+        assert all(character.isalnum() or character == "_" for character in name)
+
+    def test_two_distinct_stored_versions_never_collide_even_when_dump_slugs_match(self) -> None:
+        """Two dump ids that slug to the same fragment (e.g. differing only in punctuation)
+        must still get different names — that is what the hash suffix is for."""
+        config = FastRPConfig()
+
+        first = pipeline._index_name(pipeline.stored_model_version(config, "discogs-2026-09"))
+        second = pipeline._index_name(pipeline.stored_model_version(config, "discogs 2026 09"))
+
+        assert first != second
 
 
 # ── Idempotency ──────────────────────────────────────────────────────────────────────────────
@@ -414,9 +466,12 @@ class TestLoadEmbeddings:
 
         operator_calls = [call for call in fake_logger.info.call_args_list if "Operator step" in call.args[0]]
         assert len(operator_calls) == 1
+        statement = operator_calls[0].kwargs["statement"]
         assert operator_calls[0].kwargs["model_version"] == expected_version
-        assert "CREATE INDEX CONCURRENTLY" in operator_calls[0].kwargs["statement"]
-        assert expected_version in operator_calls[0].kwargs["statement"]
+        assert "CREATE INDEX CONCURRENTLY" in statement
+        assert "WITH (m = 16, ef_construction = 64)" in statement
+        assert expected_version in statement
+        assert pipeline._index_name(expected_version) in statement
 
     @pytest.mark.asyncio
     async def test_logs_the_method_version_and_numpy_scipy_versions_at_the_start(self, monkeypatch: pytest.MonkeyPatch) -> None:

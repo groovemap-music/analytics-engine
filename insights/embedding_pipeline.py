@@ -88,6 +88,7 @@ by the deployment layer once a month, after that month's dump has loaded and `SO
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import sys
 import time
@@ -291,27 +292,63 @@ def _halfvec_literal(vector: NDArray[np.floating]) -> str:
     return "[" + ",".join(f"{value:g}" for value in vector.tolist()) + "]"
 
 
-def _index_name_slug(model_version: str) -> str:
-    """Turn a `model_version` string into a safe SQL-identifier fragment for the operator step.
+def _index_name_slug(value: str, *, max_length: int = 48) -> str:
+    """Turn a string into a safe, lowercase SQL-identifier fragment of at most `max_length`.
 
-    Logged only — this job never executes the statement it names.
+    Logged only — this job never executes a statement built from it.
     """
-    slug = _NAME_SLUG_PATTERN.sub("_", model_version.lower()).strip("_")
-    return slug[:48]
+    return _NAME_SLUG_PATTERN.sub("_", value.lower()).strip("_")[:max_length]
+
+
+# PostgreSQL identifiers are silently truncated at NAMEDATALEN - 1 bytes, never rejected — two
+# different names that agree up to this length become the same object. 63 is NAMEDATALEN - 1
+# on every supported build.
+_INDEX_NAME_MAX_LENGTH: Final = 63
+_INDEX_NAME_PREFIX: Final = "idx_artist_embeddings_"
+_INDEX_NAME_SUFFIX: Final = "_hnsw"
+# Hex characters of a BLAKE2b digest of the *full* stored model_version, giving the name
+# per-stored-version uniqueness independent of how much of it is human-legible.
+_INDEX_NAME_DIGEST_LENGTH: Final = 12
+
+
+def _index_name(model_version: str) -> str:
+    """A deterministic HNSW index name for one stored `model_version`, always <= 63 bytes.
+
+    `model_version` (`FastRPConfig.model_version`) alone routinely exceeds the 63-byte budget
+    on its own — `docs/embeddings.md`'s example is over 100 characters — so a plain truncated
+    slug of the *stored* value (`method_version@dump_id`) never reaches the `@dump_id` suffix
+    that makes two months distinct: every dump would get the identical, silently-truncated
+    name, and `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would then skip every month after the
+    first (gm-analytics-engine-ieu.2 review round 2).
+
+    The name is composed from a short, human-legible fragment of the dump id (for readability
+    in `psql \\di` output) and a fixed-width hash of the *entire* stored value (for
+    uniqueness): two different stored versions can never collide on the same name, whatever
+    the dump id looks like, and the same stored version always names the same index.
+    """
+    digest = hashlib.blake2b(model_version.encode(), digest_size=_INDEX_NAME_DIGEST_LENGTH // 2).hexdigest()
+    dump_id_part = model_version.rsplit(_STORED_VERSION_SEPARATOR, 1)[-1]
+    budget = _INDEX_NAME_MAX_LENGTH - len(_INDEX_NAME_PREFIX) - len(_INDEX_NAME_SUFFIX) - len(digest) - 1
+    dump_slug = _index_name_slug(dump_id_part, max_length=max(budget, 0))
+    middle = f"{dump_slug}_{digest}" if dump_slug else digest
+    return f"{_INDEX_NAME_PREFIX}{middle}{_INDEX_NAME_SUFFIX}"
 
 
 def _log_operator_step(model_version: str) -> None:
     """Log the ANN-index build this job never runs itself. See the module docstring.
 
     `model_version` here is the *stored* value (`stored_model_version(...)`, including the
-    dump id) — the WHERE clause must match what is actually in the table. The index name uses
-    `_index_name_slug`, since a dump id can carry characters (`@`, `-`, `/`, ...) that are not
-    valid in an unquoted SQL identifier; the WHERE clause's value uses `_sql_string_literal`.
+    dump id) — the WHERE clause must match what is actually in the table. The index name comes
+    from `_index_name`; the WHERE clause's value from `_sql_string_literal`. `m = 16` and
+    `ef_construction = 64` are ADR 0013's fixed HNSW parameters (docs/architecture.md,
+    "Building the artist HNSW index" in database-schema) — stated explicitly rather than left
+    to pgvector's own defaults, so the logged statement matches what an upgrade of pgvector's
+    defaults would not silently change underneath it.
     """
-    index_name = f"idx_artist_embeddings_{_index_name_slug(model_version)}_hnsw"
+    index_name = _index_name(model_version)
     statement = (
         f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} "
-        f"ON {ARTIST_EMBEDDINGS_TABLE} USING hnsw (embedding halfvec_cosine_ops) "
+        f"ON {ARTIST_EMBEDDINGS_TABLE} USING hnsw (embedding halfvec_cosine_ops) WITH (m = 16, ef_construction = 64) "
         f"WHERE model_version = {_sql_string_literal(model_version)}"
     )
     logger.info(
