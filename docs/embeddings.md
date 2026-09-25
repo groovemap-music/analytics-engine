@@ -110,26 +110,43 @@ was measured against, which stays within the 12 GB full-catalog budget.
 **Lineage.** `SOURCE_DUMP_ID` and `SOURCE_DUMP_DATE` (required, no default — the invoker
 supplies them, since it is the one that knows which dump just landed) become
 `artist_embeddings.source_dump_id`/`source_dump_date` on every row the run writes.
+`numpy_version`/`scipy_version` (bit-identity holds only for one build of each — see
+"Determinism" above) are recorded in the run's own logs at the start of every call, since
+`artist_embeddings` has no column for them.
 
-**Idempotency.** The job is idempotent per `(source_dump_id, model_version)`: re-running for a
-dump already recorded under a `model_version` is a no-op — it does not re-read the graph or
-re-run `fastrp`. A *different* dump under the *same* `model_version` is not idempotent against
-it: the pipeline recomputes and upserts, updating the existing rows' vectors and lineage in
-place, because `model_version` names the method and its parameters, not a point in time. Every
-read and write this job makes is scoped to the `model_version` it is computing — it never
-touches a row of any other `model_version`, so a version `catalog-api` is currently serving is
-untouched by a load of a new one.
+**The stored `model_version` is per dump, not per algorithm.** `FastRPConfig.model_version`
+names only the method, its parameters, and the projection seed rule — the same string every
+month an operator does not change the algorithm. `stored_model_version(config, dump_id)`
+(`f"{config.model_version}@{dump_id}"`) is the value this job actually reads and writes as
+`artist_embeddings.model_version`; `config.model_version` itself is recorded separately, as
+`method_version`, in every log line. Composing the dump id in is what lets two months coexist
+under the table's `(artist_id, model_version)` primary key — a second month's load is a
+brand-new set of rows under its own key, never an upsert of the first month's. An earlier
+revision of this job stored the bare `config.model_version`, which meant a second dump would
+silently overwrite the first month's rows in place; see the module docstring's "The stored
+model_version is per dump, not per algorithm" for the full rationale this review caught.
+
+**Idempotency.** The job is idempotent per stored `model_version` (which already encodes
+`(dump_id, method_version)`): re-running for a dump already recorded under this algorithm is a
+no-op — it does not re-read the graph or re-run `fastrp`. Every read and write this job makes is
+scoped to the stored `model_version` it is computing — it never touches a row of any other
+stored `model_version`, so both an earlier month's rows and a version `catalog-api` is currently
+serving are untouched by a load of a new one. `ON CONFLICT (artist_id, model_version) DO UPDATE`
+in the write is retry safety for a crash within the *same* dump's load, never a cross-dump
+upsert, since the stored value already differs per dump.
 
 **No index DDL, ever.** `embedding_pipeline` holds no DDL privilege and no ownership of
-`public.artist_embeddings` — building or rebuilding the ANN index over a `model_version` is
-always a separate, more privileged, human- or automation-driven operator step, run after this
-job's transaction commits. The job logs the statement that step should run (a
+`public.artist_embeddings` — building or rebuilding the ANN index over a stored `model_version`
+is always a separate, more privileged, human- or automation-driven operator step, run after this
+job's transaction commits. The job logs the statement that step should run (a stored-
 `model_version`-filtered `CREATE INDEX CONCURRENTLY ... USING hnsw (embedding
-halfvec_cosine_ops) WHERE model_version = '...'`); per-`model_version` partial indexes
-(`gm-database-schema-19g5`) are not landed as of this writing, so the statement logged is the
-forward-looking shape the maintainer specified rather than something database-schema documents
-today. Retiring a superseded `model_version`'s rows and index, once `catalog-api` has switched
-to the new one, is that follow-on's business, never this job's.
+halfvec_cosine_ops) WHERE model_version = '...'`, with the value safely quoted and the index
+name derived through `_index_name_slug` since a dump id can carry characters that are not valid
+in an unquoted identifier); per-`model_version` partial indexes (`gm-database-schema-19g5`) are
+not landed as of this writing, so the statement logged is the forward-looking shape the
+maintainer specified rather than something database-schema documents today. Retiring a
+superseded `model_version`'s rows and index, once `catalog-api` has switched to the new one, is
+that follow-on's business, never this job's.
 
 **Metrics.** `groovemap.insights.computation.duration` (histogram, `computation=
 embedding_pipeline`, reusing the same instrument every other scheduled computation uses),
@@ -144,16 +161,18 @@ lineage columns are the only durable record this job can leave.
 the deployment layer once a month, after that month's dump has loaded and `SOURCE_DUMP_ID`/
 `SOURCE_DUMP_DATE` are known. The exact monthly trigger (cron, a `CronJob`, an operator running
 it by hand — the same shape as database-schema's own `build_artist_embeddings_index` operator
-procedure) is a deployment-repo concern this bead does not fix.
+procedure) is a deployment-repo concern this bead does not fix; filed as gm-deployment-cy6.
 
 **Testing.** `tests/test_embedding_pipeline.py` exercises the real FastRP/graph code against
-small in-memory fakes of the PostgreSQL connection — no database, no Docker.
+small in-memory fakes of the PostgreSQL connection — no database, no Docker, including that two
+dumps under one config get different stored versions rather than one upserting the other.
 `tests/integration/test_embedding_pipeline_integration.py` (`just test-integration-pg19`) runs
 against a real PostgreSQL 19 + pgvector container with a real `embedding_pipeline`-scoped
-login, asserting the idempotency and permission-boundary behavior above against the engine
-itself, on a small synthetic graph. That tier's `conftest.py` applies a minimal, inline stand-in
-for the ADR 0013 schema objects rather than taking `database-schema` as a dependency —
-`database-schema`'s own molecule that adds them (`gm-database-schema-lhp2`) had not reached
-`origin/main` as of this bead; see that `conftest.py`'s module docstring for the follow-up.
-Neither test tier commits provider-derived data or real embeddings, per ADR 0013's data-rights
-section.
+login, asserting the idempotency, coexistence, and permission-boundary behavior above against
+the engine itself — including that an earlier dump's rows are byte-for-byte unchanged after a
+later dump loads — on a small synthetic graph. That tier's `conftest.py` applies a minimal,
+inline stand-in for the ADR 0013 schema objects rather than taking `database-schema` as a
+dependency — `database-schema`'s own molecule that adds them (`gm-database-schema-lhp2`) had
+not reached `origin/main` as of this bead; filed as gm-analytics-engine-qzl, and see that
+`conftest.py`'s module docstring for the detail. Neither test tier commits provider-derived
+data or real embeddings, per ADR 0013's data-rights section.

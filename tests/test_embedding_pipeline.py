@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, Mock
 
 import numpy as np
 import pytest
+import scipy
 
 from insights import embedding_pipeline as pipeline
 from insights.embeddings import FastRPConfig
@@ -30,17 +31,18 @@ class _NullTransaction:
 
 
 class FakeCursor:
-    """One cursor's worth of canned `fetchmany`/`fetchone` results."""
+    """One cursor's worth of canned `fetchmany` results, plus an optional `fetchone` resolver."""
 
     def __init__(
         self,
         *,
         rows_batches: list[list[tuple[Any, ...]]] | None = None,
-        fetchone_value: tuple[Any, ...] | None = None,
+        fetchone_resolver: Any = None,
         executemany_log: list[tuple[str, list[tuple[Any, ...]]]] | None = None,
     ) -> None:
         self._batches = [list(batch) for batch in (rows_batches or [])]
-        self.fetchone_value = fetchone_value
+        self._fetchone_resolver = fetchone_resolver
+        self._last_execute_params: Any = None
         self.executed: list[tuple[str, Any]] = []
         self._executemany_log = executemany_log
 
@@ -52,12 +54,15 @@ class FakeCursor:
 
     async def execute(self, sql: str, params: Any = None) -> None:
         self.executed.append((sql, params))
+        self._last_execute_params = params
 
     async def fetchmany(self, _size: int) -> list[tuple[Any, ...]]:
         return self._batches.pop(0) if self._batches else []
 
     async def fetchone(self) -> tuple[Any, ...] | None:
-        return self.fetchone_value
+        if self._fetchone_resolver is None:
+            return None
+        return self._fetchone_resolver(self._last_execute_params)
 
     async def executemany(self, sql: str, batch: Any) -> None:
         rows = list(batch)
@@ -66,25 +71,29 @@ class FakeCursor:
 
 
 class FakeConnection:
-    """A synthetic graph plus the idempotency row `_already_loaded` should see."""
+    """A synthetic graph plus the stored `model_version`s `_already_loaded` should already see."""
 
     def __init__(
         self,
         *,
         vertex_rows: list[tuple[str, str]],
         edge_rows: dict[str, list[tuple[Any, Any]]],
-        already_loaded_row: tuple[Any, ...] | None = None,
+        already_loaded_versions: frozenset[str] = frozenset(),
     ) -> None:
         self.vertex_rows = vertex_rows
         self.edge_rows = edge_rows
-        self.already_loaded_row = already_loaded_row
+        self.already_loaded_versions = set(already_loaded_versions)
         self.executemany_log: list[tuple[str, list[tuple[Any, ...]]]] = []
         self.opened_cursor_names: list[str | None] = []
+
+    def _resolve_already_loaded(self, params: Any) -> tuple[Any, ...] | None:
+        (version,) = params
+        return (1,) if version in self.already_loaded_versions else None
 
     def cursor(self, name: str | None = None) -> FakeCursor:
         self.opened_cursor_names.append(name)
         if name is None:
-            return FakeCursor(fetchone_value=self.already_loaded_row, executemany_log=self.executemany_log)
+            return FakeCursor(fetchone_resolver=self._resolve_already_loaded, executemany_log=self.executemany_log)
         if name == "embedding_pipeline_vertices":
             return FakeCursor(rows_batches=[self.vertex_rows])
         for table, rows in self.edge_rows.items():
@@ -143,9 +152,9 @@ _EDGE_ROWS: dict[str, list[tuple[Any, Any]]] = {
 }
 
 
-def _fresh_connection(already_loaded_row: tuple[Any, ...] | None = None) -> FakeConnection:
+def _fresh_connection(already_loaded_versions: frozenset[str] = frozenset()) -> FakeConnection:
     return FakeConnection(
-        vertex_rows=list(_VERTEX_ROWS), edge_rows={k: list(v) for k, v in _EDGE_ROWS.items()}, already_loaded_row=already_loaded_row
+        vertex_rows=list(_VERTEX_ROWS), edge_rows={k: list(v) for k, v in _EDGE_ROWS.items()}, already_loaded_versions=already_loaded_versions
     )
 
 
@@ -221,6 +230,45 @@ class TestHalfvecLiteral:
         assert literal.count(",") == 127
 
 
+class TestStoredModelVersion:
+    def test_composes_the_method_version_and_the_dump_id(self) -> None:
+        config = FastRPConfig()
+
+        version = pipeline.stored_model_version(config, "discogs-2026-09")
+
+        assert version == f"{config.model_version}@discogs-2026-09"
+
+    def test_two_dumps_under_the_same_config_get_different_stored_versions(self) -> None:
+        config = FastRPConfig()
+
+        first = pipeline.stored_model_version(config, "discogs-2026-09")
+        second = pipeline.stored_model_version(config, "discogs-2026-10")
+
+        assert first != second
+        assert first.startswith(config.model_version)
+        assert second.startswith(config.model_version)
+
+    def test_rejects_a_dump_id_containing_the_separator(self) -> None:
+        with pytest.raises(ValueError, match="dump_id"):
+            pipeline.stored_model_version(FastRPConfig(), "bad@id")
+
+    def test_is_not_length_bounded(self) -> None:
+        long_dump_id = "d" * 500
+
+        version = pipeline.stored_model_version(FastRPConfig(), long_dump_id)
+
+        assert version.endswith(long_dump_id)
+        assert len(version) > 500
+
+
+class TestSqlStringLiteral:
+    def test_quotes_a_plain_value(self) -> None:
+        assert pipeline._sql_string_literal("fastrp-v1@dump-1") == "'fastrp-v1@dump-1'"
+
+    def test_escapes_an_embedded_quote(self) -> None:
+        assert pipeline._sql_string_literal("o'brien") == "'o''brien'"
+
+
 class TestIndexNameSlug:
     def test_is_a_safe_lowercase_identifier_fragment(self) -> None:
         slug = pipeline._index_name_slug(FastRPConfig().model_version)
@@ -234,6 +282,14 @@ class TestIndexNameSlug:
 
         assert len(slug) <= 48
 
+    def test_handles_a_stored_version_with_a_dump_id_suffix(self) -> None:
+        stored = pipeline.stored_model_version(FastRPConfig(), "discogs-2026-09")
+
+        slug = pipeline._index_name_slug(stored)
+
+        assert slug
+        assert all(character.isalnum() or character == "_" for character in slug)
+
 
 # ── Idempotency ──────────────────────────────────────────────────────────────────────────────
 
@@ -241,15 +297,21 @@ class TestIndexNameSlug:
 class TestAlreadyLoaded:
     @pytest.mark.asyncio
     async def test_true_when_a_row_matches(self) -> None:
-        conn = _fresh_connection(already_loaded_row=(1,))
+        conn = _fresh_connection(already_loaded_versions=frozenset({"fastrp-v1@dump-1"}))
 
-        assert await pipeline._already_loaded(conn, "fastrp-v1", "dump-1") is True
+        assert await pipeline._already_loaded(conn, "fastrp-v1@dump-1") is True
 
     @pytest.mark.asyncio
     async def test_false_when_no_row_matches(self) -> None:
-        conn = _fresh_connection(already_loaded_row=None)
+        conn = _fresh_connection()
 
-        assert await pipeline._already_loaded(conn, "fastrp-v1", "dump-1") is False
+        assert await pipeline._already_loaded(conn, "fastrp-v1@dump-1") is False
+
+    @pytest.mark.asyncio
+    async def test_a_different_dumps_stored_version_does_not_match(self) -> None:
+        conn = _fresh_connection(already_loaded_versions=frozenset({"fastrp-v1@dump-1"}))
+
+        assert await pipeline._already_loaded(conn, "fastrp-v1@dump-2") is False
 
 
 # ── Graph reading ────────────────────────────────────────────────────────────────────────────
@@ -332,36 +394,61 @@ class TestWriteEmbeddings:
 class TestLoadEmbeddings:
     @pytest.mark.asyncio
     async def test_writes_an_embedding_per_artist_and_logs_the_operator_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        conn = _fresh_connection(already_loaded_row=None)
+        conn = _fresh_connection()
         pool = FakePool(conn)
         config = FastRPConfig()
+        expected_version = pipeline.stored_model_version(config, "dump-1")
         fake_logger = Mock()
         monkeypatch.setattr(pipeline, "logger", fake_logger)
 
         result = await pipeline.load_embeddings(pool, config, "dump-1", date(2026, 9, 1))
 
         assert result.skipped is False
-        assert result.model_version == config.model_version
+        assert result.method_version == config.model_version
+        assert result.model_version == expected_version
         assert result.rows_written == 3
         assert len(conn.executemany_log) == 1
         _sql, batch = conn.executemany_log[0]
         assert sorted(row[0] for row in batch) == ["1", "2", "3"]
+        assert all(row[1] == expected_version for row in batch)
 
         operator_calls = [call for call in fake_logger.info.call_args_list if "Operator step" in call.args[0]]
         assert len(operator_calls) == 1
-        assert operator_calls[0].kwargs["model_version"] == config.model_version
+        assert operator_calls[0].kwargs["model_version"] == expected_version
         assert "CREATE INDEX CONCURRENTLY" in operator_calls[0].kwargs["statement"]
-        assert config.model_version in operator_calls[0].kwargs["statement"]
+        assert expected_version in operator_calls[0].kwargs["statement"]
 
     @pytest.mark.asyncio
-    async def test_skips_a_dump_already_loaded_under_this_model_version(self) -> None:
-        conn = _fresh_connection(already_loaded_row=(1,))
+    async def test_logs_the_method_version_and_numpy_scipy_versions_at_the_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        conn = _fresh_connection()
+        pool = FakePool(conn)
+        config = FastRPConfig()
+        fake_logger = Mock()
+        monkeypatch.setattr(pipeline, "logger", fake_logger)
+
+        await pipeline.load_embeddings(pool, config, "dump-1", date(2026, 9, 1))
+
+        start_calls = [call for call in fake_logger.info.call_args_list if "run starting" in call.args[0]]
+        assert len(start_calls) == 1
+        kwargs = start_calls[0].kwargs
+        assert kwargs["method_version"] == config.model_version
+        assert kwargs["model_version"] == pipeline.stored_model_version(config, "dump-1")
+        assert kwargs["dump_id"] == "dump-1"
+        assert kwargs["numpy_version"] == np.__version__
+        assert kwargs["scipy_version"] == scipy.__version__
+
+    @pytest.mark.asyncio
+    async def test_skips_a_dump_already_loaded_under_its_stored_version(self) -> None:
+        config = FastRPConfig()
+        conn = _fresh_connection(already_loaded_versions=frozenset({pipeline.stored_model_version(config, "dump-1")}))
         pool = FakePool(conn)
 
-        result = await pipeline.load_embeddings(pool, FastRPConfig(), "dump-1", date(2026, 9, 1))
+        result = await pipeline.load_embeddings(pool, config, "dump-1", date(2026, 9, 1))
 
         assert result.skipped is True
         assert result.rows_written == 0
+        assert result.method_version == config.model_version
+        assert result.model_version == pipeline.stored_model_version(config, "dump-1")
         assert conn.executemany_log == []
         # The graph is never read on a skip.
         assert "embedding_pipeline_vertices" not in conn.opened_cursor_names
@@ -369,15 +456,46 @@ class TestLoadEmbeddings:
     @pytest.mark.asyncio
     async def test_never_touches_a_row_of_a_different_model_version(self) -> None:
         """The upsert's ON CONFLICT target and the idempotency check are both scoped to
-        this call's own model_version — verified here at the SQL-parameter level."""
-        conn = _fresh_connection(already_loaded_row=None)
+        this call's own stored model_version — verified here at the SQL-parameter level."""
+        conn = _fresh_connection()
         pool = FakePool(conn)
         config = FastRPConfig()
 
         await pipeline.load_embeddings(pool, config, "dump-1", date(2026, 9, 1))
 
         _sql, batch = conn.executemany_log[0]
-        assert all(row[1] == config.model_version for row in batch)
+        assert all(row[1] == pipeline.stored_model_version(config, "dump-1") for row in batch)
+
+    @pytest.mark.asyncio
+    async def test_a_different_dump_gets_its_own_stored_version_not_an_upsert_of_the_first(self) -> None:
+        """Two months coexist: the second dump's load must not land on the first dump's
+        primary-key value (gm-analytics-engine-ieu.2 review fix)."""
+        conn = _fresh_connection()
+        pool = FakePool(conn)
+        config = FastRPConfig()
+
+        first = await pipeline.load_embeddings(pool, config, "dump-1", date(2026, 9, 1))
+        # The first dump is not recorded as already-loaded in this fake, so the second call
+        # re-reads the (unchanged) synthetic graph — this test only cares that the two writes
+        # land under different stored versions, not about a second idempotency skip.
+        second = await pipeline.load_embeddings(pool, config, "dump-2", date(2026, 10, 1))
+
+        assert first.model_version != second.model_version
+        assert first.model_version == pipeline.stored_model_version(config, "dump-1")
+        assert second.model_version == pipeline.stored_model_version(config, "dump-2")
+        assert len(conn.executemany_log) == 2
+        first_versions = {row[1] for row in conn.executemany_log[0][1]}
+        second_versions = {row[1] for row in conn.executemany_log[1][1]}
+        assert first_versions == {first.model_version}
+        assert second_versions == {second.model_version}
+
+    @pytest.mark.asyncio
+    async def test_rejects_a_dump_id_that_would_make_the_stored_version_ambiguous(self) -> None:
+        conn = _fresh_connection()
+        pool = FakePool(conn)
+
+        with pytest.raises(ValueError, match="dump_id"):
+            await pipeline.load_embeddings(pool, FastRPConfig(), "bad@id", date(2026, 9, 1))
 
 
 # ── The metrics-and-span wrapper ─────────────────────────────────────────────────────────────
@@ -386,7 +504,7 @@ class TestLoadEmbeddings:
 class TestRunEmbeddingPipeline:
     @pytest.mark.asyncio
     async def test_records_success_duration_and_rows_written(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        result = pipeline.LoadResult(model_version="fastrp-v1", rows_written=42, skipped=False)
+        result = pipeline.LoadResult(method_version="fastrp-v1", model_version="fastrp-v1@dump-1", rows_written=42, skipped=False)
         monkeypatch.setattr(pipeline, "load_embeddings", AsyncMock(return_value=result))
         record_computation = Mock()
         monkeypatch.setattr(pipeline, "record_computation", record_computation)

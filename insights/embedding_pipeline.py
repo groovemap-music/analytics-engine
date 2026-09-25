@@ -29,21 +29,52 @@ DDL, no ownership, nothing on any other schema. Three consequences shape this mo
   `source_dump_date`, `computed_at` — is the only durable lineage record it can leave, and
   doubles as the idempotency check below.
 
+## The stored `model_version` is per dump, not per algorithm
+
+`FastRPConfig.model_version` (`insights/embeddings/fastrp.py`) names only the method, its
+parameters, and the projection seed rule — the same string every month an operator does not
+change the algorithm. Writing that string directly into `artist_embeddings.model_version`
+would mean a second month's load lands on the *same* primary key, `(artist_id, model_version)`,
+as the first: it would upsert the first month's rows in place under a version `catalog-api` may
+still be serving, drive row-by-row HNSW maintenance on that live index instead of a clean
+`CREATE INDEX CONCURRENTLY`, discard the first dump's rows before a purge-by-dump could ever
+reach them, and leave ieu.3's month-over-month churn measurement with only one month on disk to
+compare.
+
+`stored_model_version(config, dump_id)` — `f"{config.model_version}@{dump_id}"` — is what this
+module actually reads and writes as `model_version`. Composing the dump id in is what lets two
+months coexist: each dump gets its own primary-key value, so a second month's load is a
+brand-new set of rows, never a write to the first month's. `config.model_version` (the pure
+method string) is recorded separately, in every log line here, as `method_version` — see
+"Bit-identity and lineage" below.
+
 ## Idempotency
 
-The job is idempotent per `(source_dump_id, model_version)`: re-running it for a dump already
-recorded under a `model_version` is a no-op. The read-only idempotency check
-(`_already_loaded`) and the write (`_write_embeddings`) are not one transaction — the read runs
-before the (multi-minute, CPU-bound) graph read and `fastrp` compute, and only the write itself
-is wrapped in a transaction. That is deliberate rather than a race: if the write transaction
-never commits (a crash, a killed process), no row carries the new `source_dump_id`, so a retry's
-idempotency check correctly reports "not loaded" and redoes the full load; holding one
-long-lived transaction across the whole compute would only add lock and connection-lifetime
-risk for no additional safety.
+The job is idempotent per stored `model_version` (which already encodes `(dump_id,
+method_version)`): re-running it for a dump already recorded under this algorithm is a no-op.
+The read-only idempotency check (`_already_loaded`) and the write (`_write_embeddings`) are not
+one transaction — the read runs before the (multi-minute, CPU-bound) graph read and `fastrp`
+compute, and only the write itself is wrapped in a transaction. That is deliberate rather than a
+race: if the write transaction never commits (a crash, a killed process), no row carries the new
+stored `model_version`, so a retry's idempotency check correctly reports "not loaded" and redoes
+the full load; holding one long-lived transaction across the whole compute would only add lock
+and connection-lifetime risk for no additional safety.
 
-`model_version` is scoped by the query and the `ON CONFLICT` target throughout — this job never
-touches a row of a `model_version` other than the one it is computing, so a live version being
-served by `catalog-api` is untouched by a load of a new one.
+`_write_embeddings`' `ON CONFLICT (artist_id, model_version) DO UPDATE` is retry safety for
+exactly that crash case — a partial previous attempt's rows under *this same* stored
+`model_version` — not a cross-dump upsert: since the stored value already differs per dump, the
+conflict target can never match a row from a different month. Every query and write in this
+module is scoped by the stored `model_version` throughout, so a version `catalog-api` is
+currently serving is untouched by a load of a new one.
+
+## Bit-identity and lineage
+
+docs/embeddings.md's "Determinism" section notes that bit-identity holds for one build of NumPy
+and SciPy, so cross-month comparisons need to know which build produced which vectors. Every
+run logs `numpy_version`/`scipy_version` alongside `method_version`/`model_version`/`dump_id`
+at the start of `load_embeddings`, since `public.artist_embeddings` itself has no column for
+them — the pipeline role's lineage columns (`source_dump_id`, `source_dump_date`, `computed_at`)
+are fixed by database-schema's DDL, so logs are the durable record for this.
 
 ## Scheduling
 
@@ -67,6 +98,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
 
 import numpy as np
+import scipy
 import structlog
 from common import (
     AsyncPostgreSQLPool,
@@ -136,9 +168,14 @@ _UPSERT_SQL: Final = f"""
         computed_at = EXCLUDED.computed_at
 """  # noqa: S608 -- ARTIST_EMBEDDINGS_TABLE is a module constant, not caller input.
 
-_ALREADY_LOADED_SQL: Final = f"SELECT 1 FROM {ARTIST_EMBEDDINGS_TABLE} WHERE model_version = %s AND source_dump_id = %s LIMIT 1"  # noqa: S608
+_ALREADY_LOADED_SQL: Final = f"SELECT 1 FROM {ARTIST_EMBEDDINGS_TABLE} WHERE model_version = %s LIMIT 1"  # noqa: S608
 
 _NAME_SLUG_PATTERN: Final = re.compile(r"[^a-z0-9]+")
+
+# The separator composing the stored `model_version` from the algorithm's own version and the
+# dump id — see "The stored model_version is per dump, not per algorithm" above. Rejected
+# inside a dump id so the composed string is always unambiguous to a human reading it back.
+_STORED_VERSION_SEPARATOR: Final = "@"
 
 
 @dataclass(frozen=True)
@@ -201,11 +238,47 @@ class EmbeddingPipelineConfig:
 
 @dataclass(frozen=True)
 class LoadResult:
-    """The outcome of one embedding load attempt."""
+    """The outcome of one embedding load attempt.
 
+    `method_version` is the pure `FastRPConfig.model_version` (algorithm, parameters, seed);
+    `model_version` is `stored_model_version(config, dump_id)`, the value actually written to
+    and read from `artist_embeddings.model_version`. See the module docstring.
+    """
+
+    method_version: str
     model_version: str
     rows_written: int
     skipped: bool
+
+
+def stored_model_version(config: FastRPConfig, dump_id: str) -> str:
+    """The `artist_embeddings.model_version` value one dump's load reads and writes.
+
+    Composes the algorithm's own version with the dump id so two dumps under an unchanged
+    algorithm land on different primary-key values instead of one upserting the other's rows
+    in place — see the module docstring. `model_version` is `TEXT`, so there is no length
+    bound to enforce here beyond what a reasonable `dump_id` already is.
+
+    Args:
+        config: The FastRP method configuration.
+        dump_id: The current dump's identifier.
+
+    Raises:
+        ValueError: If `dump_id` contains the separator (`@`), which would make the composed
+            string ambiguous to read back.
+    """
+    if _STORED_VERSION_SEPARATOR in dump_id:
+        raise ValueError(f"dump_id must not contain {_STORED_VERSION_SEPARATOR!r}, got {dump_id!r}")
+    return f"{config.model_version}{_STORED_VERSION_SEPARATOR}{dump_id}"
+
+
+def _sql_string_literal(value: str) -> str:
+    """A single-quoted SQL string literal, escaped for the operator step's logged statement.
+
+    Logged only, never executed by this job — but an operator may copy it verbatim, and a
+    `dump_id` is free text that could otherwise carry a quote that breaks the pasted statement.
+    """
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _halfvec_literal(vector: NDArray[np.floating]) -> str:
@@ -228,12 +301,18 @@ def _index_name_slug(model_version: str) -> str:
 
 
 def _log_operator_step(model_version: str) -> None:
-    """Log the ANN-index build this job never runs itself. See the module docstring."""
+    """Log the ANN-index build this job never runs itself. See the module docstring.
+
+    `model_version` here is the *stored* value (`stored_model_version(...)`, including the
+    dump id) — the WHERE clause must match what is actually in the table. The index name uses
+    `_index_name_slug`, since a dump id can carry characters (`@`, `-`, `/`, ...) that are not
+    valid in an unquoted SQL identifier; the WHERE clause's value uses `_sql_string_literal`.
+    """
     index_name = f"idx_artist_embeddings_{_index_name_slug(model_version)}_hnsw"
     statement = (
         f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} "
         f"ON {ARTIST_EMBEDDINGS_TABLE} USING hnsw (embedding halfvec_cosine_ops) "
-        f"WHERE model_version = '{model_version}'"
+        f"WHERE model_version = {_sql_string_literal(model_version)}"
     )
     logger.info(
         "🛠️ Operator step required — build the ANN index for this model_version",
@@ -242,10 +321,10 @@ def _log_operator_step(model_version: str) -> None:
     )
 
 
-async def _already_loaded(conn: Any, model_version: str, dump_id: str) -> bool:
-    """Return whether `(dump_id, model_version)` already has rows in `artist_embeddings`."""
+async def _already_loaded(conn: Any, model_version: str) -> bool:
+    """Return whether this stored `model_version` already has rows in `artist_embeddings`."""
     async with conn.cursor() as cursor:
-        await cursor.execute(_ALREADY_LOADED_SQL, (model_version, dump_id))
+        await cursor.execute(_ALREADY_LOADED_SQL, (model_version,))
         return await cursor.fetchone() is not None
 
 
@@ -300,12 +379,15 @@ async def _write_embeddings(
     artist_ids: Sequence[str],
     vectors: NDArray[np.floating],
 ) -> int:
-    """Upsert every artist's embedding row for `model_version`, in one transaction.
+    """Upsert every artist's embedding row for the stored `model_version`, in one transaction.
 
-    Batched multi-statement `executemany`, not `COPY`: `COPY` has no `ON CONFLICT` clause, and
-    a plain re-`INSERT` would fail outright on a retry that reaches previously-committed rows
+    `model_version` here is the *stored* value (`stored_model_version(...)`), already unique
+    per dump — so `ON CONFLICT (artist_id, model_version) DO UPDATE` can only ever match a row
+    this same dump's own, possibly-partial, previous attempt wrote, never another dump's. It
+    exists purely for that crash-retry case: `COPY` has no `ON CONFLICT` clause, and a plain
+    re-`INSERT` would fail outright on a retry that reaches those previously-committed rows
     (which cannot happen after this function returns, by the idempotency check above, but a
-    retry that resumes mid-run before that check would still see it).
+    retry that resumes mid-run before that check would still see them).
     """
     computed_at = datetime.now(UTC)
     rows_written = 0
@@ -333,24 +415,36 @@ async def load_embeddings(pool: AsyncPostgreSQLPool, config: FastRPConfig, dump_
 
     Args:
         pool: A pool connected as the `embedding_pipeline` role (or a role holding it).
-        config: The FastRP method configuration; its `model_version` names both the
-            idempotency key and the rows this call writes or updates.
-        dump_id: The current dump's identifier, recorded as `source_dump_id` lineage.
+        config: The FastRP method configuration; `config.model_version` is recorded as
+            `method_version` in every log line here.
+        dump_id: The current dump's identifier, recorded as `source_dump_id` lineage and
+            composed into the stored `model_version` (see the module docstring).
         dump_date: The current dump's date, recorded as `source_dump_date` lineage.
 
     Returns:
-        The load outcome — `skipped=True` when `(dump_id, model_version)` was already loaded.
+        The load outcome — `skipped=True` when this stored `model_version` was already loaded.
+
+    Raises:
+        ValueError: If `dump_id` contains `stored_model_version`'s separator (`@`).
     """
-    model_version = config.model_version
+    version = stored_model_version(config, dump_id)
+    logger.info(
+        "🔢 Embedding pipeline run starting",
+        method_version=config.model_version,
+        model_version=version,
+        dump_id=dump_id,
+        numpy_version=np.__version__,
+        scipy_version=scipy.__version__,
+    )
     async with pool.connection() as conn:
-        if await _already_loaded(conn, model_version, dump_id):
-            logger.info("⏭️ Embedding load skipped — already loaded", model_version=model_version, dump_id=dump_id)
-            return LoadResult(model_version=model_version, rows_written=0, skipped=True)
+        if await _already_loaded(conn, version):
+            logger.info("⏭️ Embedding load skipped — already loaded", model_version=version, dump_id=dump_id)
+            return LoadResult(method_version=config.model_version, model_version=version, rows_written=0, skipped=True)
 
         nodes, artist_ids = await _read_vertices(conn)
         if not artist_ids:
-            logger.warning("⚠️ No artist vertices found in the graph — nothing to embed", model_version=model_version, dump_id=dump_id)
-            return LoadResult(model_version=model_version, rows_written=0, skipped=False)
+            logger.warning("⚠️ No artist vertices found in the graph — nothing to embed", model_version=version, dump_id=dump_id)
+            return LoadResult(method_version=config.model_version, model_version=version, rows_written=0, skipped=False)
 
         builder = AdjacencyBuilder(nodes)
         await _stream_edge_blocks(conn, builder)
@@ -365,16 +459,16 @@ async def load_embeddings(pool: AsyncPostgreSQLPool, config: FastRPConfig, dump_
 
         rows_written = await _write_embeddings(
             conn,
-            model_version=model_version,
+            model_version=version,
             dump_id=dump_id,
             dump_date=dump_date,
             artist_ids=artist_ids,
             vectors=vectors,
         )
 
-    logger.info("💾 Embedding load complete", model_version=model_version, dump_id=dump_id, rows_written=rows_written)
-    _log_operator_step(model_version)
-    return LoadResult(model_version=model_version, rows_written=rows_written, skipped=False)
+    logger.info("💾 Embedding load complete", model_version=version, dump_id=dump_id, rows_written=rows_written)
+    _log_operator_step(version)
+    return LoadResult(method_version=config.model_version, model_version=version, rows_written=rows_written, skipped=False)
 
 
 async def run_embedding_pipeline(
@@ -400,7 +494,7 @@ async def run_embedding_pipeline(
         logger.error(
             "❌ Embedding pipeline failed",
             error=describe_exception(error),
-            model_version=config.model_version,
+            method_version=config.model_version,
             dump_id=dump_id,
         )
         raise
