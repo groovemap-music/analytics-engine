@@ -28,6 +28,8 @@ INSTRUMENTATION_SCOPE = "groovemap.insights"
 COMPUTATION_DURATION = "groovemap.insights.computation.duration"
 LAST_SUCCESS = "groovemap.insights.last_success"
 CACHE = "groovemap.api.cache"
+EMBEDDING_ROWS_WRITTEN = "groovemap.insights.embedding_pipeline.rows_written"
+EMBEDDING_FAILURES = "groovemap.insights.embedding_pipeline.failures"
 
 COMPUTATION_SPAN_PREFIX = "insights"
 CACHE_NAME = "insights"
@@ -62,6 +64,15 @@ def _build_instruments() -> dict[str, Any]:
         CACHE: meter.create_counter(
             CACHE,
             description="Insights cache reads by outcome.",
+        ),
+        EMBEDDING_ROWS_WRITTEN: meter.create_counter(
+            EMBEDDING_ROWS_WRITTEN,
+            unit="row",
+            description="artist_embeddings rows an embedding-pipeline run wrote or updated.",
+        ),
+        EMBEDDING_FAILURES: meter.create_counter(
+            EMBEDDING_FAILURES,
+            description="Embedding-pipeline runs that raised before completing.",
         ),
     }
     instruments[LAST_SUCCESS] = meter.create_observable_gauge(
@@ -112,6 +123,22 @@ def record_computation(computation: str, duration_s: float, *, success: bool) ->
             _instrument(LAST_SUCCESS)
         except Exception:
             logger.debug("⚠️ Could not register last-success gauge", computation=computation)
+
+
+def record_embedding_rows_written(rows: int) -> None:
+    """Record the number of `artist_embeddings` rows one embedding-pipeline run wrote."""
+    try:
+        _instrument(EMBEDDING_ROWS_WRITTEN).add(rows)
+    except Exception:
+        logger.debug("⚠️ Could not record embedding rows written", rows=rows)
+
+
+def record_embedding_pipeline_failure() -> None:
+    """Record one embedding-pipeline run that raised before completing."""
+    try:
+        _instrument(EMBEDDING_FAILURES).add(1)
+    except Exception:
+        logger.debug("⚠️ Could not record embedding pipeline failure")
 
 
 def record_cache_read(*, hit: bool) -> None:

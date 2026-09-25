@@ -168,6 +168,46 @@ class TestCacheReads:
         assert points == {"hit": 2, "miss": 1}
 
 
+class TestEmbeddingPipelineRowsWritten:
+    def test_is_a_row_counter(self, collector: Collector) -> None:
+        insights_telemetry.record_embedding_rows_written(10_234_567)
+
+        metric = collector.metrics()[insights_telemetry.EMBEDDING_ROWS_WRITTEN]
+        assert metric.unit == "row"
+        points = collector.points(insights_telemetry.EMBEDDING_ROWS_WRITTEN)
+        assert len(points) == 1
+        assert points[0].value == 10_234_567
+
+    def test_a_zero_row_no_op_run_still_records(self, collector: Collector) -> None:
+        insights_telemetry.record_embedding_rows_written(0)
+
+        assert collector.points(insights_telemetry.EMBEDDING_ROWS_WRITTEN)[0].value == 0
+
+    def test_counts_accumulate_across_runs(self, collector: Collector) -> None:
+        insights_telemetry.record_embedding_rows_written(100)
+        insights_telemetry.record_embedding_rows_written(50)
+
+        assert collector.points(insights_telemetry.EMBEDDING_ROWS_WRITTEN)[0].value == 150
+
+
+class TestEmbeddingPipelineFailures:
+    def test_records_one_failure(self, collector: Collector) -> None:
+        insights_telemetry.record_embedding_pipeline_failure()
+
+        points = collector.points(insights_telemetry.EMBEDDING_FAILURES)
+        assert len(points) == 1
+        assert points[0].value == 1
+
+    def test_counts_repeated_failures(self, collector: Collector) -> None:
+        insights_telemetry.record_embedding_pipeline_failure()
+        insights_telemetry.record_embedding_pipeline_failure()
+
+        assert collector.points(insights_telemetry.EMBEDDING_FAILURES)[0].value == 2
+
+    def test_no_points_before_any_failure(self, collector: Collector) -> None:
+        assert collector.points(insights_telemetry.EMBEDDING_FAILURES) == []
+
+
 class TestResetInstruments:
     def test_clears_cached_instruments_and_last_success_state(self, collector: Collector) -> None:
         insights_telemetry.record_computation("artist_centrality", 0.1, success=True)
