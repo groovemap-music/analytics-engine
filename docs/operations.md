@@ -41,6 +41,17 @@ The outbound client identifies itself as `analytics-engine/<version>` with the c
 
 Secrets must be delivered by the deployment layer. Do not place credentials in repository files or image environment instructions.
 
+### The embedding pipeline (`analytics-engine-embeddings`)
+
+A separate, one-shot entry point (`insights.embedding_pipeline:main`), not the FastAPI process above — see docs/embeddings.md, "The monthly load pipeline", for the full design. It shares `POSTGRES_HOST`/`POSTGRES_PORT`/`POSTGRES_DATABASE` above but authenticates with its own, narrower credentials.
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `EMBEDDING_PIPELINE_POSTGRES_USERNAME` / `_FILE` | yes | The `embedding_pipeline`-scoped login; the `_FILE` value takes precedence |
+| `EMBEDDING_PIPELINE_POSTGRES_PASSWORD` / `_FILE` | yes | That login's password; the `_FILE` value takes precedence |
+| `SOURCE_DUMP_ID` | yes | The current dump's identifier, recorded as `artist_embeddings.source_dump_id` lineage and as this run's idempotency key alongside the FastRP `model_version` |
+| `SOURCE_DUMP_DATE` | yes | The current dump's date (`YYYY-MM-DD`), recorded as `artist_embeddings.source_dump_date` |
+
 ## Telemetry
 
 Metrics and traces are bootstrapped by `groovemap-runtime`'s `common.telemetry` (the `otel` and `otel-http` extras) and pushed over OTLP/HTTP-protobuf — there is no local `/metrics` scrape endpoint. Both signals are configured entirely from the standard environment variables above and independently of each other: `OTEL_TRACES_EXPORTER=none` silences spans while metrics keep flowing, and the reverse holds. With `OTEL_EXPORTER_OTLP_ENDPOINT` unset, every instrument and every span is a local no-op and the service starts and behaves exactly as it does today.
@@ -57,6 +68,9 @@ Metrics and traces are bootstrapped by `groovemap-runtime`'s `common.telemetry` 
 | `groovemap.insights.computation.duration` | histogram, s | `computation`, `outcome=success\|failure` | `run_all_computations`, around each scheduled computation |
 | `groovemap.insights.last_success` | observable gauge, unix s | `computation` | in-memory state updated on each successful computation |
 | `groovemap.api.cache` | counter | `outcome=hit\|miss`, `cache=insights` | `InsightsCache.get` on every cache-aside read |
+| `groovemap.insights.computation.duration` | histogram, s | `computation=embedding_pipeline`, `outcome=success\|failure` | `run_embedding_pipeline`, around one embedding-pipeline run (same instrument the scheduled computations above use) |
+| `groovemap.insights.embedding_pipeline.rows_written` | counter, row | none | `run_embedding_pipeline`, after a run completes (0 on a no-op skip) |
+| `groovemap.insights.embedding_pipeline.failures` | counter | none | `run_embedding_pipeline`, when a run raises before completing |
 
 ### Runtime metrics
 
@@ -118,7 +132,8 @@ The recipes below are the maintained repository interface. `just --summary` list
 | `just source-check` | Run `format-check`, `lint`, `contract-check`, and `repository-check`. |
 | `just test` / `just coverage` | Run the isolated test suite and write `coverage.xml`; `coverage` is the CI-facing alias. |
 | `just secret-scan` | Scan Git history and the working directory with Gitleaks. |
-| `just check` | Run source, type, coverage, secret, build, install, license, release-artifact, and version-preview checks. This is the authoritative pre-merge gate. |
+| `just check` | Run source, type, coverage, secret, build, install, license, release-artifact, and version-preview checks. This is the authoritative pre-merge gate. `just test`/`just coverage` (and therefore `just check`) exclude `integration`-marked tests. |
+| `just test-integration-pg19` | Advisory tier: runs the embedding-pipeline suite against a disposable PostgreSQL 19 + pgvector container with the real `embedding_pipeline` role, applying database-schema's own DDL. Reuses the existing local `database-schema-postgres19-pgvector:local` image; never builds it (see `scripts/test-integration-pg19.sh`). |
 | `just audit` | Run the network-backed dependency vulnerability scan. |
 | `just image` | Build the repository-named image and verify its import, non-root user, repository, license, and exact-revision annotations. |
 | `just release-dry-run` | Run `just check` and assemble release artifacts without tagging, uploading, or publishing. |

@@ -84,3 +84,76 @@ Memory can be reduced further, at a cost:
 - Returning only served artists (about 9.4M) saves about 0.2 GB.
 
 Threads add little memory, because each task works on at most 262,144 rows.
+
+## The monthly load pipeline
+
+`insights/embedding_pipeline.py` is the pipeline the module docstring above defers to: it
+reads the `graph` schema, calls `fastrp`, and writes `public.artist_embeddings`. It is a
+separate entry point, `analytics-engine-embeddings` (`main()` in that module), not part of the
+always-on FastAPI service — it authenticates under the `embedding_pipeline` role's own
+credentials (`EMBEDDING_PIPELINE_POSTGRES_USERNAME`/`_PASSWORD`, the same `_FILE` secret
+convention as everything else), a different, deliberately narrower login than the service's
+`POSTGRES_USERNAME`. See database-schema's "Vector embeddings and the embedding pipeline role"
+for the grant: `SELECT` on every relation in `graph`, `SELECT, INSERT, UPDATE, DELETE` on
+`public.artist_embeddings` alone, nothing else.
+
+**Reading the graph.** The pipeline reads the six vertex kinds this module's node identity
+covers (artist, release, label, master, genre, style) from `graph.vertex_degree`, and the eight
+edge relations that connect them (`graph.by_artist`, `graph.on_label`, `graph.derived_from`,
+`graph.in_genre`, `graph.in_style`, `graph.master_by_artist`, `graph.master_in_genre`,
+`graph.master_in_style`) — each via a named (server-side) PostgreSQL cursor, fetched in
+50,000-row blocks, so the full vertex and edge sets are never materialized as Python lists in
+one piece. `fastrp` is then called with the defaults documented above: `out_dtype=np.float16`,
+`block_columns=4` (the default), and `threads=6` — the configuration the scaling table above
+was measured against, which stays within the 12 GB full-catalog budget.
+
+**Lineage.** `SOURCE_DUMP_ID` and `SOURCE_DUMP_DATE` (required, no default — the invoker
+supplies them, since it is the one that knows which dump just landed) become
+`artist_embeddings.source_dump_id`/`source_dump_date` on every row the run writes.
+
+**Idempotency.** The job is idempotent per `(source_dump_id, model_version)`: re-running for a
+dump already recorded under a `model_version` is a no-op — it does not re-read the graph or
+re-run `fastrp`. A *different* dump under the *same* `model_version` is not idempotent against
+it: the pipeline recomputes and upserts, updating the existing rows' vectors and lineage in
+place, because `model_version` names the method and its parameters, not a point in time. Every
+read and write this job makes is scoped to the `model_version` it is computing — it never
+touches a row of any other `model_version`, so a version `catalog-api` is currently serving is
+untouched by a load of a new one.
+
+**No index DDL, ever.** `embedding_pipeline` holds no DDL privilege and no ownership of
+`public.artist_embeddings` — building or rebuilding the ANN index over a `model_version` is
+always a separate, more privileged, human- or automation-driven operator step, run after this
+job's transaction commits. The job logs the statement that step should run (a
+`model_version`-filtered `CREATE INDEX CONCURRENTLY ... USING hnsw (embedding
+halfvec_cosine_ops) WHERE model_version = '...'`); per-`model_version` partial indexes
+(`gm-database-schema-19g5`) are not landed as of this writing, so the statement logged is the
+forward-looking shape the maintainer specified rather than something database-schema documents
+today. Retiring a superseded `model_version`'s rows and index, once `catalog-api` has switched
+to the new one, is that follow-on's business, never this job's.
+
+**Metrics.** `groovemap.insights.computation.duration` (histogram, `computation=
+embedding_pipeline`, reusing the same instrument every other scheduled computation uses),
+`groovemap.insights.embedding_pipeline.rows_written` (counter), and
+`groovemap.insights.embedding_pipeline.failures` (counter) — see docs/operations.md.
+`insights.computation_log`, the other computations' outcome log, is not written here: the
+pipeline role holds nothing on the `insights` schema, so `public.artist_embeddings`'s own
+lineage columns are the only durable record this job can leave.
+
+**Scheduling.** There is no in-process scheduler loop, unlike `insights.insights`'s
+`_scheduler_loop`. `analytics-engine-embeddings` is a one-shot script meant to be invoked by
+the deployment layer once a month, after that month's dump has loaded and `SOURCE_DUMP_ID`/
+`SOURCE_DUMP_DATE` are known. The exact monthly trigger (cron, a `CronJob`, an operator running
+it by hand — the same shape as database-schema's own `build_artist_embeddings_index` operator
+procedure) is a deployment-repo concern this bead does not fix.
+
+**Testing.** `tests/test_embedding_pipeline.py` exercises the real FastRP/graph code against
+small in-memory fakes of the PostgreSQL connection — no database, no Docker.
+`tests/integration/test_embedding_pipeline_integration.py` (`just test-integration-pg19`) runs
+against a real PostgreSQL 19 + pgvector container with a real `embedding_pipeline`-scoped
+login, asserting the idempotency and permission-boundary behavior above against the engine
+itself, on a small synthetic graph. That tier's `conftest.py` applies a minimal, inline stand-in
+for the ADR 0013 schema objects rather than taking `database-schema` as a dependency —
+`database-schema`'s own molecule that adds them (`gm-database-schema-lhp2`) had not reached
+`origin/main` as of this bead; see that `conftest.py`'s module docstring for the follow-up.
+Neither test tier commits provider-derived data or real embeddings, per ADR 0013's data-rights
+section.

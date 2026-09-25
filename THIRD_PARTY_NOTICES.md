@@ -19,6 +19,8 @@ For MPL-covered files, preserve license and copyright notices and make the sourc
 
 Their binary wheels bundle compiled libraries whose terms are listed in each wheel's own license file: OpenBLAS and LAPACK under BSD terms, the GCC runtime libraries (`libgfortran`, `libgcc`) under `GPL-3.0-or-later WITH GCC-exception-3.1`, and `libquadmath` under `LGPL-2.1-or-later`. The GCC Runtime Library Exception lets programs that use those runtime libraries be distributed under their own terms; the `libquadmath` obligations match the LGPL obligations above. The analytics engine uses these libraries only through NumPy and SciPy and does not modify, vendor, or statically link them. They add no MPL-covered package: `certifi` and `orjson` above were already present, and neither NumPy nor SciPy pulls in `tqdm`.
 
+The maintainer accepted SciPy's bundling of the GCC runtime (`GPL-3.0-or-later WITH GCC-exception-3.1`) and `libquadmath` (`LGPL-2.1-or-later`) under the license policy on 2026-09-25: the GCC Runtime Library Exception and the pass-through-only usage above mean neither introduces a reciprocal obligation the policy would otherwise block.
+
 ## Build and test dependencies
 
 The locked development environment also includes `chardet` 5.2.0 under `LGPL-2.1-or-later`, plus `fqdn` 1.5.1 and `pathspec` 1.1.1 under `MPL-2.0`. They are tools or transitive development dependencies and are not installed in the runtime image. Their distribution obligations must be reassessed if that boundary changes.
