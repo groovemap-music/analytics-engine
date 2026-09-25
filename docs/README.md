@@ -5,6 +5,7 @@ This directory documents the responsibilities and operating contract of the `ana
 - [Architecture](architecture.md) — service boundaries, data flow, precomputation, and cache consistency.
 - [Operations](operations.md) — configuration, health, scheduling, shutdown, and failure behavior.
 - [Release compliance](release-compliance.md) — package, image, automation, dependency, and publication-readiness checks.
+- [FastRP artist embeddings](embeddings.md) — the deterministic embedding computation, its determinism guarantees, and its measured scaling.
 - [Extraction provenance](extraction.md) — what moved from the monolith and which repositories own adjacent responsibilities.
 - [Embedding quality](embedding_quality.md) — shipped FastRP similar-artist recall on the chw.2 proxy benchmark, vs. the design spike and the production heuristic.
 
