@@ -464,7 +464,6 @@ class TestComputeAndStoreAnniversaries:
                 milestone_years=custom_milestones,
             )
 
-        # Verify milestones were passed to the API call
         mock_fetch.assert_called_once_with(
             mock_client,
             "/api/internal/insights/anniversaries",
