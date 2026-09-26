@@ -82,8 +82,8 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
 
 import numpy as np  # noqa: E402
 import scipy  # noqa: E402
-
 from common.credit_roles import categorize_role  # noqa: E402
+
 from insights.embeddings import AdjacencyBuilder, FastRPConfig, NodeIndex, fastrp, node_key  # noqa: E402
 
 
@@ -236,7 +236,7 @@ def _pass1_same_as_chunk(chunk: bytes) -> dict[str, set[str]]:
     if b"<!DOCTYPE" in chunk or b"<!ENTITY" in chunk:
         return partial
     try:
-        root = ET.fromstring(b"<r>" + chunk + b"</r>")
+        root = ET.fromstring(b"<r>" + chunk + b"</r>")  # noqa: S314 -- see _reject_entity_declarations above this file's DOCTYPE/ENTITY guard.
     except ET.ParseError:
         return partial
     for rel in root.findall("release"):
@@ -285,7 +285,7 @@ class ChunkResult:
     """One chunk's edge endpoint pairs, as ``(source_key, target_key)`` uint64 lists, plus
     the raw artist id strings it saw (for the final artist_id -> vector output)."""
 
-    __slots__ = ("edges", "artist_ids", "count")
+    __slots__ = ("artist_ids", "count", "edges")
 
     def __init__(self) -> None:
         self.edges: dict[str, list[tuple[int, int]]] = {name: [] for name in ALL_RELATIONS}
@@ -297,7 +297,7 @@ def _parse_release_chunk(chunk: bytes) -> ChunkResult:
     result = ChunkResult()
     try:
         _reject_entity_declarations(chunk)
-        root = ET.fromstring(b"<r>" + chunk + b"</r>")
+        root = ET.fromstring(b"<r>" + chunk + b"</r>")  # noqa: S314 -- see _reject_entity_declarations above this file's DOCTYPE/ENTITY guard.
     except (ET.ParseError, ValueError) as error:  # pragma: no cover -- defensive; well-formed chunks expected
         print(f"⚠️  skipping malformed release chunk: {error}", file=sys.stderr)
         return result
@@ -347,7 +347,7 @@ def _parse_master_chunk(chunk: bytes) -> ChunkResult:
     result = ChunkResult()
     try:
         _reject_entity_declarations(chunk)
-        root = ET.fromstring(b"<r>" + chunk + b"</r>")
+        root = ET.fromstring(b"<r>" + chunk + b"</r>")  # noqa: S314 -- see _reject_entity_declarations above this file's DOCTYPE/ENTITY guard.
     except (ET.ParseError, ValueError) as error:  # pragma: no cover -- defensive; well-formed chunks expected
         print(f"⚠️  skipping malformed master chunk: {error}", file=sys.stderr)
         return result

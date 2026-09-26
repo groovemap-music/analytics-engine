@@ -47,16 +47,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import numpy as np
-
 from common import AsyncPostgreSQLPool
-from insights.embedding_pipeline import ARTIST_EMBEDDINGS_TABLE, FastRPConfig, _already_loaded, _index_name, _sql_string_literal, _write_embeddings, stored_model_version
+
+from insights.embedding_pipeline import (
+    ARTIST_EMBEDDINGS_TABLE,
+    FastRPConfig,
+    _already_loaded,
+    _index_name,
+    _sql_string_literal,
+    _write_embeddings,
+    stored_model_version,
+)
 from insights.embeddings.graph import node_key
 from insights.embeddings.projection import splitmix64
 
@@ -72,6 +81,11 @@ HNSW_EF_CONSTRUCTION: int = 64
 DEFAULT_MAINTENANCE_WORK_MEM: str = "2GB"  # database-schema's documented build-time value.
 TRIAL_BATCH_ROWS: int = 100_000
 TRIAL_TIME_BUDGET_S: float = 30 * 60  # 30 minutes, per the maintainer's condition.
+
+# Resolved once to a full path, matching this repo's own `GIT = shutil.which("git")`
+# convention (tests/test_repository_compliance.py) -- S607 wants a full executable path,
+# not a bare name resolved via $PATH at call time.
+DOCKER: Final = shutil.which("docker") or "docker"
 
 _VECTOR_EXTENSION_SQL = "CREATE EXTENSION IF NOT EXISTS vector"
 
@@ -170,31 +184,44 @@ def _restart_container(*, name: str, image: str, shm_size: str, username: str, p
     the dispatcher's condition). Returns the new (host, port) to connect to.
 
     A full container restart, not an in-place `TRUNCATE`, is deliberate: `--shm-size` is set
-    at container creation and cannot be changed on a running container. Starting fresh also
-    means there is no stale index left over from August under a name this script never
-    tracks for an explicit drop (`_index_name` gives each stored `model_version` its own
-    name, so August's and September's indexes never collide by name regardless -- but a
-    fresh container is simpler and cheaper than reasoning about `TRUNCATE`'s index-emptying
-    behavior on a name we'd have to recompute here anyway).
+    at container creation and cannot be changed on a running container. A fresh container
+    also starts genuinely empty (no leftover per-`model_version` HNSW index from a previous
+    month at all, not just an emptied one) -- `_drop_index` is still called for the
+    same-container (`TRUNCATE`-only) path in `main_async`, since that path keeps the
+    container across months.
+
+    `DOCKER`/`name`/`image` are all this script's own constants or caller-supplied
+    identifiers, never attacker-controlled input, so a fixed-argument-list `subprocess.run`
+    (S603) with a resolved full executable path (S607) is the deliberate shape here, not an
+    oversight.
     """
-    subprocess.run(["docker", "stop", name], check=True, capture_output=True)
-    subprocess.run(
+    subprocess.run([DOCKER, "stop", name], check=True, capture_output=True)  # noqa: S603
+    subprocess.run(  # noqa: S603
         [
-            "docker", "run", "--detach", "--rm",
-            "--name", name,
-            "--publish", "127.0.0.1::5432",
-            "--shm-size", shm_size,
-            "--env", f"POSTGRES_USER={username}",
-            "--env", f"POSTGRES_PASSWORD={password}",
-            "--env", f"POSTGRES_DB={database}",
+            DOCKER,
+            "run",
+            "--detach",
+            "--rm",
+            "--name",
+            name,
+            "--publish",
+            "127.0.0.1::5432",
+            "--shm-size",
+            shm_size,
+            "--env",
+            f"POSTGRES_USER={username}",
+            "--env",
+            f"POSTGRES_PASSWORD={password}",
+            "--env",
+            f"POSTGRES_DB={database}",
             image,
         ],
         check=True,
         capture_output=True,
     )
     for _attempt in range(60):
-        ready = subprocess.run(
-            ["docker", "exec", name, "pg_isready", "--username", username, "--dbname", database],
+        ready = subprocess.run(  # noqa: S603
+            [DOCKER, "exec", name, "pg_isready", "--username", username, "--dbname", database],
             capture_output=True,
         )
         if ready.returncode == 0:
@@ -202,7 +229,7 @@ def _restart_container(*, name: str, image: str, shm_size: str, username: str, p
         time.sleep(2)
     else:
         raise RuntimeError(f"container {name!r} did not become ready within 120s of restart")
-    published = subprocess.run(["docker", "port", name, "5432/tcp"], check=True, capture_output=True, text=True).stdout.strip()
+    published = subprocess.run([DOCKER, "port", name, "5432/tcp"], check=True, capture_output=True, text=True).stdout.strip()  # noqa: S603
     host, _, port = published.rpartition(":")
     return host or "127.0.0.1", int(port)
 
@@ -237,7 +264,10 @@ async def _write_month(conn: Any, month: dict[str, Any]) -> dict[str, Any]:
     )
     trial_elapsed = time.perf_counter() - trial_started
     extrapolated_s = trial_elapsed * (total / trial_n) if trial_n else 0.0
-    print(f"  trial: {trial_rows:,} rows in {trial_elapsed:.1f}s -> extrapolated full month {extrapolated_s:.0f}s ({extrapolated_s / 60:.1f} min)", file=sys.stderr)
+    print(
+        f"  trial: {trial_rows:,} rows in {trial_elapsed:.1f}s -> extrapolated full month {extrapolated_s:.0f}s ({extrapolated_s / 60:.1f} min)",
+        file=sys.stderr,
+    )
 
     used_copy = False
     if extrapolated_s > TRIAL_TIME_BUDGET_S and trial_n < total:
@@ -249,10 +279,10 @@ async def _write_month(conn: Any, month: dict[str, Any]) -> dict[str, Any]:
         # the real column is `TIMESTAMPTZ NOT NULL DEFAULT NOW()`, and a DEFAULT only
         # fires when a COPY row's column list leaves it out entirely -- an explicit NULL
         # (what an earlier version of this fallback passed) violates NOT NULL outright.
-        async with conn.cursor() as cursor, cursor.copy(
-            f"COPY {ARTIST_EMBEDDINGS_TABLE} (artist_id, model_version, embedding, source_dump_id, source_dump_date) "  # noqa: S608
-            f"FROM STDIN"
-        ) as copy:
+        async with (
+            conn.cursor() as cursor,
+            cursor.copy(f"COPY {ARTIST_EMBEDDINGS_TABLE} (artist_id, model_version, embedding, source_dump_id, source_dump_date) FROM STDIN") as copy,
+        ):
             for index in range(len(remaining_ids)):
                 vector_literal = "[" + ",".join(f"{value:g}" for value in remaining_vectors[index].tolist()) + "]"
                 await copy.write_row((remaining_ids[index], month["model_version"], vector_literal, month["dump_id"], month["dump_date"]))
@@ -309,7 +339,7 @@ async def _build_index(conn: Any, model_version: str, maintenance_work_mem: str)
         # block's body. `_sql_string_literal` (the same helper `_log_operator_step` uses for
         # this exact WHERE clause) escapes it as a literal instead.
         await cursor.execute(
-            f"CREATE INDEX IF NOT EXISTS {index_name} ON {ARTIST_EMBEDDINGS_TABLE} "  # noqa: S608
+            f"CREATE INDEX IF NOT EXISTS {index_name} ON {ARTIST_EMBEDDINGS_TABLE} "
             f"USING hnsw (embedding halfvec_cosine_ops) WITH (m = {HNSW_M}, ef_construction = {HNSW_EF_CONSTRUCTION}) "
             f"WHERE model_version = {_sql_string_literal(model_version)}"
         )
@@ -329,7 +359,9 @@ async def _drop_index(conn: Any, model_version: str) -> None:
         await cursor.execute(f"DROP INDEX IF EXISTS {index_name}")
 
 
-async def _ann_top_k(conn: Any, model_version: str, vectors: np.ndarray, artist_ids: list[str], positions: list[int], ef_search: int, k: int) -> list[list[str] | None]:
+async def _ann_top_k(
+    conn: Any, model_version: str, vectors: np.ndarray, artist_ids: list[str], positions: list[int], ef_search: int, k: int
+) -> list[list[str] | None]:
     """The live index's top-`k` artist_ids for each query position's vector, at EF_SEARCH.
 
     Excludes the query's own artist_id: its vector is stored verbatim in the table, so an
@@ -400,10 +432,7 @@ async def measure_month(
 
     print(f"=== {label}: exact ground truth ({len(query_sample_positions):,} queries) ===", file=sys.stderr)
     exact_started = time.perf_counter()
-    exact_ids_by_query = [
-        [month["artist_ids"][position] for position in row]
-        for row in _exact_top_k(month["vectors"], query_sample_positions, 10)
-    ]
+    exact_ids_by_query = [[month["artist_ids"][position] for position in row] for row in _exact_top_k(month["vectors"], query_sample_positions, 10)]
     exact_elapsed = time.perf_counter() - exact_started
     print(f"  exact: {exact_elapsed:.1f}s", file=sys.stderr)
 
@@ -412,7 +441,9 @@ async def measure_month(
     production_ef_search: int | None = None
     for ef_search in EF_SEARCH_SWEEP:
         ann_started = time.perf_counter()
-        ann_ids_by_query = await _ann_top_k(conn, month["model_version"], month["vectors"], month["artist_ids"], query_sample_positions, ef_search, 10)
+        ann_ids_by_query = await _ann_top_k(
+            conn, month["model_version"], month["vectors"], month["artist_ids"], query_sample_positions, ef_search, 10
+        )
         ann_elapsed = time.perf_counter() - ann_started
         recall = _recall_at_k(ann_ids_by_query, exact_ids_by_query, 10)
         recall_by_ef[ef_search] = recall
@@ -421,7 +452,10 @@ async def measure_month(
             production_ef_search = ef_search
 
     churn_ef_search = production_ef_search or EF_SEARCH_SWEEP[-1]
-    print(f"=== {label}: churn top-10 at ef_search={churn_ef_search} ({len(query_sample_ids)} query positions reused for churn sample separately) ===", file=sys.stderr)
+    print(
+        f"=== {label}: churn top-10 at ef_search={churn_ef_search} ({len(query_sample_ids)} query positions reused for churn sample separately) ===",
+        file=sys.stderr,
+    )
 
     return {
         "write": write_result,
@@ -505,7 +539,12 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         async with pool.connection() as conn:
             await _apply_schema(conn)
             aug_result = await measure_month(
-                conn, aug, label="August", query_sample_positions=aug_query_positions, query_sample_ids=aug_query_ids, maintenance_work_mem=args.aug_maintenance_work_mem
+                conn,
+                aug,
+                label="August",
+                query_sample_positions=aug_query_positions,
+                query_sample_ids=aug_query_ids,
+                maintenance_work_mem=args.aug_maintenance_work_mem,
             )
             print("\n=== August: churn top-10 (exact + ANN) for the common-artist sample, BEFORE dropping the table ===", file=sys.stderr)
             aug_churn = await churn_top_k(conn, aug, churn_sample_ids, aug_result["churn_ef_search_used"])
@@ -526,7 +565,12 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             file=sys.stderr,
         )
         new_host, new_port = _restart_container(
-            name=args.container_name, image=args.image, shm_size=args.sept_shm_size, username=args.username, password=args.password, database=args.database
+            name=args.container_name,
+            image=args.image,
+            shm_size=args.sept_shm_size,
+            username=args.username,
+            password=args.password,
+            database=args.database,
         )
         print(f"  restarted: {new_host}:{new_port}", file=sys.stderr)
         args.host, args.port = new_host, new_port
@@ -552,10 +596,15 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 # either way -- but it's cheap cleanup and keeps the catalog tidy.
                 await _drop_index(conn, aug["model_version"])
                 async with conn.cursor() as cursor:
-                    await cursor.execute(f"TRUNCATE {ARTIST_EMBEDDINGS_TABLE}")  # noqa: S608 -- constant, no caller input.
+                    await cursor.execute(f"TRUNCATE {ARTIST_EMBEDDINGS_TABLE}")
 
             sept_result = await measure_month(
-                conn, sept, label="September", query_sample_positions=sept_query_positions, query_sample_ids=sept_query_ids, maintenance_work_mem=args.sept_maintenance_work_mem
+                conn,
+                sept,
+                label="September",
+                query_sample_positions=sept_query_positions,
+                query_sample_ids=sept_query_ids,
+                maintenance_work_mem=args.sept_maintenance_work_mem,
             )
             print("\n=== September: churn top-10 (exact + ANN) for the common-artist sample ===", file=sys.stderr)
             sept_churn = await churn_top_k(conn, sept, churn_sample_ids, sept_result["churn_ef_search_used"])
@@ -575,8 +624,20 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "common_artists": len(common_ids),
             "rule": "smallest N by splitmix64(node_key('a', artist_id) XOR seed)",
         },
-        "august": {"dump_id": aug["dump_id"], "dump_date": aug["dump_date"], "model_version": aug["model_version"], "n_vectors": len(aug["artist_ids"]), **aug_result},
-        "september": {"dump_id": sept["dump_id"], "dump_date": sept["dump_date"], "model_version": sept["model_version"], "n_vectors": len(sept["artist_ids"]), **sept_result},
+        "august": {
+            "dump_id": aug["dump_id"],
+            "dump_date": aug["dump_date"],
+            "model_version": aug["model_version"],
+            "n_vectors": len(aug["artist_ids"]),
+            **aug_result,
+        },
+        "september": {
+            "dump_id": sept["dump_id"],
+            "dump_date": sept["dump_date"],
+            "model_version": sept["model_version"],
+            "n_vectors": len(sept["artist_ids"]),
+            **sept_result,
+        },
         "churn_exact_cosine": churn_exact,
         "churn_ann_at_production_ef_search": churn_ann,
     }
