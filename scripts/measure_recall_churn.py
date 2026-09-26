@@ -228,6 +228,16 @@ async def _ann_top_k(conn: Any, model_version: str, vectors: np.ndarray, artist_
     `_exact_top_k` applies by setting its own score to `-inf`. Without this, ANN and exact
     are compared on a different footing (ANN off by exactly one true positive every time --
     caught by this script's own synthetic smoke test before it ran against real data).
+
+    Deliberately NOT `WHERE artist_id != %s` alongside the `ORDER BY ... LIMIT` -- a second
+    equality filter on top of the ANN ordering risks the planner choosing a different plan
+    than a plain filtered-by-model_version index scan (relevant for the real, ~7-10M-row
+    table this queries; not distinguishable on the synthetic smoke-test table this bug was
+    caught on). Requesting `k + 1` rows with only the `model_version` filter and dropping
+    the self row client-side gets the same result without touching the query plan at all.
+    Same shape catalog-api's own kNN endpoint (gm-catalog-api-2zsq) will need for its
+    self-exclusion, there behind a `model_version`-filtered *partial* index instead of this
+    script's whole-table one -- see docs/recall_and_churn.md.
     """
     results: list[list[str] | None] = []
     async with conn.cursor() as cursor:
@@ -236,11 +246,12 @@ async def _ann_top_k(conn: Any, model_version: str, vectors: np.ndarray, artist_
             literal = "[" + ",".join(f"{value:g}" for value in vectors[position].tolist()) + "]"
             await cursor.execute(
                 f"SELECT artist_id FROM {ARTIST_EMBEDDINGS_TABLE} "  # noqa: S608
-                f"WHERE model_version = %s AND artist_id != %s ORDER BY embedding <=> %s::halfvec LIMIT %s",
-                (model_version, artist_ids[position], literal, k),
+                f"WHERE model_version = %s ORDER BY embedding <=> %s::halfvec LIMIT %s",
+                (model_version, literal, k + 1),
             )
             rows = await cursor.fetchall()
-            results.append([artist_id for (artist_id,) in rows][:k])
+            own_id = artist_ids[position]
+            results.append([artist_id for (artist_id,) in rows if artist_id != own_id][:k])
     return results
 
 
