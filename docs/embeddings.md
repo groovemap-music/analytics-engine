@@ -58,7 +58,7 @@ The hashed projection is statistically another draw of the same distribution. On
 | 1.0M | 6.8M | 4 | 2.7 s | 14.1 s | 0.54 GB | 0.29 GB |
 | 8.0M | 54.1M | 4 | 24.2 s | 179.2 s | 2.71 GB | 2.30 GB |
 
-The full catalog is 32.8M nodes, at most 222M edges, and 10.2M artist rows. Extrapolating the measurements linearly from 1M to 8M nodes:
+Before ieu.6, this document estimated the full catalog at 32.8M nodes, at most 222M edges, and 10.2M artist rows — the chw.2 spike's own coarse extrapolation ("Full-catalog extrapolation (estimated, not run)"), not a count against a real dump. Extrapolating the measurements above linearly from 1M to 8M nodes against that estimate:
 
 | `block_columns` | Peak RSS | Array estimate | FastRP | Build |
 | ---: | ---: | ---: | ---: | ---: |
@@ -66,7 +66,7 @@ The full catalog is 32.8M nodes, at most 222M edges, and 10.2M artist rows. Extr
 | **4 (default)** | **10.4 GB** | **9.4 GB** | **about 12 min** | **about 1.5 min** |
 | 128, one pass | — | 54 GB | — | — |
 
-The pipeline therefore runs with the defaults (four columns per block and two passes), `float16` output, and six threads, which stays within the 12 GB budget. At the peak, the resident set is as follows:
+The pipeline therefore runs with the defaults (four columns per block and two passes), `float16` output, and six threads, which stays within the 12 GB budget. At that (pre-ieu.6) peak, the resident set is as follows:
 
 - the CSR transition matrix: 3.7 GB of `int32` indices and `float32` values
 - the returned `float16` artist rows: 2.6 GB
@@ -85,6 +85,12 @@ Memory can be reduced further, at a cost:
 
 Threads add little memory, because each task works on at most 262,144 rows.
 
+### Updated for the release-level credited-artist edges (ieu.6)
+
+The 2026-08 dump gives a real count in place of the spike's extrapolation: about 30M nodes and 174M edges once the credited-artist relation's 51,004,385 edges and 4,072,191 credited-only artists are included (see "Release-level credited-artist edges" above) — both somewhat below the earlier 32.8M/222M guess, since that guess was never checked against a real dump. Artist rows written grow from the 2,861,379 main artists to about 6.93M (2,861,379 main plus 4,072,191 credited-only), since `_read_vertices` returns every artist vertex, not only main artists, and `_write_embeddings` writes one row per vertex it returns.
+
+`estimate_peak_bytes(30_000_000, 174_000_000, 6_933_570, block_columns=4, out_itemsize=2)` gives an array estimate of about 7.6 GB (build 3.6 GB, compute 7.6 GB) — lower than the pre-ieu.6 9.4 GB estimate above despite the added edges and artist rows, because the real node/edge counts are themselves lower than the spike's guess. Adding the same roughly 1 GB of interpreter and allocator overhead this document already carries puts the estimated peak RSS at about 8.5 GB, still within the 12 GB budget with headroom to spare. The scaling table's proportions (6.77 undirected edges per node) no longer describe the graph exactly — the credited-artist relation shifts the edge-per-node ratio somewhat — but `estimate_peak_bytes` takes node and edge counts directly, so the estimate above does not depend on that ratio holding.
+
 ## The monthly load pipeline
 
 `insights/embedding_pipeline.py` is the pipeline the module docstring above defers to: it
@@ -98,14 +104,58 @@ for the grant: `SELECT` on every relation in `graph`, `SELECT, INSERT, UPDATE, D
 `public.artist_embeddings` alone, nothing else.
 
 **Reading the graph.** The pipeline reads the six vertex kinds this module's node identity
-covers (artist, release, label, master, genre, style) from `graph.vertex_degree`, and the eight
+covers (artist, release, label, master, genre, style) from `graph.vertex_degree`, and the nine
 edge relations that connect them (`graph.by_artist`, `graph.on_label`, `graph.derived_from`,
 `graph.in_genre`, `graph.in_style`, `graph.master_by_artist`, `graph.master_in_genre`,
-`graph.master_in_style`) — each via a named (server-side) PostgreSQL cursor, fetched in
-50,000-row blocks, so the full vertex and edge sets are never materialized as Python lists in
-one piece. `fastrp` is then called with the defaults documented above: `out_dtype=np.float16`,
-`block_columns=4` (the default), and `threads=6` — the configuration the scaling table above
-was measured against, which stays within the 12 GB full-catalog budget.
+`graph.master_in_style`, and — since ieu.6 — the release-level credited-artist relation below) —
+each via a named (server-side) PostgreSQL cursor, fetched in 50,000-row blocks, so the full
+vertex and edge sets are never materialized as Python lists in one piece. `fastrp` is then
+called with the defaults documented above: `out_dtype=np.float16`, `block_columns=4` (the
+default), and `threads=6` — the configuration the scaling table above was measured against,
+which stays within the 12 GB full-catalog budget.
+
+**Release-level credited-artist edges (ieu.6).** The chw.2 spike's adopted FastRP
+configuration includes credit and track edges — "removing credit and track edges costs 10
+points of recall@10" — but the eight relations above are all main-artist (`by_artist`); no
+credit reaches the graph. Production already stores release-level credits:
+`graph.credited_on` is `(person_name, release_id, role)`, with a GENERATED `role_category`
+column over the same `common.credit_roles` taxonomy the spike's harness used
+(`graph.credit_role_category`), and `graph.same_as` is the separate `(person_name, artist_id)`
+table resolving a credited name to a catalog artist id. The pipeline reads
+`graph.credited_on JOIN graph.same_as ON person_name`, filtered to the spike's kept categories
+— `production`, `engineering`, `session`, `other` — and drops `mastering`, `design`, and
+`management`, exactly `KEPT_CREDIT_CATEGORIES` in the spike harness
+(`design/docs/spikes/gm-design-chw.2/parse_dump.py`): a cutting engineer or sleeve photographer
+links releases by vendor, not by sound.
+
+`graph.same_as` has no release column, so a credited name resolves to zero, one, or more artist
+ids independent of which release asked. This pipeline's rule, which the spike's harness never
+had to make (its harness read Discogs artist ids directly out of the dump, bypassing this
+name-based split entirely): a name with no resolved id joins to nothing and the credit is
+silently dropped, and a name resolved to more than one id joins to every one of them, fanning
+the credited-artist edge out rather than picking one. Both are accepted rather than treated as
+errors — see `_CREDITED_ARTIST_EDGE_SQL`'s comment in `insights/embedding_pipeline.py` for the
+full reasoning.
+
+Because a session player or producer credited only this way is never a main artist, an alias,
+or a group member, `graph.vertex_degree` — scoped to the ten path-traversal relations
+database-schema sums it over — has no row for them. `_read_vertices` runs two extra discovery
+queries (over the same kept-category filter) to find exactly those artist and, defensively,
+release ids before building the node index, so the credited-artist edge never names a vertex
+the pipeline has not already seen; see that function's docstring.
+
+`FASTRP_ALGORITHM_VERSION`/`config.model_version` cover the *algorithm*; they do not change
+when the graph fed into it does. So that a dump reprocessed under a different edge set can
+never land on, be skipped as, or silently overwrite an earlier edge set's rows, the *stored*
+`model_version` composes in a separate `_EDGE_SET_VERSION` tag (`"edges-v1"` before this bead,
+`"edges-v2"` after) — see "The stored `model_version` is per dump, not per algorithm" below.
+
+On the 2026-08 dump this relation adds 51,004,385 edges and 5,124,569 distinct credited
+artists, of which 4,072,191 are never a main artist — beyond the 2,861,379 main-artist nodes
+the eight relations above already carry. The full graph is therefore about 30M nodes and 174M
+edges, up from the pre-ieu.6 estimate this document carried before real dump-based counts were
+available (see "Memory and time at catalog scale" below for what that does to the peak-memory
+estimate).
 
 **Lineage.** `SOURCE_DUMP_ID` and `SOURCE_DUMP_DATE` (required, no default — the invoker
 supplies them, since it is the one that knows which dump just landed) become
@@ -114,17 +164,22 @@ supplies them, since it is the one that knows which dump just landed) become
 "Determinism" above) are recorded in the run's own logs at the start of every call, since
 `artist_embeddings` has no column for them.
 
-**The stored `model_version` is per dump, not per algorithm.** `FastRPConfig.model_version`
-names only the method, its parameters, and the projection seed rule — the same string every
-month an operator does not change the algorithm. `stored_model_version(config, dump_id)`
-(`f"{config.model_version}@{dump_id}"`) is the value this job actually reads and writes as
-`artist_embeddings.model_version`; `config.model_version` itself is recorded separately, as
-`method_version`, in every log line. Composing the dump id in is what lets two months coexist
-under the table's `(artist_id, model_version)` primary key — a second month's load is a
-brand-new set of rows under its own key, never an upsert of the first month's. An earlier
-revision of this job stored the bare `config.model_version`, which meant a second dump would
-silently overwrite the first month's rows in place; see the module docstring's "The stored
-model_version is per dump, not per algorithm" for the full rationale this review caught.
+**The stored `model_version` is per dump and per edge set, not per algorithm.**
+`FastRPConfig.model_version` names only the method, its parameters, and the projection seed
+rule — the same string every month an operator does not change the algorithm.
+`stored_model_version(config, dump_id)`
+(`f"{config.model_version}:{_EDGE_SET_VERSION}@{dump_id}"`) is the value this job actually reads
+and writes as `artist_embeddings.model_version`; `config.model_version` itself is recorded
+separately, as `method_version`, in every log line. Composing the dump id in is what lets two
+months coexist under the table's `(artist_id, model_version)` primary key — a second month's
+load is a brand-new set of rows under its own key, never an upsert of the first month's. An
+earlier revision of this job stored the bare `config.model_version`, which meant a second dump
+would silently overwrite the first month's rows in place; see the module docstring's "The
+stored model_version is per dump, not per algorithm" for the full rationale this review caught.
+`_EDGE_SET_VERSION` (`"edges-v1"` before ieu.6, `"edges-v2"` after it added the release-level
+credited-artist relation) applies the identical idea to the graph: bumping it whenever
+`_EDGE_RELATIONS` changes means a dump reprocessed under a different edge set also lands on its
+own rows rather than colliding with, or being skipped as, the previous edge set's.
 
 **Idempotency.** The job is idempotent per stored `model_version` (which already encodes
 `(dump_id, method_version)`): re-running for a dump already recorded under this algorithm is a

@@ -6,7 +6,7 @@ environment variable `_required_env` below reads. See that script and `docs/embe
 
 The schema applied here is a minimal, self-contained stand-in for the objects ADR 0013's
 2026-09-24 amendment adds in `database-schema` — `public.artist_embeddings`, the
-`embedding_pipeline` role and its grants, and the eight `graph` schema edge relations plus
+`embedding_pipeline` role and its grants, and the nine `graph` schema edge relations plus
 `graph.vertex_degree` this pipeline reads — declared inline rather than taken as a dependency
 on that repository's package. `database-schema`'s own molecule that adds these objects
 (`gm-database-schema-lhp2`) has not been pushed to `origin/main` as of this bead (see the
@@ -17,6 +17,15 @@ the embedding pipeline role") instead of the producer's authoritative DDL. Once 
 lands, `groovemap-database-schema` should become a pinned dev dependency the way
 `catalog-api` already does it, and this fixture should apply its real
 `create_postgres_schema` instead.
+
+`graph.credited_on` and `graph.same_as` (ieu.6) are the two exceptions to "plain two-column
+edge table": `credited_on.role_category` is a GENERATED column bound to
+`graph.credit_role_category`, a SQL rendering of `common.credit_roles.ROLE_CATEGORIES` (the
+same taxonomy `insights.embedding_pipeline._KEPT_CREDIT_CATEGORIES` filters against), built here
+by `_credit_role_category_function_sql()` from that shared, already-vendored dependency rather
+than hand-copied — so a taxonomy change in `groovemap-runtime` changes this fixture's function
+body the same way it would change database-schema's real one, and this suite cannot silently
+drift from what `role_category` actually resolves to.
 
 The graph tables here are created directly, not projected from catalog documents: they are
 base tables in the real schema too (loader-written, not views), so seeding them directly is
@@ -31,6 +40,7 @@ from typing import TYPE_CHECKING
 import pytest
 import pytest_asyncio
 from common import AsyncPostgreSQLPool, parse_postgres_host_port
+from common.credit_roles import ROLE_CATEGORIES
 from psycopg import sql
 
 
@@ -42,9 +52,12 @@ EMBEDDING_PIPELINE_ROLE = "embedding_pipeline"
 _PIPELINE_LOGIN_ROLE = "embedding_pipeline_login"
 
 # A small, fully-connected synthetic graph exercising all six FastRP vertex kinds and all
-# eight edge relations `insights.embedding_pipeline` reads: artists 1 and 2 share release
-# 101, 2 and 3 share release 102; release 101 also carries a label, a master, a genre, and a
-# style, and the master repeats the artist/genre/style tags the way a Discogs master does.
+# eight pre-ieu.6 edge relations `insights.embedding_pipeline` reads: artists 1 and 2 share
+# release 101, 2 and 3 share release 102; release 101 also carries a label, a master, a genre,
+# and a style, and the master repeats the artist/genre/style tags the way a Discogs master
+# does. The ninth relation, the release-level credited-artist edge, is exercised separately
+# (`test_credited_artist_edges_are_filtered_resolved_and_embedded`) with its own seed rows,
+# inserted and cleaned up per test rather than added to this session-scoped base graph.
 ARTIST_IDS: tuple[str, ...] = ("1", "2", "3")
 
 _VERTEX_ROWS: tuple[tuple[str, str, int], ...] = (
@@ -70,8 +83,9 @@ _EDGE_ROWS: dict[str, tuple[tuple[str, str], ...]] = {
     "graph.master_in_style": (("601", "Fixture Style"),),
 }
 
-# (table, column pair) — the eight edge relations, in the same shape `_EDGE_RELATIONS` in
-# `insights/embedding_pipeline.py` reads.
+# (table, column pair) — the eight plain-scan edge relations, in the same shape
+# `_EDGE_RELATIONS` in `insights/embedding_pipeline.py` reads. The ninth, `graph.credited_on`
+# joined to `graph.same_as`, is not a plain two-column table and is declared separately below.
 _EDGE_COLUMNS: dict[str, tuple[str, str]] = {
     "graph.by_artist": ("release_id", "artist_id"),
     "graph.on_label": ("release_id", "label_id"),
@@ -82,6 +96,46 @@ _EDGE_COLUMNS: dict[str, tuple[str, str]] = {
     "graph.master_in_genre": ("master_id", "genre_name"),
     "graph.master_in_style": ("master_id", "style_name"),
 }
+
+
+def _sql_literal(value: str) -> str:
+    """A single-quoted SQL string literal for embedding directly into DDL text."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _credit_role_category_function_sql() -> str:
+    """Return `graph.credit_role_category`, rendered from the real, vendored taxonomy.
+
+    Verbatim shape of database-schema's `_credit_role_category_function`/`_role_category_branches`
+    (docs/architecture.md, "Vector embeddings and the embedding pipeline role"), but built from
+    `common.credit_roles.ROLE_CATEGORIES` here rather than hand-copied, so this fixture's
+    function body tracks the shared taxonomy `insights.embedding_pipeline._KEPT_CREDIT_CATEGORIES`
+    filters against exactly, including its longest-fragment-first, cross-category specificity
+    rule for a compound credit like "Recorded By, Mastered By".
+    """
+    fragments = {role: category for category, roles in ROLE_CATEGORIES.items() for role in roles}
+    branches = sorted(fragments.items(), key=lambda pair: (-len(pair[0]), pair[0]))
+    exact = "\n".join(f"        WHEN normalized.role = {_sql_literal(fragment)} THEN {_sql_literal(category)}" for fragment, category in branches)
+    contained = "\n".join(
+        f"        WHEN strpos(normalized.role, {_sql_literal(fragment)}) > 0 THEN {_sql_literal(category)}" for fragment, category in branches
+    )
+    return f"""
+    CREATE OR REPLACE FUNCTION graph.credit_role_category(raw_role text)
+    RETURNS text
+    LANGUAGE sql
+    IMMUTABLE
+    PARALLEL SAFE
+    RETURNS NULL ON NULL INPUT
+    AS $credit_role_category$
+    SELECT CASE
+{exact}
+{contained}
+        ELSE 'other'
+    END
+    FROM (SELECT btrim(lower(raw_role)) AS role) AS normalized
+    $credit_role_category$
+    """  # noqa: S608 -- built from the fixed, vendored ROLE_CATEGORIES taxonomy, never caller input.
+
 
 _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE EXTENSION IF NOT EXISTS vector",
@@ -106,6 +160,29 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         """
         for table, columns in _EDGE_COLUMNS.items()
     ),
+    _credit_role_category_function_sql(),
+    # `role_category` is GENERATED, exactly like database-schema's real `credited_on` — see
+    # that table's DDL comment on why: nine downstream credits functions read it there, and a
+    # loader that forgot to set it would produce a silent null rather than a failure. Naming it
+    # in an INSERT is therefore an error, never a value this fixture's seed rows supply.
+    """
+    CREATE TABLE IF NOT EXISTS graph.credited_on (
+        person_name   TEXT NOT NULL,
+        release_id    TEXT NOT NULL,
+        role          TEXT NOT NULL,
+        role_category TEXT GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED,
+        PRIMARY KEY (person_name, release_id, role)
+    )
+    """,
+    # No release column: the same person credited by id on any release asserts the same row
+    # (database-schema's `derive_release` docstring on `same_as`) — additive, never pruned.
+    """
+    CREATE TABLE IF NOT EXISTS graph.same_as (
+        person_name TEXT NOT NULL,
+        artist_id   TEXT NOT NULL,
+        PRIMARY KEY (person_name, artist_id)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS public.artist_embeddings (
         artist_id        TEXT NOT NULL,

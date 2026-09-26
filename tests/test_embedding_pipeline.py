@@ -71,7 +71,13 @@ class FakeCursor:
 
 
 class FakeConnection:
-    """A synthetic graph plus the stored `model_version`s `_already_loaded` should already see."""
+    """A synthetic graph plus the stored `model_version`s `_already_loaded` should already see.
+
+    `credited_artist_ids`/`credited_release_ids` stand in for what
+    `_CREDITED_ARTIST_IDS_SQL`/`_CREDITED_RELEASE_IDS_SQL` would discover beyond
+    `graph.vertex_degree` — see `_read_vertices`'s docstring. Both default to empty: a fixture
+    that never mentions credited-only vertices behaves exactly as it did before ieu.6.
+    """
 
     def __init__(
         self,
@@ -79,10 +85,14 @@ class FakeConnection:
         vertex_rows: list[tuple[str, str]],
         edge_rows: dict[str, list[tuple[Any, Any]]],
         already_loaded_versions: frozenset[str] = frozenset(),
+        credited_artist_ids: tuple[str, ...] = (),
+        credited_release_ids: tuple[str, ...] = (),
     ) -> None:
         self.vertex_rows = vertex_rows
         self.edge_rows = edge_rows
         self.already_loaded_versions = set(already_loaded_versions)
+        self.credited_artist_ids = list(credited_artist_ids)
+        self.credited_release_ids = list(credited_release_ids)
         self.executemany_log: list[tuple[str, list[tuple[Any, ...]]]] = []
         self.opened_cursor_names: list[str | None] = []
 
@@ -96,6 +106,10 @@ class FakeConnection:
             return FakeCursor(fetchone_resolver=self._resolve_already_loaded, executemany_log=self.executemany_log)
         if name == "embedding_pipeline_vertices":
             return FakeCursor(rows_batches=[self.vertex_rows])
+        if name == "embedding_pipeline_credited_artist_ids":
+            return FakeCursor(rows_batches=[[(artist_id,) for artist_id in self.credited_artist_ids]])
+        if name == "embedding_pipeline_credited_release_ids":
+            return FakeCursor(rows_batches=[[(release_id,) for release_id in self.credited_release_ids]])
         for table, rows in self.edge_rows.items():
             if name == f"embedding_pipeline_{table.replace('.', '_')}":
                 return FakeCursor(rows_batches=[rows])
@@ -124,10 +138,13 @@ class _ConnectionContext:
         return False
 
 
-# A small, fully-connected synthetic graph exercising every one of the eight edge relations
-# and all six FastRP vertex kinds: artists 1 and 2 share release 101, 2 and 3 share release
-# 102; release 101 also carries a label, a master, a genre, and a style, and the master
-# repeats the artist/genre/style tags.
+# A small, fully-connected synthetic graph exercising every one of the eight pre-ieu.6 edge
+# relations and all six FastRP vertex kinds: artists 1 and 2 share release 101, 2 and 3 share
+# release 102; release 101 also carries a label, a master, a genre, and a style, and the master
+# repeats the artist/genre/style tags. The ninth relation, the release-level credited-artist
+# edge, is exercised separately below (`TestCreditedArtistEdges`) since its interesting cases
+# — an unresolvable name, an ambiguous one, a credited-only artist or release with no
+# `graph.vertex_degree` row — need their own small fixtures, not this one.
 _VERTEX_ROWS: list[tuple[str, str]] = [
     ("a", "1"),
     ("a", "2"),
@@ -149,6 +166,10 @@ _EDGE_ROWS: dict[str, list[tuple[Any, Any]]] = {
     "graph.master_by_artist": [("601", "1")],
     "graph.master_in_genre": [("601", "Fixture Genre")],
     "graph.master_in_style": [("601", "Fixture Style")],
+    # No credited-artist edges in the base fixture -- every artist here is already a main
+    # artist, so this base graph is unaffected by ieu.6. `TestCreditedArtistEdges` below
+    # exercises the new relation on its own, purpose-built fixtures.
+    "graph.credited_on": [],
 }
 
 
@@ -231,12 +252,24 @@ class TestHalfvecLiteral:
 
 
 class TestStoredModelVersion:
-    def test_composes_the_method_version_and_the_dump_id(self) -> None:
+    def test_composes_the_method_version_the_edge_set_version_and_the_dump_id(self) -> None:
         config = FastRPConfig()
 
         version = pipeline.stored_model_version(config, "discogs-2026-09")
 
-        assert version == f"{config.model_version}@discogs-2026-09"
+        assert version == f"{config.model_version}:{pipeline._EDGE_SET_VERSION}@discogs-2026-09"
+
+    def test_an_edge_set_bump_changes_the_stored_version_for_an_unchanged_config_and_dump(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The acceptance criterion this bead adds: two edge sets under the same algorithm and
+        dump must never share a stored `model_version` — see the module docstring's "The
+        stored model_version is per dump, not per algorithm"."""
+        config = FastRPConfig()
+        before = pipeline.stored_model_version(config, "discogs-2026-09")
+
+        monkeypatch.setattr(pipeline, "_EDGE_SET_VERSION", "edges-v3")
+        after = pipeline.stored_model_version(config, "discogs-2026-09")
+
+        assert before != after
 
     def test_two_dumps_under_the_same_config_get_different_stored_versions(self) -> None:
         config = FastRPConfig()
@@ -400,6 +433,179 @@ class TestStreamEdgeBlocks:
         assert adjacency.degree[artist_1] == 2  # release 101, master 601
         assert adjacency.degree[artist_2] == 2  # releases 101 and 102
         assert adjacency.degree[artist_3] == 1  # release 102
+
+
+# ── Release-level credited-artist edges (ieu.6) ─────────────────────────────────────────────────
+
+
+class TestCreditedArtistCategories:
+    def test_matches_the_chw2_spikes_kept_categories(self) -> None:
+        # design docs/spikes/gm-design-chw.2/parse_dump.py: KEPT_CREDIT_CATEGORIES
+        assert set(pipeline._KEPT_CREDIT_CATEGORIES) == {"production", "engineering", "session", "other"}
+
+    def test_kept_and_dropped_are_disjoint_and_cover_the_full_taxonomy(self) -> None:
+        """Drift guard: if `common.credit_roles` grows a new category, this fails instead of
+        the new category silently falling into neither list."""
+        from common.credit_roles import ALL_CATEGORIES
+
+        kept = set(pipeline._KEPT_CREDIT_CATEGORIES)
+        dropped = set(pipeline._DROPPED_CREDIT_CATEGORIES)
+
+        assert kept.isdisjoint(dropped)
+        assert kept | dropped == set(ALL_CATEGORIES)
+
+
+class TestCreditedArtistEdgeSql:
+    def test_filters_on_role_category(self) -> None:
+        assert "role_category = ANY(%s)" in pipeline._CREDITED_ARTIST_EDGE_SQL
+        assert "graph.credited_on" in pipeline._CREDITED_ARTIST_EDGE_SQL
+        assert "graph.same_as" in pipeline._CREDITED_ARTIST_EDGE_SQL
+
+    def test_registered_with_the_release_artist_kinds_and_the_kept_categories(self) -> None:
+        entry = next(relation for relation in pipeline._EDGE_RELATIONS if relation[0] == "graph.credited_on")
+        _name, query, params, source_kind, target_kind = entry
+
+        assert query is pipeline._CREDITED_ARTIST_EDGE_SQL
+        assert params == (list(pipeline._KEPT_CREDIT_CATEGORIES),)
+        assert (source_kind, target_kind) == ("r", "a")
+
+    def test_discovery_queries_use_the_same_kept_categories(self) -> None:
+        assert "role_category = ANY(%s)" in pipeline._CREDITED_ARTIST_IDS_SQL
+        assert "graph.same_as" in pipeline._CREDITED_ARTIST_IDS_SQL
+        assert "role_category = ANY(%s)" in pipeline._CREDITED_RELEASE_IDS_SQL
+
+
+def _connection_with_credited_edges(
+    *,
+    credited_edges: list[tuple[str, str]],
+    credited_artist_ids: tuple[str, ...] = (),
+    credited_release_ids: tuple[str, ...] = (),
+    vertex_rows: list[tuple[str, str]] | None = None,
+) -> FakeConnection:
+    """A minimal connection isolating the credited-artist relation from the other eight.
+
+    Defaults to one known main artist (``a``, ``1``) and one known release (``r``, ``101``), so
+    a test adds exactly the credited-only vertices it cares about via
+    ``credited_artist_ids``/``credited_release_ids`` instead of inheriting the base
+    ``_VERTEX_ROWS`` fixture's unrelated edges. The other eight relations are wired to empty
+    batches from `_EDGE_RELATIONS` itself, so a relation added there later gets one here too.
+    """
+    edge_rows: dict[str, list[tuple[Any, Any]]] = {name: [] for name, *_rest in pipeline._EDGE_RELATIONS if name != "graph.credited_on"}
+    edge_rows["graph.credited_on"] = list(credited_edges)
+    return FakeConnection(
+        vertex_rows=vertex_rows if vertex_rows is not None else [("a", "1"), ("r", "101")],
+        edge_rows=edge_rows,
+        credited_artist_ids=credited_artist_ids,
+        credited_release_ids=credited_release_ids,
+    )
+
+
+class TestReadVerticesCreditedArtists:
+    @pytest.mark.asyncio
+    async def test_includes_a_credited_only_artist_with_no_vertex_degree_row(self) -> None:
+        """The artist a session-player credit resolves to may never be a main artist, alias,
+        or group member, so `graph.vertex_degree` has no row for it at all -- see
+        `_read_vertices`'s docstring."""
+        from insights.embeddings import node_key
+
+        conn = _connection_with_credited_edges(credited_edges=[("101", "99")], credited_artist_ids=("99",))
+
+        nodes, artist_ids = await pipeline._read_vertices(conn)
+
+        assert "99" in artist_ids
+        nodes.positions([node_key("a", "99")])  # raises KeyError if the node is missing
+
+    @pytest.mark.asyncio
+    async def test_includes_a_credited_only_release_with_no_vertex_degree_row(self) -> None:
+        from insights.embeddings import node_key
+
+        conn = _connection_with_credited_edges(credited_edges=[("202", "1")], credited_release_ids=("202",))
+
+        nodes, _artist_ids = await pipeline._read_vertices(conn)
+
+        nodes.positions([node_key("r", "202")])  # raises KeyError if the node is missing
+
+    @pytest.mark.asyncio
+    async def test_drops_an_unresolvable_credited_name(self) -> None:
+        """A `same_as` name with no recorded artist id (nothing to `JOIN` onto) contributes no
+        edge row and no discovered artist id -- an accepted, silent drop, not an error."""
+        conn = _connection_with_credited_edges(credited_edges=[], credited_artist_ids=())
+
+        nodes, artist_ids = await pipeline._read_vertices(conn)
+
+        assert artist_ids == ["1"]
+        assert len(nodes) == 2  # the base artist and release only
+
+    @pytest.mark.asyncio
+    async def test_fans_out_an_ambiguous_same_as_name_to_every_resolved_artist(self) -> None:
+        """A `same_as` name resolved to more than one artist id (recorded across different
+        releases, since `same_as` carries no release column to disambiguate by) joins to every
+        one of them -- see `_CREDITED_ARTIST_EDGE_SQL`'s comment for why that is the accepted
+        resolution rule rather than picking one."""
+        from insights.embeddings import node_key
+
+        conn = _connection_with_credited_edges(credited_edges=[("101", "99"), ("101", "100")], credited_artist_ids=("99", "100"))
+
+        nodes, artist_ids = await pipeline._read_vertices(conn)
+
+        assert sorted(artist_ids) == ["1", "100", "99"]
+        nodes.positions([node_key("a", "99"), node_key("a", "100")])  # raises KeyError if either is missing
+
+    @pytest.mark.asyncio
+    async def test_does_not_duplicate_an_artist_already_known_from_vertex_degree(self) -> None:
+        """A credited artist who is also a main artist elsewhere appears exactly once in
+        `artist_ids` -- a duplicate would make `_write_embeddings`' multi-row upsert try to
+        affect the same `(artist_id, model_version)` row twice within one statement."""
+        conn = _connection_with_credited_edges(credited_edges=[("101", "1")], credited_artist_ids=("1",))
+
+        _nodes, artist_ids = await pipeline._read_vertices(conn)
+
+        assert artist_ids == ["1"]
+
+    @pytest.mark.asyncio
+    async def test_is_order_independent_across_discovery_batches(self) -> None:
+        """Neither discovery query is ordered (`SELECT DISTINCT`, no `ORDER BY`); the resulting
+        node set must not depend on the order PostgreSQL happens to return either of them in."""
+        forward = _connection_with_credited_edges(credited_edges=[("101", "99"), ("101", "100")], credited_artist_ids=("99", "100"))
+        reversed_ = _connection_with_credited_edges(credited_edges=[("101", "100"), ("101", "99")], credited_artist_ids=("100", "99"))
+
+        forward_nodes, forward_ids = await pipeline._read_vertices(forward)
+        reversed_nodes, reversed_ids = await pipeline._read_vertices(reversed_)
+
+        assert np.array_equal(forward_nodes.keys, reversed_nodes.keys)
+        assert sorted(forward_ids) == sorted(reversed_ids)
+
+
+class TestStreamEdgeBlocksCreditedArtists:
+    @pytest.mark.asyncio
+    async def test_connects_a_release_to_every_resolved_credited_artist(self) -> None:
+        from insights.embeddings import AdjacencyBuilder, node_key
+
+        conn = _connection_with_credited_edges(credited_edges=[("101", "99"), ("101", "100")], credited_artist_ids=("99", "100"))
+        nodes, _artist_ids = await pipeline._read_vertices(conn)
+        builder = AdjacencyBuilder(nodes)
+
+        await pipeline._stream_edge_blocks(conn, builder)
+        adjacency = builder.build()
+
+        artist_99 = nodes.positions([node_key("a", "99")])[0]
+        artist_100 = nodes.positions([node_key("a", "100")])[0]
+        assert adjacency.degree[artist_99] == 1
+        assert adjacency.degree[artist_100] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_credited_edge_to_an_existing_main_artist_adds_to_its_degree(self) -> None:
+        from insights.embeddings import AdjacencyBuilder, node_key
+
+        conn = _connection_with_credited_edges(credited_edges=[("202", "1")], credited_release_ids=("202",))
+        nodes, _artist_ids = await pipeline._read_vertices(conn)
+        builder = AdjacencyBuilder(nodes)
+
+        await pipeline._stream_edge_blocks(conn, builder)
+        adjacency = builder.build()
+
+        artist_1 = nodes.positions([node_key("a", "1")])[0]
+        assert adjacency.degree[artist_1] == 1  # the new credited release only; 101 is untouched
 
 
 # ── Writing ──────────────────────────────────────────────────────────────────────────────────

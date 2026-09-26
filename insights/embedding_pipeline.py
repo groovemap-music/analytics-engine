@@ -41,12 +41,16 @@ still be serving, drive row-by-row HNSW maintenance on that live index instead o
 reach them, and leave ieu.3's month-over-month churn measurement with only one month on disk to
 compare.
 
-`stored_model_version(config, dump_id)` — `f"{config.model_version}@{dump_id}"` — is what this
-module actually reads and writes as `model_version`. Composing the dump id in is what lets two
-months coexist: each dump gets its own primary-key value, so a second month's load is a
-brand-new set of rows, never a write to the first month's. `config.model_version` (the pure
-method string) is recorded separately, in every log line here, as `method_version` — see
-"Bit-identity and lineage" below.
+`stored_model_version(config, dump_id)` — `f"{config.model_version}:{_EDGE_SET_VERSION}@{dump_id}"`
+— is what this module actually reads and writes as `model_version`. Composing the dump id in is
+what lets two months coexist: each dump gets its own primary-key value, so a second month's load
+is a brand-new set of rows, never a write to the first month's. `_EDGE_SET_VERSION` is the same
+idea applied to the *graph* rather than the dump: it names which relations `_EDGE_RELATIONS`
+reads, bumped whenever one is added, removed, or refiltered (ieu.6 added the release-level
+credited-artist relation and bumped it to `"edges-v2"`), so a dump reprocessed under a changed
+edge set also lands on its own rows rather than upserting or being skipped as the old edge set's.
+`config.model_version` (the pure method string) is recorded separately, in every log line here,
+as `method_version` — see "Bit-identity and lineage" below.
 
 ## Idempotency
 
@@ -135,19 +139,75 @@ ARTIST_EMBEDDINGS_TABLE: Final = "public.artist_embeddings"
 # this the FastRP subgraph rather than that wider graph.
 _VERTEX_KINDS: Final = ("a", "r", "l", "m", "g", "s")
 
-# (relation, source column, source kind, target column, target kind) for every edge relation
-# that connects two of the six kinds above -- release<->artist/label/master/genre/style and
-# master<->artist/genre/style, exactly the bipartite shape the six kinds admit. Declared in
-# database-schema's `graph.catalog` property graph (docs/architecture.md, "Property graph").
-_EDGE_RELATIONS: Final[tuple[tuple[str, str, str, str, str], ...]] = (
-    ("graph.by_artist", "release_id", "r", "artist_id", "a"),
-    ("graph.on_label", "release_id", "r", "label_id", "l"),
-    ("graph.derived_from", "release_id", "r", "master_id", "m"),
-    ("graph.in_genre", "release_id", "r", "genre_name", "g"),
-    ("graph.in_style", "release_id", "r", "style_name", "s"),
-    ("graph.master_by_artist", "master_id", "m", "artist_id", "a"),
-    ("graph.master_in_genre", "master_id", "m", "genre_name", "g"),
-    ("graph.master_in_style", "master_id", "m", "style_name", "s"),
+# Kept `common.credit_roles` categories for the release-level credited-artist edge below,
+# exactly the chw.2 spike's `KEPT_CREDIT_CATEGORIES` (design
+# docs/spikes/gm-design-chw.2/parse_dump.py): a producer, engineer, session musician, or
+# otherwise-uncategorized credit says something about musical similarity. Mastering, design,
+# and management credits are dropped -- a cutting engineer or sleeve photographer links
+# releases by vendor, not by sound. `common.credit_roles.ALL_CATEGORIES` (`groovemap-runtime`,
+# already a dependency here) is the taxonomy these two tuples partition;
+# `tests/test_embedding_pipeline.py` guards that they still cover it completely and disjointly,
+# so a category added upstream fails a test here instead of silently landing in neither list.
+_KEPT_CREDIT_CATEGORIES: Final[tuple[str, ...]] = ("production", "engineering", "session", "other")
+_DROPPED_CREDIT_CATEGORIES: Final[tuple[str, ...]] = ("mastering", "design", "management")
+
+# The release-level credited-artist edge (ieu.6). `graph.credited_on` is `(person_name,
+# release_id, role)` with a GENERATED `role_category` column over the same taxonomy
+# `common.credit_roles.categorize_role` implements (`graph.credit_role_category`,
+# database-schema); it carries no artist id of its own. `graph.same_as`, `(person_name,
+# artist_id)`, is the separate, additive table that resolves a credited name to zero, one, or
+# more catalog artists. An INNER JOIN on `person_name` gives exactly the resolution rule this
+# pipeline uses, with no extra Python-side logic: a name `same_as` never resolved (no id was
+# ever recorded for it) joins to nothing and the credit is silently dropped -- there is no
+# artist to point an edge at; a name `same_as` resolved to more than one artist id (seen across
+# different releases, since `same_as` has no release column to disambiguate by) joins to every
+# one of them, fanning the credit out to all of them rather than guessing which is "the" match.
+# Both are accepted, documented behaviour, not an error: dropping an unresolvable credit loses
+# no real artist, and fanning out an ambiguous one at worst adds a handful of noisy edges from
+# genuine name collisions, which FastRP's propagation is already robust to by construction (one
+# release among thousands touching a hub node changes it negligibly). The chw.2 spike itself
+# never faced this: its harness read Discogs artist ids straight out of the dump's
+# `extraartists/artist/id` element (`parse_dump.py`'s `_ids`), which production's
+# `graph.credited_on`/`graph.same_as` split does not carry forward, so this rule has no spike
+# precedent to match -- it is this bead's own design decision.
+_CREDITED_ARTIST_EDGE_SQL: Final = """
+SELECT DISTINCT credited_on.release_id AS release_id, same_as.artist_id AS artist_id
+FROM graph.credited_on AS credited_on
+JOIN graph.same_as AS same_as ON same_as.person_name = credited_on.person_name
+WHERE credited_on.role_category = ANY(%s)
+"""
+
+# The two vertex-discovery queries `_read_vertices` runs beyond `graph.vertex_degree` -- see
+# that function's docstring for why a credited-only artist or release needs one at all.
+_CREDITED_ARTIST_IDS_SQL: Final = """
+SELECT DISTINCT same_as.artist_id AS artist_id
+FROM graph.credited_on AS credited_on
+JOIN graph.same_as AS same_as ON same_as.person_name = credited_on.person_name
+WHERE credited_on.role_category = ANY(%s)
+"""
+_CREDITED_RELEASE_IDS_SQL: Final = """
+SELECT DISTINCT release_id
+FROM graph.credited_on
+WHERE role_category = ANY(%s)
+"""
+
+# (name, query, params, source kind, target kind) for every edge relation that connects two of
+# the six kinds above -- release<->artist/label/master/genre/style and master<->artist/genre/
+# style, plus the release<->artist credited-artist edge ieu.6 added. The first eight are plain
+# table scans, declared in database-schema's `graph.catalog` property graph
+# (docs/architecture.md, "Property graph"); the ninth is a filtered join over two base tables
+# that are not (yet) a `graph.catalog` edge label, so it carries its own query and bind params
+# rather than being built from a bare table/column pair like the others.
+_EDGE_RELATIONS: Final[tuple[tuple[str, str, tuple[Any, ...], str, str], ...]] = (
+    ("graph.by_artist", "SELECT release_id, artist_id FROM graph.by_artist", (), "r", "a"),
+    ("graph.on_label", "SELECT release_id, label_id FROM graph.on_label", (), "r", "l"),
+    ("graph.derived_from", "SELECT release_id, master_id FROM graph.derived_from", (), "r", "m"),
+    ("graph.in_genre", "SELECT release_id, genre_name FROM graph.in_genre", (), "r", "g"),
+    ("graph.in_style", "SELECT release_id, style_name FROM graph.in_style", (), "r", "s"),
+    ("graph.master_by_artist", "SELECT master_id, artist_id FROM graph.master_by_artist", (), "m", "a"),
+    ("graph.master_in_genre", "SELECT master_id, genre_name FROM graph.master_in_genre", (), "m", "g"),
+    ("graph.master_in_style", "SELECT master_id, style_name FROM graph.master_in_style", (), "m", "s"),
+    ("graph.credited_on", _CREDITED_ARTIST_EDGE_SQL, (list(_KEPT_CREDIT_CATEGORIES),), "r", "a"),
 )
 
 # Rows fetched per round trip from a server-side (named) cursor. Bounds how much of one block
@@ -177,6 +237,16 @@ _NAME_SLUG_PATTERN: Final = re.compile(r"[^a-z0-9]+")
 # dump id — see "The stored model_version is per dump, not per algorithm" above. Rejected
 # inside a dump id so the composed string is always unambiguous to a human reading it back.
 _STORED_VERSION_SEPARATOR: Final = "@"
+
+# The edge relations `_stream_edge_blocks` reads, as a short version tag bumped whenever a
+# relation is added, removed, or its filter changes. Composed into the stored `model_version`
+# below, between `config.model_version` and the dump id, so a rerun of a dump already loaded
+# under a different edge set can never land on, get skipped as, or silently overwrite that
+# earlier set's rows -- the two edge sets read a structurally different graph for the same
+# `FastRPConfig` and dump, and must never share a primary-key value. ieu.2 shipped the eight
+# relations in `_EDGE_RELATIONS` before this as (implicitly) "edges-v1"; ieu.6 is "edges-v2",
+# adding the release-level credited-artist relation.
+_EDGE_SET_VERSION: Final = "edges-v2"
 
 
 @dataclass(frozen=True)
@@ -255,10 +325,11 @@ class LoadResult:
 def stored_model_version(config: FastRPConfig, dump_id: str) -> str:
     """The `artist_embeddings.model_version` value one dump's load reads and writes.
 
-    Composes the algorithm's own version with the dump id so two dumps under an unchanged
-    algorithm land on different primary-key values instead of one upserting the other's rows
-    in place — see the module docstring. `model_version` is `TEXT`, so there is no length
-    bound to enforce here beyond what a reasonable `dump_id` already is.
+    Composes the algorithm's own version, the edge-set version (`_EDGE_SET_VERSION`), and the
+    dump id, so two dumps under an unchanged algorithm land on different primary-key values
+    instead of one upserting the other's rows in place, and so do two edge sets under an
+    unchanged algorithm and dump — see the module docstring. `model_version` is `TEXT`, so
+    there is no length bound to enforce here beyond what a reasonable `dump_id` already is.
 
     Args:
         config: The FastRP method configuration.
@@ -270,7 +341,7 @@ def stored_model_version(config: FastRPConfig, dump_id: str) -> str:
     """
     if _STORED_VERSION_SEPARATOR in dump_id:
         raise ValueError(f"dump_id must not contain {_STORED_VERSION_SEPARATOR!r}, got {dump_id!r}")
-    return f"{config.model_version}{_STORED_VERSION_SEPARATOR}{dump_id}"
+    return f"{config.model_version}:{_EDGE_SET_VERSION}{_STORED_VERSION_SEPARATOR}{dump_id}"
 
 
 def _sql_string_literal(value: str) -> str:
@@ -368,36 +439,74 @@ async def _already_loaded(conn: Any, model_version: str) -> bool:
 async def _read_vertices(conn: Any) -> tuple[NodeIndex, list[str]]:
     """Stream every `(kind, key)` vertex of the six FastRP kinds; return it and the artist ids.
 
-    A named (server-side) cursor, so the full vertex set is never materialized as a Python
-    list in one piece. PostgreSQL only allows `DECLARE CURSOR` inside a transaction block, so
-    this opens one read-only transaction for the duration of the scan — `AsyncPostgreSQLPool`
+    Named (server-side) cursors, so no full result set is ever materialized as a Python list
+    in one piece. PostgreSQL only allows `DECLARE CURSOR` inside a transaction block, so this
+    opens one read-only transaction for the duration of the scan — `AsyncPostgreSQLPool`
     connections default to autocommit, unlike a plain `psycopg.AsyncConnection`.
+
+    `graph.vertex_degree` sums only the ten path-traversal relations database-schema declares
+    for it (by_artist, master_by_artist, on_label, in_genre/in_style, master_in_genre/in_style,
+    derived_from, alias_of, artist_member_of) — `credited_on` and `same_as` are deliberately
+    absent from that list. An artist credited only via `extraartists` — never a main artist, an
+    alias, or a group member — therefore has no `graph.vertex_degree` row at all, and the
+    release-level credited-artist edge ieu.6 added (`_CREDITED_ARTIST_EDGE_SQL`) would name a
+    node this pipeline had never seen; the same is true, in principle, of a release asserting
+    only credits and none of the other eight relations. `_CREDITED_ARTIST_IDS_SQL` and
+    `_CREDITED_RELEASE_IDS_SQL` discover exactly those extra artist and release ids, over the
+    same kept-category filter, so every endpoint `_stream_edge_blocks` will later ask
+    `NodeIndex.positions` for already has a node. Both discovery queries are unordered
+    `SELECT DISTINCT`s; the final `np.unique` sorts and dedupes the combined key array, so the
+    resulting node set (and therefore the resulting embeddings) does not depend on the order
+    PostgreSQL happens to return either of them in.
     """
     key_chunks: list[NDArray[np.uint64]] = []
     artist_ids: list[str] = []
-    async with conn.transaction(), conn.cursor(name="embedding_pipeline_vertices") as cursor:
-        await cursor.execute("SELECT kind, key FROM graph.vertex_degree WHERE kind = ANY(%s)", (list(_VERTEX_KINDS),))
-        while True:
-            batch = await cursor.fetchmany(_CURSOR_FETCH_SIZE)
-            if not batch:
-                break
-            key_chunks.append(node_keys(batch))
-            artist_ids.extend(key for kind, key in batch if kind == "a")
-    keys = np.concatenate(key_chunks) if key_chunks else np.zeros(0, dtype=np.uint64)
+    seen_artist_ids: set[str] = set()
+    async with conn.transaction():
+        async with conn.cursor(name="embedding_pipeline_vertices") as cursor:
+            await cursor.execute("SELECT kind, key FROM graph.vertex_degree WHERE kind = ANY(%s)", (list(_VERTEX_KINDS),))
+            while True:
+                batch = await cursor.fetchmany(_CURSOR_FETCH_SIZE)
+                if not batch:
+                    break
+                key_chunks.append(node_keys(batch))
+                for kind, key in batch:
+                    if kind == "a" and key not in seen_artist_ids:
+                        seen_artist_ids.add(key)
+                        artist_ids.append(key)
+        async with conn.cursor(name="embedding_pipeline_credited_artist_ids") as cursor:
+            await cursor.execute(_CREDITED_ARTIST_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),))
+            while True:
+                batch = await cursor.fetchmany(_CURSOR_FETCH_SIZE)
+                if not batch:
+                    break
+                new_ids = [artist_id for (artist_id,) in batch if artist_id not in seen_artist_ids]
+                seen_artist_ids.update(new_ids)
+                if new_ids:
+                    key_chunks.append(node_keys(("a", artist_id) for artist_id in new_ids))
+                    artist_ids.extend(new_ids)
+        async with conn.cursor(name="embedding_pipeline_credited_release_ids") as cursor:
+            await cursor.execute(_CREDITED_RELEASE_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),))
+            while True:
+                batch = await cursor.fetchmany(_CURSOR_FETCH_SIZE)
+                if not batch:
+                    break
+                key_chunks.append(node_keys(("r", release_id) for (release_id,) in batch))
+    keys = np.unique(np.concatenate(key_chunks)) if key_chunks else np.zeros(0, dtype=np.uint64)
     return NodeIndex(keys), artist_ids
 
 
 async def _stream_edge_blocks(conn: Any, builder: AdjacencyBuilder) -> None:
-    """Add every edge of the eight relations that connect the six FastRP kinds, in blocks.
+    """Add every edge of the nine relations that connect the six FastRP kinds, in blocks.
 
     One read-only transaction for the whole scan — see `_read_vertices` on why a named
     cursor needs one.
     """
     async with conn.transaction():
-        for table, source_column, source_kind, target_column, target_kind in _EDGE_RELATIONS:
-            cursor_name = f"embedding_pipeline_{table.replace('.', '_')}"
+        for name, query, params, source_kind, target_kind in _EDGE_RELATIONS:
+            cursor_name = f"embedding_pipeline_{name.replace('.', '_')}"
             async with conn.cursor(name=cursor_name) as cursor:
-                await cursor.execute(f"SELECT {source_column}, {target_column} FROM {table}")  # noqa: S608 -- table/columns are from the fixed _EDGE_RELATIONS tuple.
+                await cursor.execute(query, params)
                 while True:
                     batch = await cursor.fetchmany(_CURSOR_FETCH_SIZE)
                     if not batch:
