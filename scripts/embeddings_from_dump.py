@@ -16,15 +16,21 @@ does neither):
 - ``master_by_artist`` / ``master_in_genre`` / ``master_in_style``: the **master's own**
   document fields -- not aggregated from its releases. This is why the masters dump is
   needed at all.
-- ``credited_by_artist`` (the maintainer's option-(a) decision, 2026-09-25, being added
-  to the shipped pipeline by gm-analytics-engine-ieu.6, which blocks this bead): a
-  release's own **release-level** ``extraartists`` -- never per-track or sub-track --
-  resolved to an artist id, filtered to the chw.2 spike's kept role categories
-  (production, engineering, session, and `common.credit_roles`' catch-all "other";
-  mastering/design/management are dropped). This is what `graph.credited_on` JOINed to
-  `graph.same_as` will read once ieu.6 lands. **The exact relation name, join shape, and
-  category list here are this script's best-informed placeholder** -- reconcile against
-  ieu.6's merged implementation before the real FastRP run this bead is held on.
+- ``credited_by_artist`` (ieu.6, landed 2026-09-26, merge commit 4c0d4de): a release's
+  own **release-level** ``extraartists`` only -- never per-track or sub-track -- with a
+  kept role category (production, engineering, session, `common.credit_roles`' catch-all
+  "other"; mastering/design/management dropped), resolved to an artist id through the
+  SAME name-join `graph.credited_on` INNER JOIN `graph.same_as` ON `person_name` performs
+  in `insights/embedding_pipeline.py`'s `_CREDITED_ARTIST_EDGE_SQL`: an unresolvable name
+  (never paired with any id, anywhere in the catalog) drops the credit; a name resolved to
+  more than one id fans out to all of them. This needs the GLOBAL same_as map -- built
+  from every release-level `extraartists` entry with a resolvable id, **regardless of
+  role** (same_as has no category filter) -- built once over the whole releases dump
+  before any `credited_by_artist` edge can be resolved. See `_build_same_as_map` below.
+  `categorize_role` does **not** split a compound "A, B" role on comma; it substring-
+  matches the whole lowered string, longest fragment first, exactly like the
+  `graph.credit_role_category` SQL it mirrors -- confirmed by reading both directly, and
+  the one place this script's first draft (pre-ieu.6) had it wrong.
 - An id is dropped only when blank or the Discogs "no entity" sentinel ``"0"``
   (``graph_derivation._entity_id``); no placeholder-artist filtering.
 
@@ -58,6 +64,7 @@ committed -- see ADR 0013's data-rights section and this repo's docs/embeddings.
 from __future__ import annotations
 
 import argparse
+import gc
 import gzip
 import json
 import multiprocessing as mp
@@ -178,28 +185,94 @@ def _artist_ids(container: ET.Element | None) -> list[str]:
 
 
 def _role_kept(role: str) -> bool:
-    """Whether ROLE (possibly several comma-separated roles) keeps at least one of the
-    spike's kept categories -- `common.credit_roles.categorize_role`, the same taxonomy
-    `graph.credit_role_category` renders into SQL."""
-    return any(categorize_role(part.strip()) in KEPT_CREDIT_CATEGORIES for part in role.split(",") if part.strip())
+    """Whether ROLE's single resolved category is one of the kept ones.
+
+    `categorize_role` does NOT split a compound "A, B" role by comma -- it substring-
+    matches the whole lowered/stripped string, longest fragment first, exactly like the
+    `graph.credit_role_category` SQL rendering `credited_on.role_category` is a GENERATED
+    column over. A per-comma-segment check (what this script's pre-ieu.6 draft, and the
+    chw.2 spike's own harness, both did) is not what production's stored `role_category`
+    actually is -- it is one category for the whole string.
+    """
+    return categorize_role(role) in KEPT_CREDIT_CATEGORIES
 
 
-def _credited_artist_ids(container: ET.Element | None) -> list[str]:
-    """Release-level ``extraartists`` only -- never per-track/sub-track, see the module
-    docstring -- with a kept role category and a resolvable id: the `credited_on` (JOIN)
-    `same_as` shape ieu.6 is adding."""
+def _release_extraartists(container: ET.Element | None) -> list[tuple[str, str, str | None]]:
+    """Return ``(name, role, xml_id_or_None)`` for every release-level ``extraartists``
+    entry with both a name and a role -- exactly what `graph_derivation._credits()` keeps,
+    with or without a resolvable id (an id-less entry still asserts `graph.credited_on`,
+    just not `graph.same_as`)."""
     if container is None:
         return []
-    out = []
+    out: list[tuple[str, str, str | None]] = []
     for artist in container.findall("artist"):
-        role = artist.findtext("role") or ""
-        if not _role_kept(role):
+        name = artist.findtext("name")
+        role = artist.findtext("role")
+        if not name or not role:
             continue
         id_el = artist.find("id")
-        aid = _usable_id(id_el.text if id_el is not None else None)
-        if aid is not None:
-            out.append(aid)
+        out.append((name, role, _usable_id(id_el.text if id_el is not None else None)))
     return out
+
+
+# Set once per worker process by `_pass2_worker_init` (a `Pool(initializer=...)`), not
+# passed as part of every chunk's task args: pickling and re-sending a several-million-
+# entry map on every one of ~1,200 chunk tasks (instead of once per worker at pool
+# startup) turned this into a multi-hour run the first time this was tried -- see the
+# bead comments' same_as-comparison investigation.
+_SAME_AS: dict[str, frozenset[str]] = {}
+
+
+def _pass2_worker_init(same_as: dict[str, frozenset[str]]) -> None:
+    global _SAME_AS
+    _SAME_AS = same_as
+
+
+def _pass1_same_as_chunk(chunk: bytes) -> dict[str, set[str]]:
+    """This chunk's contribution to the global `same_as` map: every release-level
+    `extraartists` entry with a resolvable id, of ANY role -- `graph.same_as` carries no
+    category filter, only `graph.credited_on`'s query does."""
+    partial: dict[str, set[str]] = {}
+    if b"<!DOCTYPE" in chunk or b"<!ENTITY" in chunk:
+        return partial
+    try:
+        root = ET.fromstring(b"<r>" + chunk + b"</r>")
+    except ET.ParseError:
+        return partial
+    for rel in root.findall("release"):
+        if rel.get("id") is None:
+            continue
+        for name, _role, xml_id in _release_extraartists(rel.find("extraartists")):
+            if xml_id is not None:
+                partial.setdefault(name, set()).add(xml_id)
+    return partial
+
+
+def _build_same_as_map(releases_path: Path, workers: int, limit_chunks: int) -> dict[str, frozenset[str]]:
+    """Pass 1: the global `person_name -> {artist_id, ...}` map `credited_by_artist`
+    resolves through, built once over the whole releases dump before pass 2 can compute
+    any credited edge -- `graph.same_as` is additive and catalog-wide, not per-release."""
+    print("🔗 pass 1: building the global same_as map (release-level extraartists, any role)...", file=sys.stderr)
+    same_as: dict[str, set[str]] = {}
+    started = time.time()
+    ctx = mp.get_context("spawn")
+    chunks = _chunks(releases_path, b"release")
+    if limit_chunks:
+        chunks = (c for _, c in zip(range(limit_chunks), chunks, strict=False))
+    processed = 0
+    with ctx.Pool(workers) as pool:
+        for partial in pool.imap_unordered(_pass1_same_as_chunk, chunks, chunksize=1):
+            for name, ids in partial.items():
+                existing = same_as.get(name)
+                if existing is None:
+                    same_as[name] = ids
+                else:
+                    existing |= ids
+            processed += 1
+            if processed % 200 == 0:
+                print(f"  pass 1: {processed} chunks, {len(same_as):,} distinct names, {time.time() - started:.0f}s", file=sys.stderr, flush=True)
+    print(f"🔗 pass 1 done: {len(same_as):,} distinct names, {time.time() - started:.0f}s", file=sys.stderr)
+    return {name: frozenset(ids) for name, ids in same_as.items()}
 
 
 def _tag_names(container: ET.Element | None, tag: str) -> list[str]:
@@ -252,7 +325,18 @@ def _parse_release_chunk(chunk: bytes) -> ChunkResult:
             result.edges["in_genre"].append((rkey, node_key("g", genre)))
         for style in _tag_names(rel.find("styles"), "style"):
             result.edges["in_style"].append((rkey, node_key("s", style)))
-        credited_ids = _credited_artist_ids(rel.find("extraartists"))
+        # credited_on JOIN same_as ON person_name (ieu.6, _CREDITED_ARTIST_EDGE_SQL): a
+        # kept-category credit resolves through the GLOBAL same_as map, not its own XML
+        # id -- an unresolvable name (never paired with any id anywhere) is dropped, an
+        # ambiguous one (paired with more than one id somewhere) fans out to all of them.
+        # SELECT DISTINCT release_id, artist_id: dedup per release, whatever the fan-out.
+        credited_ids: set[str] = set()
+        for name, role, _xml_id in _release_extraartists(rel.find("extraartists")):
+            if not _role_kept(role):
+                continue
+            resolved = _SAME_AS.get(name)
+            if resolved:
+                credited_ids |= resolved
         for aid in credited_ids:
             result.edges[CREDIT_RELATION].append((rkey, node_key("a", aid)))
         result.artist_ids.extend(credited_ids)
@@ -284,7 +368,16 @@ def _parse_master_chunk(chunk: bytes) -> ChunkResult:
     return result
 
 
-def _run_pool(path: Path, record_tag: bytes, parse_chunk, workers: int, limit_chunks: int) -> tuple[dict[str, list[np.ndarray]], dict[str, list[np.ndarray]], list[str], int]:
+def _run_pool(
+    path: Path,
+    record_tag: bytes,
+    parse_chunk,
+    workers: int,
+    limit_chunks: int,
+    *,
+    initializer=None,
+    initargs: tuple = (),
+) -> tuple[dict[str, list[np.ndarray]], dict[str, list[np.ndarray]], list[str], int]:
     """Stream `path` through a worker pool; return per-relation (source, target) uint64
     array lists, the raw artist id strings seen, and the number of records parsed."""
     sources: dict[str, list[np.ndarray]] = {name: [] for name in ALL_RELATIONS}
@@ -293,7 +386,7 @@ def _run_pool(path: Path, record_tag: bytes, parse_chunk, workers: int, limit_ch
     count = 0
     started = time.time()
     ctx = mp.get_context("spawn")
-    with ctx.Pool(workers) as pool:
+    with ctx.Pool(workers, initializer=initializer, initargs=initargs) as pool:
         source_chunks = _chunks(path, record_tag)
         if limit_chunks:
             source_chunks = (c for _, c in zip(range(limit_chunks), source_chunks, strict=False))
@@ -316,9 +409,23 @@ def build_graph(releases_path: Path, masters_path: Path, workers: int, limit_chu
     """Parse both dumps, build the Adjacency, and return everything the parity report
     and `fastrp` need. Raises nothing on a normal run; malformed chunks are skipped and
     logged, never fatal."""
-    print(f"📖 parsing releases: {releases_path}", file=sys.stderr)
+    # Memory checkpoints below are named phase BOUNDARIES of `resource.getrusage`'s
+    # monotonic, process-lifetime high-water mark, not isolated per-phase costs -- ru_maxrss
+    # never decreases, even after `del` + `gc.collect()` frees real memory back to the
+    # allocator. The explicit frees between phases are still worth doing: they let the
+    # *next* phase's allocations reuse that freed memory instead of growing the peak
+    # further, which is what makes the checkpoint *sequence* an honest (if not perfectly
+    # isolated) attribution of where this script's memory actually goes -- see the "Memory
+    # at catalog scale" finding in docs/recall_and_churn.md this instrumentation feeds.
     parse_started = time.perf_counter()
-    r_sources, r_targets, r_artist_ids, release_count = _run_pool(releases_path, b"release", _parse_release_chunk, workers, limit_chunks)
+    same_as = _build_same_as_map(releases_path, workers, limit_chunks)
+    same_as_peak_rss = peak_rss_bytes()
+
+    print(f"📖 parsing releases: {releases_path}", file=sys.stderr)
+    r_sources, r_targets, r_artist_ids, release_count = _run_pool(
+        releases_path, b"release", _parse_release_chunk, workers, limit_chunks, initializer=_pass2_worker_init, initargs=(same_as,)
+    )
+    del same_as  # only needed by the (now-finished) release-parsing workers above.
 
     print(f"📖 parsing masters: {masters_path}", file=sys.stderr)
     m_sources, m_targets, m_artist_ids, master_count = _run_pool(masters_path, b"master", _parse_master_chunk, workers, limit_chunks)
@@ -334,6 +441,7 @@ def build_graph(releases_path: Path, masters_path: Path, workers: int, limit_chu
     # for both directions and never loses data.
     sources = {name: r_sources[name] + m_sources[name] for name in ALL_RELATIONS}
     targets = {name: r_targets[name] + m_targets[name] for name in ALL_RELATIONS}
+    del r_sources, r_targets, m_sources, m_targets
 
     # artist_id -> node_key, first occurrence wins (all occurrences hash identically).
     artist_key_to_id: dict[int, str] = {}
@@ -341,6 +449,7 @@ def build_graph(releases_path: Path, masters_path: Path, workers: int, limit_chu
         artist_key_to_id.setdefault(node_key("a", aid), aid)
     for aid in m_artist_ids:
         artist_key_to_id.setdefault(node_key("a", aid), aid)
+    del r_artist_ids, m_artist_ids
 
     relation_arrays: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     all_keys: list[np.ndarray] = []
@@ -352,13 +461,18 @@ def build_graph(releases_path: Path, masters_path: Path, workers: int, limit_chu
         relation_counts[name] = int(src.size)
         all_keys.append(src)
         all_keys.append(dst)
+    del sources, targets
+    gc.collect()
+    pre_build_peak_rss = peak_rss_bytes()
 
     build_started = time.perf_counter()
     # Edge endpoints repeat (the same artist/release/... appears in many edges), but
     # `NodeIndex` takes the distinct vertex set -- unlike `graph.vertex_degree`, which is
     # already one row per vertex, these keys come straight from edge occurrences here.
     all_keys_concatenated = np.concatenate(all_keys) if all_keys else np.zeros(0, dtype=np.uint64)
+    del all_keys
     nodes = NodeIndex(np.unique(all_keys_concatenated))
+    del all_keys_concatenated
     builder = AdjacencyBuilder(nodes)
     for name in ALL_RELATIONS:
         src, dst = relation_arrays[name]
@@ -391,7 +505,9 @@ def build_graph(releases_path: Path, masters_path: Path, workers: int, limit_chu
         "relation_counts": relation_counts,
         "distinct_by_kind": distinct_by_kind,
         "parse_elapsed_s": parse_elapsed,
+        "same_as_peak_rss_gb": same_as_peak_rss / 1e9,
         "parse_peak_rss_gb": parse_peak_rss / 1e9,
+        "pre_build_peak_rss_gb": pre_build_peak_rss / 1e9,
         "build_elapsed_s": build_elapsed,
         "build_peak_rss_gb": build_peak_rss / 1e9,
     }
@@ -406,8 +522,11 @@ def print_parity_report(graph: dict) -> None:
         print(f"distinct {label:9s} (kind={kind}): {graph['distinct_by_kind'][kind]:,}", file=sys.stderr)
     for name in ALL_RELATIONS:
         print(f"edges {name:20s}: {graph['relation_counts'][name]:,}", file=sys.stderr)
-    print(f"parse: {graph['parse_elapsed_s']:.1f}s, peak RSS {graph['parse_peak_rss_gb']:.2f} GB", file=sys.stderr)
-    print(f"build: {graph['build_elapsed_s']:.1f}s, peak RSS {graph['build_peak_rss_gb']:.2f} GB", file=sys.stderr)
+    print(f"peak RSS after same_as map (pass 1):        {graph['same_as_peak_rss_gb']:.2f} GB", file=sys.stderr)
+    print(f"peak RSS after full parse (pass 2, both dumps): {graph['parse_peak_rss_gb']:.2f} GB", file=sys.stderr)
+    print(f"peak RSS after freeing parser structures, pre-build: {graph['pre_build_peak_rss_gb']:.2f} GB", file=sys.stderr)
+    print(f"peak RSS after AdjacencyBuilder.build():     {graph['build_peak_rss_gb']:.2f} GB", file=sys.stderr)
+    print(f"parse: {graph['parse_elapsed_s']:.1f}s, build: {graph['build_elapsed_s']:.1f}s", file=sys.stderr)
 
 
 def main() -> None:
@@ -422,10 +541,23 @@ def main() -> None:
     parser.add_argument("--block-columns", type=int, default=4)
     parser.add_argument("--limit-chunks", type=int, default=0, help="parse only the first N chunks of each dump (smoke test)")
     parser.add_argument("--parity-only", action="store_true", help="stop after the parity report, before fastrp")
+    parser.add_argument(
+        "--delete-dumps-after-parse",
+        action="store_true",
+        help="delete the releases/masters dump files immediately after a successful parse, before fastrp runs. "
+        "Safe: the gzip streams are fully consumed and closed by the time build_graph() returns, nothing after "
+        "this point re-reads them. Only for a dump this invocation downloaded itself, never a shared one.",
+    )
     args = parser.parse_args()
 
     graph = build_graph(args.releases, args.masters, args.workers, args.limit_chunks)
     print_parity_report(graph)
+
+    if args.delete_dumps_after_parse:
+        for dump_path in (args.releases, args.masters):
+            size_gb = dump_path.stat().st_size / 1e9
+            dump_path.unlink()
+            print(f"🗑️  deleted {dump_path} ({size_gb:.2f} GB) -- parse is done, fastrp needs no further disk read of it", file=sys.stderr)
 
     if args.parity_only:
         print("🛑 --parity-only: stopping before fastrp", file=sys.stderr)
@@ -465,7 +597,9 @@ def main() -> None:
         "distinct_by_kind": graph["distinct_by_kind"],
         "relation_counts": graph["relation_counts"],
         "parse_elapsed_s": round(graph["parse_elapsed_s"], 1),
+        "same_as_peak_rss_gb": round(graph["same_as_peak_rss_gb"], 2),
         "parse_peak_rss_gb": round(graph["parse_peak_rss_gb"], 2),
+        "pre_build_peak_rss_gb": round(graph["pre_build_peak_rss_gb"], 2),
         "build_elapsed_s": round(graph["build_elapsed_s"], 1),
         "build_peak_rss_gb": round(graph["build_peak_rss_gb"], 2),
         "fastrp_elapsed_s": round(fastrp_elapsed, 1),
