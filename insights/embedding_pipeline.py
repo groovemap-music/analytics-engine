@@ -169,7 +169,12 @@ _DROPPED_CREDIT_CATEGORIES: Final[tuple[str, ...]] = ("mastering", "design", "ma
 # never faced this: its harness read Discogs artist ids straight out of the dump's
 # `extraartists/artist/id` element (`parse_dump.py`'s `_ids`), which production's
 # `graph.credited_on`/`graph.same_as` split does not carry forward, so this rule has no spike
-# precedent to match -- it is this bead's own design decision.
+# precedent to match -- it is this bead's own design decision. `person_name` keeps Discogs' own
+# `(2)`/`(3)` disambiguation suffix (discogs-sql-loader's `_credits` reads it verbatim), so an
+# exact-string collision is the narrower case of an un-merged duplicate profile or a data-entry
+# error, not the common "two same-named musicians" case Discogs' own numbering already
+# separates -- see docs/embeddings.md's "Release-level credited-artist edges" for the full
+# argument and the real-catalog measurement this fan-out-vs-drop choice is pending.
 _CREDITED_ARTIST_EDGE_SQL: Final = """
 SELECT DISTINCT credited_on.release_id AS release_id, same_as.artist_id AS artist_id
 FROM graph.credited_on AS credited_on

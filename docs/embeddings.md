@@ -137,6 +137,23 @@ the credited-artist edge out rather than picking one. Both are accepted rather t
 errors — see `_CREDITED_ARTIST_EDGE_SQL`'s comment in `insights/embedding_pipeline.py` for the
 full reasoning.
 
+`same_as.person_name` is written verbatim from the Discogs `extraartists` name text
+(discogs-sql-loader's `_credits`: "reads the name verbatim ... folding or trimming it here
+would key the vertex differently from the node"), and it is catalog-wide and role-unfiltered —
+it accumulates from *every* extraartists credit ever loaded, regardless of that credit's role
+category, not only the kept ones this pipeline reads. That verbatim name already carries
+Discogs' own `(2)`/`(3)` disambiguation suffix, which Discogs mints specifically so that two
+different real people never share a plain display name: "John Smith" and "John Smith (2)" are
+different `person_name` strings and never join together. An exact-string collision under this
+scheme is therefore not the common "two musicians named John Smith" case — Discogs' own
+numbering already separates those — but the narrower case of an un-merged duplicate artist
+profile (two ids for what is, in the underlying catalog, the same real person, before a
+moderator merges them) or a genuine data-entry error (a contributor crediting an existing name
+without checking whether it was already taken). How common that narrower case actually is on
+the real catalog is being measured separately (Aug-dump collision count); if it turns out to be
+material, the fan-out rule above should become a drop-ambiguous-names rule instead, filed as a
+follow-up rather than guessed at here.
+
 Because a session player or producer credited only this way is never a main artist, an alias,
 or a group member, `graph.vertex_degree` — scoped to the ten path-traversal relations
 database-schema sums it over — has no row for them. `_read_vertices` runs two extra discovery
