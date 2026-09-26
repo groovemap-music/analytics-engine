@@ -10,8 +10,14 @@ time -- the real DDL from `database-schema`, not a stand-in):
   (falling back to `COPY` only if a timed trial extrapolates past ~30 minutes, per the
   maintainer's condition -- see `_write_month`),
 - builds the real HNSW index, named by `insights.embedding_pipeline._index_name`, under a
-  session-only 2 GB `maintenance_work_mem` bump (full scale first; a subset fallback is
-  used only after a real failure),
+  session-only `maintenance_work_mem` bump (full scale first; a subset fallback is used
+  only after a real failure). August uses database-schema's documented 2 GB value.
+  September, per a dispatcher decision made after August's build measurably slowed around
+  the point its HNSW graph likely outgrew that 2 GB, uses a higher one instead (raising it
+  needs the container's `--shm-size` to cover it too, so this script restarts the
+  throwaway container between months when the two values differ, rather than a plain
+  `TRUNCATE` -- `--shm-size` can only be set at container creation). Both builds' settings
+  and wall times are recorded side by side; see docs/recall_and_churn.md.
 - sweeps recall@10 against exact cosine (computed in NumPy directly from the in-memory
   vectors, no Postgres needed for the exact side) over `ef_search` in `EF_SEARCH_SWEEP`,
   naming the smallest value reaching recall@10 >= 0.95 (or stating that none does), and
@@ -41,6 +47,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -49,7 +56,7 @@ from typing import Any
 import numpy as np
 
 from common import AsyncPostgreSQLPool
-from insights.embedding_pipeline import ARTIST_EMBEDDINGS_TABLE, FastRPConfig, _index_name, _write_embeddings, stored_model_version
+from insights.embedding_pipeline import ARTIST_EMBEDDINGS_TABLE, FastRPConfig, _already_loaded, _index_name, _write_embeddings, stored_model_version
 from insights.embeddings.graph import node_key
 from insights.embeddings.projection import splitmix64
 
@@ -62,7 +69,7 @@ EF_SEARCH_SWEEP: tuple[int, ...] = (40, 100, 200, 400, 800, 1000)  # pgvector ca
 RECALL_TARGET: float = 0.95
 HNSW_M: int = 16
 HNSW_EF_CONSTRUCTION: int = 64
-MAINTENANCE_WORK_MEM: str = "2GB"
+DEFAULT_MAINTENANCE_WORK_MEM: str = "2GB"  # database-schema's documented build-time value.
 TRIAL_BATCH_ROWS: int = 100_000
 TRIAL_TIME_BUDGET_S: float = 30 * 60  # 30 minutes, per the maintainer's condition.
 
@@ -156,16 +163,64 @@ async def _apply_schema(conn: Any) -> None:
         await cursor.execute(_ARTIST_EMBEDDINGS_MODEL_VERSION_INDEX_SQL)
 
 
-async def _truncate_table(conn: Any) -> None:
-    async with conn.cursor() as cursor:
-        await cursor.execute(f"TRUNCATE {ARTIST_EMBEDDINGS_TABLE}")  # noqa: S608 -- constant, no caller input.
-        await cursor.execute("DROP INDEX IF EXISTS idx_artist_embeddings_embedding_hnsw")
+def _restart_container(*, name: str, image: str, shm_size: str, username: str, password: str, database: str) -> tuple[str, int]:
+    """Stop the throwaway container (started with `--rm`, so stopping removes it) and start
+    a fresh one of the same name/image/credentials but a new `--shm-size`, for September's
+    higher `maintenance_work_mem` (the container's shared memory must be able to hold it --
+    the dispatcher's condition). Returns the new (host, port) to connect to.
+
+    A full container restart, not an in-place `TRUNCATE`, is deliberate: `--shm-size` is set
+    at container creation and cannot be changed on a running container. Starting fresh also
+    means there is no stale index left over from August under a name this script never
+    tracks for an explicit drop (`_index_name` gives each stored `model_version` its own
+    name, so August's and September's indexes never collide by name regardless -- but a
+    fresh container is simpler and cheaper than reasoning about `TRUNCATE`'s index-emptying
+    behavior on a name we'd have to recompute here anyway).
+    """
+    subprocess.run(["docker", "stop", name], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "docker", "run", "--detach", "--rm",
+            "--name", name,
+            "--publish", "127.0.0.1::5432",
+            "--shm-size", shm_size,
+            "--env", f"POSTGRES_USER={username}",
+            "--env", f"POSTGRES_PASSWORD={password}",
+            "--env", f"POSTGRES_DB={database}",
+            image,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    for _attempt in range(60):
+        ready = subprocess.run(
+            ["docker", "exec", name, "pg_isready", "--username", username, "--dbname", database],
+            capture_output=True,
+        )
+        if ready.returncode == 0:
+            break
+        time.sleep(2)
+    else:
+        raise RuntimeError(f"container {name!r} did not become ready within 120s of restart")
+    published = subprocess.run(["docker", "port", name, "5432/tcp"], check=True, capture_output=True, text=True).stdout.strip()
+    host, _, port = published.rpartition(":")
+    return host or "127.0.0.1", int(port)
 
 
 async def _write_month(conn: Any, month: dict[str, Any]) -> dict[str, Any]:
     """Write one month's rows, timing a `TRIAL_BATCH_ROWS` trial through the real
     `_write_embeddings` first; falls back to `COPY` only if that trial extrapolates past
-    `TRIAL_TIME_BUDGET_S` for the full month, per the maintainer's condition."""
+    `TRIAL_TIME_BUDGET_S` for the full month, per the maintainer's condition.
+
+    Skips the write entirely if this stored `model_version` already has rows -- the same
+    `_already_loaded` idempotency check `insights.embedding_pipeline.load_embeddings` itself
+    runs -- so a script restart against a container this month's rows already reached
+    (a crash after write but before the index build, say) doesn't repeat an ~18-minute write.
+    """
+    if await _already_loaded(conn, month["model_version"]):
+        print("  already loaded (skipping write)", file=sys.stderr)
+        return {"rows_written": len(month["artist_ids"]), "trial_elapsed_s": 0.0, "extrapolated_full_s": 0.0, "used_copy": False, "skipped": True}
+
     artist_ids = month["artist_ids"]
     vectors = month["vectors"]
     total = len(artist_ids)
@@ -221,16 +276,19 @@ async def _write_month(conn: Any, month: dict[str, Any]) -> dict[str, Any]:
     return {"rows_written": rows_written, "trial_elapsed_s": trial_elapsed, "extrapolated_full_s": extrapolated_s, "used_copy": used_copy}
 
 
-async def _build_index(conn: Any, model_version: str) -> dict[str, Any]:
+async def _build_index(conn: Any, model_version: str, maintenance_work_mem: str) -> dict[str, Any]:
     """Build the full-scale HNSW index for MODEL_VERSION's rows, named by `_index_name`.
 
     Full scale first, per the maintainer's condition: a subset fallback is used only after
     a real failure here, with that failure's wall time and peak memory recorded -- this
-    function does not pre-emptively choose a smaller scale.
+    function does not pre-emptively choose a smaller scale. `maintenance_work_mem` is a
+    session-only `SET`, reverted after, matching `database-schema.build_artist_embeddings_
+    index`'s own pattern -- the caller decides the value (August uses the documented 2GB;
+    September, in this bead's finding-driven side-by-side comparison, uses more).
     """
     index_name = _index_name(model_version)
     async with conn.cursor() as cursor:
-        await cursor.execute(f"SET maintenance_work_mem = '{MAINTENANCE_WORK_MEM}'")
+        await cursor.execute(f"SET maintenance_work_mem = '{maintenance_work_mem}'")
         started = time.perf_counter()
         await cursor.execute(
             f"CREATE INDEX IF NOT EXISTS {index_name} ON {ARTIST_EMBEDDINGS_TABLE} "  # noqa: S608
@@ -238,7 +296,7 @@ async def _build_index(conn: Any, model_version: str) -> dict[str, Any]:
         )
         elapsed = time.perf_counter() - started
         await cursor.execute("RESET maintenance_work_mem")
-    return {"index_name": index_name, "build_elapsed_s": elapsed}
+    return {"index_name": index_name, "build_elapsed_s": elapsed, "maintenance_work_mem": maintenance_work_mem}
 
 
 async def _ann_top_k(conn: Any, model_version: str, vectors: np.ndarray, artist_ids: list[str], positions: list[int], ef_search: int, k: int) -> list[list[str] | None]:
@@ -300,13 +358,14 @@ async def measure_month(
     label: str,
     query_sample_positions: list[int],
     query_sample_ids: list[str],
+    maintenance_work_mem: str,
 ) -> dict[str, Any]:
     print(f"\n=== {label}: writing embeddings ===", file=sys.stderr)
     write_result = await _write_month(conn, month)
     print(f"  wrote {write_result['rows_written']:,} rows", file=sys.stderr)
 
-    print(f"=== {label}: building HNSW index (full scale) ===", file=sys.stderr)
-    index_result = await _build_index(conn, month["model_version"])
+    print(f"=== {label}: building HNSW index (full scale, maintenance_work_mem={maintenance_work_mem}) ===", file=sys.stderr)
+    index_result = await _build_index(conn, month["model_version"], maintenance_work_mem)
     print(f"  {index_result['index_name']}: {index_result['build_elapsed_s']:.1f}s", file=sys.stderr)
 
     print(f"=== {label}: exact ground truth ({len(query_sample_positions):,} queries) ===", file=sys.stderr)
@@ -388,18 +447,48 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         max_connections=1,
     )
     await pool.initialize()
+    async with pool.connection() as conn:
+        await _apply_schema(conn)
+        aug_result = await measure_month(
+            conn, aug, label="August", query_sample_positions=aug_query_positions, query_sample_ids=aug_query_ids, maintenance_work_mem=args.aug_maintenance_work_mem
+        )
+        print("\n=== August: churn top-10 (exact + ANN) for the common-artist sample, BEFORE dropping the table ===", file=sys.stderr)
+        aug_churn = await churn_top_k(conn, aug, churn_sample_ids, aug_result["churn_ef_search_used"])
+    await pool.close()
+
+    if args.sept_maintenance_work_mem != args.aug_maintenance_work_mem:
+        print(
+            f"\n=== restarting {args.container_name} with --shm-size {args.sept_shm_size} for September's "
+            f"maintenance_work_mem={args.sept_maintenance_work_mem} (dispatcher-approved side-by-side comparison) ===",
+            file=sys.stderr,
+        )
+        new_host, new_port = _restart_container(
+            name=args.container_name, image=args.image, shm_size=args.sept_shm_size, username=args.username, password=args.password, database=args.database
+        )
+        print(f"  restarted: {new_host}:{new_port}", file=sys.stderr)
+        args.host, args.port = new_host, new_port
+    else:
+        print("\n=== dropping August's table before September (same container/mwm) ===", file=sys.stderr)
+
+    pool = AsyncPostgreSQLPool(
+        connection_params={"host": args.host, "port": args.port, "dbname": args.database, "user": args.username, "password": args.password},
+        min_connections=1,
+        max_connections=1,
+    )
+    await pool.initialize()
     try:
         async with pool.connection() as conn:
             await _apply_schema(conn)
+            if args.sept_maintenance_work_mem == args.aug_maintenance_work_mem:
+                # Same container carried over from August: drop its rows (and, since the
+                # index name is per-`model_version`, September's own `CREATE INDEX IF NOT
+                # EXISTS` under its own name is never blocked by August's leftover one).
+                async with conn.cursor() as cursor:
+                    await cursor.execute(f"TRUNCATE {ARTIST_EMBEDDINGS_TABLE}")  # noqa: S608 -- constant, no caller input.
 
-            aug_result = await measure_month(conn, aug, label="August", query_sample_positions=aug_query_positions, query_sample_ids=aug_query_ids)
-            print("\n=== August: churn top-10 (exact + ANN) for the common-artist sample, BEFORE dropping the table ===", file=sys.stderr)
-            aug_churn = await churn_top_k(conn, aug, churn_sample_ids, aug_result["churn_ef_search_used"])
-
-            print("\n=== truncating table before September ===", file=sys.stderr)
-            await _truncate_table(conn)
-
-            sept_result = await measure_month(conn, sept, label="September", query_sample_positions=sept_query_positions, query_sample_ids=sept_query_ids)
+            sept_result = await measure_month(
+                conn, sept, label="September", query_sample_positions=sept_query_positions, query_sample_ids=sept_query_ids, maintenance_work_mem=args.sept_maintenance_work_mem
+            )
             print("\n=== September: churn top-10 (exact + ANN) for the common-artist sample ===", file=sys.stderr)
             sept_churn = await churn_top_k(conn, sept, churn_sample_ids, sept_result["churn_ef_search_used"])
     finally:
@@ -435,6 +524,11 @@ def main() -> None:
     parser.add_argument("--username", required=True)
     parser.add_argument("--password", required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--container-name", default="gm-ieu3-measure-pg", help="for restarting between August and September if the mwm values differ")
+    parser.add_argument("--image", default="database-schema-postgres19-pgvector:local")
+    parser.add_argument("--aug-maintenance-work-mem", default=DEFAULT_MAINTENANCE_WORK_MEM)
+    parser.add_argument("--sept-maintenance-work-mem", default=DEFAULT_MAINTENANCE_WORK_MEM)
+    parser.add_argument("--sept-shm-size", default="2g", help="only used if --sept-maintenance-work-mem differs from --aug-maintenance-work-mem")
     args = parser.parse_args()
 
     result = asyncio.run(main_async(args))
