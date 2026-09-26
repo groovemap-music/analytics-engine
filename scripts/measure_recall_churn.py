@@ -190,16 +190,17 @@ async def _write_month(conn: Any, month: dict[str, Any]) -> dict[str, Any]:
         used_copy = True
         remaining_ids = artist_ids[trial_n:]
         remaining_vectors = vectors[trial_n:]
-        computed_at_sql = "NOW()"
+        # computed_at is omitted from the column list, not passed as an explicit NULL:
+        # the real column is `TIMESTAMPTZ NOT NULL DEFAULT NOW()`, and a DEFAULT only
+        # fires when a COPY row's column list leaves it out entirely -- an explicit NULL
+        # (what an earlier version of this fallback passed) violates NOT NULL outright.
         async with conn.cursor() as cursor, cursor.copy(
-            f"COPY {ARTIST_EMBEDDINGS_TABLE} (artist_id, model_version, embedding, source_dump_id, source_dump_date, computed_at) "  # noqa: S608
+            f"COPY {ARTIST_EMBEDDINGS_TABLE} (artist_id, model_version, embedding, source_dump_id, source_dump_date) "  # noqa: S608
             f"FROM STDIN"
         ) as copy:
             for index in range(len(remaining_ids)):
                 vector_literal = "[" + ",".join(f"{value:g}" for value in remaining_vectors[index].tolist()) + "]"
-                await copy.write_row(
-                    (remaining_ids[index], month["model_version"], vector_literal, month["dump_id"], month["dump_date"], None)
-                )
+                await copy.write_row((remaining_ids[index], month["model_version"], vector_literal, month["dump_id"], month["dump_date"]))
         rows_written = trial_rows + len(remaining_ids)
     elif trial_n < total:
         write_started = time.perf_counter()
