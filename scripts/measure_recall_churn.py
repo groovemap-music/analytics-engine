@@ -423,6 +423,25 @@ def compute_churn(aug_top10: dict[str, list[str]], sept_top10: dict[str, list[st
     return {"mean_jaccard": sum(jaccards) / len(jaccards) if jaccards else 0.0, "n": len(jaccards)}
 
 
+def _save_checkpoint(path: Path, aug_result: dict[str, Any], aug_churn: dict[str, Any], model_version: str) -> None:
+    """Persist August's full result (recall sweep + churn top-10) to disk immediately after
+    it's computed, before September starts -- so a restart between months (a container
+    swap for a higher maintenance_work_mem, say) can skip re-doing August's multi-hour
+    build entirely, per the dispatcher's ask about resumability. Keyed on August's own
+    stored model_version so a checkpoint from a different config/dump is never reused."""
+    path.write_text(json.dumps({"model_version": model_version, "aug_result": aug_result, "aug_churn": aug_churn}, default=str))
+
+
+def _load_checkpoint(path: Path, model_version: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    if data.get("model_version") != model_version:
+        print(f"  checkpoint at {path} is for a different model_version ({data.get('model_version')!r}); ignoring", file=sys.stderr)
+        return None
+    return data["aug_result"], data["aug_churn"]
+
+
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     print(f"loading {args.aug}", file=sys.stderr)
     aug = _load_month(args.aug)
@@ -441,22 +460,36 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     sept_id_to_position = {aid: index for index, aid in enumerate(sept["artist_ids"])}
     sept_query_positions = [sept_id_to_position[aid] for aid in sept_query_ids]
 
-    pool = AsyncPostgreSQLPool(
-        connection_params={"host": args.host, "port": args.port, "dbname": args.database, "user": args.username, "password": args.password},
-        min_connections=1,
-        max_connections=1,
-    )
-    await pool.initialize()
-    async with pool.connection() as conn:
-        await _apply_schema(conn)
-        aug_result = await measure_month(
-            conn, aug, label="August", query_sample_positions=aug_query_positions, query_sample_ids=aug_query_ids, maintenance_work_mem=args.aug_maintenance_work_mem
+    checkpoint_path = args.out.with_suffix(".august_checkpoint.json")
+    checkpoint = _load_checkpoint(checkpoint_path, aug["model_version"])
+    if checkpoint is not None:
+        print(f"\n=== August: resuming from checkpoint {checkpoint_path} (skipping write/build/sweep) ===", file=sys.stderr)
+        aug_result, aug_churn = checkpoint
+    else:
+        pool = AsyncPostgreSQLPool(
+            connection_params={"host": args.host, "port": args.port, "dbname": args.database, "user": args.username, "password": args.password},
+            min_connections=1,
+            max_connections=1,
         )
-        print("\n=== August: churn top-10 (exact + ANN) for the common-artist sample, BEFORE dropping the table ===", file=sys.stderr)
-        aug_churn = await churn_top_k(conn, aug, churn_sample_ids, aug_result["churn_ef_search_used"])
-    await pool.close()
+        await pool.initialize()
+        async with pool.connection() as conn:
+            await _apply_schema(conn)
+            aug_result = await measure_month(
+                conn, aug, label="August", query_sample_positions=aug_query_positions, query_sample_ids=aug_query_ids, maintenance_work_mem=args.aug_maintenance_work_mem
+            )
+            print("\n=== August: churn top-10 (exact + ANN) for the common-artist sample, BEFORE dropping the table ===", file=sys.stderr)
+            aug_churn = await churn_top_k(conn, aug, churn_sample_ids, aug_result["churn_ef_search_used"])
+        await pool.close()
+        _save_checkpoint(checkpoint_path, aug_result, aug_churn, aug["model_version"])
+        print(f"  checkpoint saved: {checkpoint_path}", file=sys.stderr)
 
-    if args.sept_maintenance_work_mem != args.aug_maintenance_work_mem:
+    if checkpoint is not None:
+        # August's phase never touched a container in THIS invocation (it was skipped
+        # entirely), so there is nothing here to restart -- the caller is responsible for
+        # having --host/--port already point at a container provisioned for September's
+        # settings before resuming from a checkpoint.
+        print(f"\n=== using the given container ({args.host}:{args.port}) for September (resumed from checkpoint) ===", file=sys.stderr)
+    elif args.sept_maintenance_work_mem != args.aug_maintenance_work_mem:
         print(
             f"\n=== restarting {args.container_name} with --shm-size {args.sept_shm_size} for September's "
             f"maintenance_work_mem={args.sept_maintenance_work_mem} (dispatcher-approved side-by-side comparison) ===",
