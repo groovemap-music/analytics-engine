@@ -49,7 +49,7 @@ from typing import Any
 import numpy as np
 
 from common import AsyncPostgreSQLPool
-from insights.embedding_pipeline import ARTIST_EMBEDDINGS_TABLE, _index_name, _write_embeddings
+from insights.embedding_pipeline import ARTIST_EMBEDDINGS_TABLE, FastRPConfig, _index_name, _write_embeddings, stored_model_version
 from insights.embeddings.graph import node_key
 from insights.embeddings.projection import splitmix64
 
@@ -104,11 +104,31 @@ def _load_month(path: Path) -> dict[str, Any]:
     # here -- this file is written by scripts/embeddings_from_dump.py on this same machine
     # in this same measurement workflow, never fetched from an untrusted source.
     with np.load(path, allow_pickle=True) as data:
+        method_version = str(data["model_version"])
+        dump_id = str(data["dump_id"])
+        default_method_version = FastRPConfig().model_version
+        if method_version != default_method_version:
+            raise ValueError(
+                f"{path}: saved method_version {method_version!r} does not match the current "
+                f"FastRPConfig() default {default_method_version!r} -- this script assumes the npz "
+                "was produced with the same defaults it reconstructs stored_model_version from."
+            )
         return {
             "artist_ids": [str(aid) for aid in data["artist_ids"]],
             "vectors": data["vectors"],
-            "model_version": str(data["model_version"]),
-            "dump_id": str(data["dump_id"]),
+            # `embeddings_from_dump.py` saves the bare `FastRPConfig.model_version`
+            # (`method_version` here), not production's *stored* value -- it never imports
+            # `stored_model_version` at all. Composing it here, the same way production
+            # does (`f"{config.model_version}:{_EDGE_SET_VERSION}@{dump_id}"`), matters for
+            # more than labelling: without the dump id folded in, Aug and Sept would
+            # resolve to the IDENTICAL model_version string (same `FastRPConfig()` for
+            # both), which would collide on `_index_name`'s composed index name too --
+            # Sept's `CREATE INDEX IF NOT EXISTS` would then silently no-op against
+            # Aug's (by-then-truncated, so empty) index instead of building a real one.
+            # Caught before this ran end to end against real data.
+            "method_version": method_version,
+            "model_version": stored_model_version(FastRPConfig(), dump_id),
+            "dump_id": dump_id,
             "dump_date": str(data["dump_date"]),
         }
 
