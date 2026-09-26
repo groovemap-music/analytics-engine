@@ -56,7 +56,7 @@ from typing import Any
 import numpy as np
 
 from common import AsyncPostgreSQLPool
-from insights.embedding_pipeline import ARTIST_EMBEDDINGS_TABLE, FastRPConfig, _already_loaded, _index_name, _write_embeddings, stored_model_version
+from insights.embedding_pipeline import ARTIST_EMBEDDINGS_TABLE, FastRPConfig, _already_loaded, _index_name, _sql_string_literal, _write_embeddings, stored_model_version
 from insights.embeddings.graph import node_key
 from insights.embeddings.projection import splitmix64
 
@@ -279,24 +279,54 @@ async def _write_month(conn: Any, month: dict[str, Any]) -> dict[str, Any]:
 async def _build_index(conn: Any, model_version: str, maintenance_work_mem: str) -> dict[str, Any]:
     """Build the full-scale HNSW index for MODEL_VERSION's rows, named by `_index_name`.
 
+    A per-`model_version` PARTIAL index (`WHERE model_version = ...`), exactly the shape
+    `insights.embedding_pipeline._log_operator_step` logs as the real operator statement
+    and `gm-database-schema-19g5` builds -- not a whole-table index. This matters even
+    though this script only ever keeps one month's rows in the table at a time: a
+    whole-table index, once built, is a live HNSW graph that keeps accepting inserts for
+    *any* `model_version` written afterward (there is no `WHERE` filtering what the index
+    accepts), so a later month's rows get added to the same graph one at a time via
+    per-row HNSW maintenance instead of getting their own bulk-built graph -- silently
+    correct but catastrophically slow (a real incident this bead hit: September's `COPY`
+    crawled at ~20k rows/min, on pace for over 5 hours, because it was appending to
+    August's already-built whole-table index instead of building its own).
+
     Full scale first, per the maintainer's condition: a subset fallback is used only after
     a real failure here, with that failure's wall time and peak memory recorded -- this
     function does not pre-emptively choose a smaller scale. `maintenance_work_mem` is a
     session-only `SET`, reverted after, matching `database-schema.build_artist_embeddings_
-    index`'s own pattern -- the caller decides the value (August uses the documented 2GB;
-    September, in this bead's finding-driven side-by-side comparison, uses more).
+    index`'s own pattern -- the caller decides the value (August's first attempt used the
+    documented 2GB; both months' final runs use more -- see docs/recall_and_churn.md).
     """
     index_name = _index_name(model_version)
     async with conn.cursor() as cursor:
         await cursor.execute(f"SET maintenance_work_mem = '{maintenance_work_mem}'")
         started = time.perf_counter()
+        # A bind parameter in CREATE INDEX's WHERE clause hits psycopg's
+        # `IndeterminateDatatype` (PostgreSQL can't infer the parameter's type in this DDL
+        # context, confirmed against the live container before this ran for real) -- the
+        # same class of limitation `_create_pipeline_login`'s own docstring notes for a `DO`
+        # block's body. `_sql_string_literal` (the same helper `_log_operator_step` uses for
+        # this exact WHERE clause) escapes it as a literal instead.
         await cursor.execute(
             f"CREATE INDEX IF NOT EXISTS {index_name} ON {ARTIST_EMBEDDINGS_TABLE} "  # noqa: S608
-            f"USING hnsw (embedding halfvec_cosine_ops) WITH (m = {HNSW_M}, ef_construction = {HNSW_EF_CONSTRUCTION})"
+            f"USING hnsw (embedding halfvec_cosine_ops) WITH (m = {HNSW_M}, ef_construction = {HNSW_EF_CONSTRUCTION}) "
+            f"WHERE model_version = {_sql_string_literal(model_version)}"
         )
         elapsed = time.perf_counter() - started
         await cursor.execute("RESET maintenance_work_mem")
     return {"index_name": index_name, "build_elapsed_s": elapsed, "maintenance_work_mem": maintenance_work_mem}
+
+
+async def _drop_index(conn: Any, model_version: str) -> None:
+    """Drop the previous month's per-`model_version` HNSW index, before that month's rows
+    are truncated -- so a later `CREATE INDEX IF NOT EXISTS` under a *different* name
+    (per-`model_version`, so it never collides) always builds a fresh graph, and the old,
+    now-empty-table index is never left around taking up (admittedly small) catalog space.
+    """
+    index_name = _index_name(model_version)
+    async with conn.cursor() as cursor:
+        await cursor.execute(f"DROP INDEX IF EXISTS {index_name}")
 
 
 async def _ann_top_k(conn: Any, model_version: str, vectors: np.ndarray, artist_ids: list[str], positions: list[int], ef_search: int, k: int) -> list[list[str] | None]:
@@ -501,7 +531,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         print(f"  restarted: {new_host}:{new_port}", file=sys.stderr)
         args.host, args.port = new_host, new_port
     else:
-        print("\n=== dropping August's table before September (same container/mwm) ===", file=sys.stderr)
+        print("\n=== dropping August's index and table before September (same container/mwm) ===", file=sys.stderr)
 
     pool = AsyncPostgreSQLPool(
         connection_params={"host": args.host, "port": args.port, "dbname": args.database, "user": args.username, "password": args.password},
@@ -512,10 +542,15 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     try:
         async with pool.connection() as conn:
             await _apply_schema(conn)
-            if args.sept_maintenance_work_mem == args.aug_maintenance_work_mem:
-                # Same container carried over from August: drop its rows (and, since the
-                # index name is per-`model_version`, September's own `CREATE INDEX IF NOT
-                # EXISTS` under its own name is never blocked by August's leftover one).
+            if checkpoint is None and args.sept_maintenance_work_mem == args.aug_maintenance_work_mem:
+                # Same container carried over from August (and August actually ran in THIS
+                # invocation, not resumed from a checkpoint against a fresh one): drop its
+                # per-model_version index explicitly, then truncate its rows. Both are
+                # per-`model_version` (index name and the index's own `WHERE` predicate), so
+                # this was never a hard requirement for correctness -- a stale, now-empty
+                # partial index for August's model_version doesn't accept September's rows
+                # either way -- but it's cheap cleanup and keeps the catalog tidy.
+                await _drop_index(conn, aug["model_version"])
                 async with conn.cursor() as cursor:
                     await cursor.execute(f"TRUNCATE {ARTIST_EMBEDDINGS_TABLE}")  # noqa: S608 -- constant, no caller input.
 
