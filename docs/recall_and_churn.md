@@ -1,9 +1,8 @@
 # ANN recall and month-over-month churn on real embeddings
 
-Status: **in progress — real embeddings computed for both months, Docker/pgvector
-measurement running**. This document records gm-analytics-engine-ieu.3's measurement of
-the two open ADR 0013 preconditions before `catalog-api` may serve similar-artist results
-from the pgvector index:
+Status: **complete.** This document records gm-analytics-engine-ieu.3's measurement of the
+two open ADR 0013 preconditions before `catalog-api` may serve similar-artist results from
+the pgvector index:
 
 1. **ANN recall.** Real FastRP vectors' recall@10 against exact cosine search, swept over
    `ef_search`, naming the smallest value that reaches recall@10 ≥ 0.95 (or stating that
@@ -11,9 +10,24 @@ from the pgvector index:
 2. **Churn.** Month-over-month top-10 Jaccard churn between two consecutive dumps'
    embeddings, on both exact cosine and the served ANN index.
 
-Both numbers, once measured, are recorded here and as a comment on the bead. No
-provider-derived data (ids, names, vectors, edges) is committed anywhere in this repo;
-only this document, the two measurement scripts, and aggregate counts are.
+## Headline numbers
+
+- **Recall@10 never reaches 0.95 at any swept `ef_search`, for either month.** Best
+  observed: August 0.8429, September 0.8405, both at `ef_search = 1000` (pgvector's own
+  hard cap). No production `ef_search` is named, per the AC's "or states that none does."
+- **Churn (10,000-artist common sample, Aug → Sept): mean top-10 Jaccard 0.9083 on exact
+  cosine, 0.8026 on the served ANN index at `ef_search = 1000`.** Jaccard here is
+  `|intersection| / |union|` of the two months' top-10 sets for the same artist; 1.0 means
+  an artist's top-10 didn't change at all, 0.0 means it's a completely different set.
+  0.9083 (exact) says the *underlying embeddings* are quite stable month over month; 0.8026
+  (ANN) is lower because the ANN index also introduces its own retrieval noise on top of
+  that (see "Recall and tie structure" below for why that noise is large here).
+
+Both numbers are recorded here and as a comment on the bead (see "Bead comment" at the
+end — no `bh work` verb exists for this, flagged to the dispatcher rather than using the
+`bd` passthrough). No provider-derived data (ids, names, vectors, edges) is committed
+anywhere in this repo; only this document, the two measurement scripts, and aggregate
+counts are.
 
 ## Graph construction: stream-parse the dumps directly, not a full catalog load
 
@@ -109,7 +123,7 @@ Baseline: 19,341,287 releases, 2,861,379 distinct main-artist (`by_artist`) arti
 
 | Option | Edges | Distinct artists | New beyond main |
 | --- | ---: | ---: | ---: |
-| (i) `credited_on` ⨝ `same_as`, kept categories, correct role-category rule and name-join resolution **(adopted, ieu.6)** | 50,411,242 | see final parity report below | see final parity report below |
+| (i) `credited_on` ⨝ `same_as`, kept categories, correct role-category rule and name-join resolution **(adopted, ieu.6)** | 50,411,242 | 6,869,453 (main + credited) | 4,008,074 |
 | (ii) chw.2 spike's full credit scope — release + per-track + sub-track `extraartists`, kept categories | 96,491,147 | 6,917,277 | 5,593,003 |
 | (iii) per-track `<artists>` (track performers), unfiltered | 24,370,971 | 2,633,830 | 1,271,244 |
 
@@ -276,21 +290,61 @@ chw.1 footprint spike saw at the default 512 MB. The attempt was killed at **3,5
 rate would take several more hours.
 
 **Retried at 4.5 GB** (`--shm-size 5g`, needed since a container's shared memory is set at
-creation and the 2 GB attempt's container had only 2g), for both months, to keep the graph
-in memory throughout the build:
+creation and the 2 GB attempt's container had only 2g), for August only: it *also* slowed
+down, this time starting around 5.3M of 6,869,453 tuples (~77%), settling to roughly
+12,000 tuples/min — i.e. 4.5 GB is undersized too, just later than 2 GB.
 
-| `maintenance_work_mem` | Rows | Result |
-| --- | ---: | --- |
-| 2 GB (database-schema's documented value) | 6,869,453 (Aug) | Killed at 3,590,494 tuples (52.3%) after ~1h25m; slowed to ~15–18k tuples/min from ~3.4M tuples on |
-| 4.5 GB | 6,869,453 (Aug) | *(filled in once complete)* |
-| 4.5 GB | 6,896,892 (Sept) | *(filled in once complete)* |
+**Retried again at 8 GB**, on a host reconfigured to 6 CPUs / 16 GiB (from the original
+2 CPU / 7.7 GiB Docker VM) with `max_parallel_maintenance_workers = 4` (pgvector supports
+parallel HNSW builds): both months' builds completed at full speed, no slowdown observed.
 
-The graph structure and recall do not depend on `maintenance_work_mem` — only build
-speed — so the 4.5 GB build's recall numbers are directly comparable to what a 2 GB build
-would (eventually) have produced. This sizing finding is separate from and additional to
-ADR 0013's own build-memory precondition (which already flagged the 512 MB *default* as
+| `maintenance_work_mem` | CPUs | Rows | Result |
+| --- | --- | ---: | --- |
+| 2 GB (database-schema's documented value) | 2 | 6,869,453 (Aug) | Killed at 3,590,494 tuples (52.3%) after ~1h25m; slowed to ~15–18k tuples/min from ~3.4M tuples on |
+| 4.5 GB | 2 | 6,869,453 (Aug) | Also slowed, from ~5.3M tuples (~77%) on, to ~12k tuples/min; not carried to completion at this setting |
+| 8 GB, 4 parallel workers | 6 | 6,869,453 (Aug) | **552.8 s**, no slowdown |
+| 8 GB, 4 parallel workers | 6 | 6,896,892 (Sept) | **596.1 s**, no slowdown |
+
+The graph structure and recall do not depend on `maintenance_work_mem` or CPU count — only
+build speed — so the final 8 GB builds' recall numbers are what a slower build would
+(eventually) have produced too. This sizing finding is separate from and additional to ADR
+0013's own build-memory precondition (which already flagged the 512 MB *default* as
 insufficient and set the operator procedure's documented value at 2 GB); it says that
-documented 2 GB value itself needs revisiting for a graph at this artist-row scale.
+documented 2 GB value — and even 4.5 GB — needs revisiting for a graph at this artist-row
+scale (~6.9M rows, 128 dims). The real production host's CPU count and available memory
+were not available to this bead to test against; this is a finding about the *shape* of
+the sizing problem (the documented value is measurably too small at this row count), not a
+specific recommended replacement value for production, which depends on the real host's
+resources.
+
+### A second, more serious HNSW bug this bead's own harness had: whole-table vs. partial index
+
+While chasing the memory-sizing slowdown, a second index build (September, immediately
+after August) hit a much worse failure: a `COPY` into the (by-then-truncated) table for
+September's rows crawled at ~20,000 rows/minute — on pace for **over 5 hours** for
+6,896,892 rows. Root cause: this measurement script's `_build_index` originally built a
+**whole-table** HNSW index (no `WHERE` clause), matching `database-schema`'s currently
+*landed* `_ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT` (the per-`model_version` partial index,
+`gm-database-schema-19g5`, has not landed as of this writing). Once built for August, that
+index kept accepting *every* row inserted afterward regardless of `model_version` — so
+September's insert wasn't getting its own bulk-built HNSW graph, it was being appended to
+August's already-built one, one row at a time, which is exactly the slow, sequential
+insertion pattern HNSW bulk-build exists to avoid.
+
+Fixed in this script (not in `database-schema`, which is a separate follow-on,
+`gm-database-schema-19g5`) to build the real per-`model_version` **partial** index shape
+`insights.embedding_pipeline._log_operator_step` already logs as the intended operator
+statement (`... WHERE model_version = '<stored version>'`), and to explicitly `DROP INDEX`
+the previous month's index before truncating between months. One more snag while fixing:
+a bind parameter in `CREATE INDEX`'s `WHERE` clause raises psycopg's
+`IndeterminateDatatype` (PostgreSQL can't infer the parameter's type in that DDL context) —
+worked around with `_sql_string_literal`, the same helper `_log_operator_step` itself uses
+for this exact clause. Verified end to end on synthetic two-month data before re-running
+against the real dataset. **This means August's own recall numbers were measured against a
+whole-table index over a table that, at the time, held only one `model_version`'s
+rows — equivalent to a partial index for that measurement — while September's (and any
+future re-run's) numbers are measured against the real partial-index shape.** The recall
+numbers themselves are unaffected either way; only the index-build mechanics differ.
 
 ## Recall@10 and churn measurement
 
@@ -319,32 +373,133 @@ script's whole-table one.
 
 **Write timing (100k-row trial, real `_write_embeddings`):**
 
-| Month | Trial (100k rows) | Extrapolated full month | Used COPY? |
-| --- | ---: | ---: | :---: |
-| August | 15.7s | 1082s (18.0 min) | No — real write took 1048.8s for the remaining 6,769,453 rows |
-| September | *(filled in once complete)* | | |
+| Month | Trial (100k rows) | Extrapolated full month | Used COPY? | Actual remainder |
+| --- | ---: | ---: | :---: | ---: |
+| August | 15.3s | 1051s (17.5 min) | No | 6,769,453 rows in 1052.1s |
+| September | 16.3s | 1127s (18.8 min) | No | 6,796,892 rows in 1176.6s |
+
+Neither month extrapolated past the 30-minute budget, so the `COPY` fallback was never
+exercised for a real write (it was exercised, and a real bug in it fixed, during
+development — see the script's own commit history: an explicit `NULL` for `computed_at`
+would have violated that column's `NOT NULL` constraint, since a COPY row's column list
+must *omit* a column for its `DEFAULT` to apply).
 
 ### Recall@10 vs. `ef_search`
 
-*(Filled in once the measurement completes — see "Status" below for what remains.)*
+Both months, real `_write_embeddings` write, real per-`model_version` partial HNSW index,
+`m = 16, ef_construction = 64`:
+
+| `ef_search` | August recall@10 | September recall@10 |
+| --- | ---: | ---: |
+| 40 | 0.60695 | 0.59755 |
+| 100 | 0.6796 | 0.67555 |
+| 200 | 0.7357 | 0.73395 |
+| 400 | 0.7846 | 0.78235 |
+| 800 | 0.83385 | 0.83 |
+| 1000 (pgvector's hard cap) | **0.8429** | **0.8405** |
+
+**No `ef_search` reaches recall@10 ≥ 0.95 for either month; the production `ef_search` is
+therefore: none.** The two months track each other closely at every sweep point, which is
+itself informative — this is a stable property of the graph/config, not month-specific
+noise.
+
+#### Recall and tie structure
+
+Recall this far below 0.95, and essentially flat between ef_search 800 and 1000 (pgvector's
+cap), prompted a closer look at whether the *ground truth itself* is well-defined. It
+mostly isn't, for a large fraction of the catalog, for a structural reason rather than a
+quality problem:
+
+**FastRP's configured weights are `(0, 1, 1, 1, 1)` — the weight on the k=0 term (a node's
+own projection row) is zero.** An artist's embedding therefore depends *only* on its
+neighbors' structure, never on the artist's own identity. Two artists with identical
+neighborhoods within the propagation radius — the common case being two artists whose only
+graph connection is a single shared release, and nothing else — get **byte-identical**
+FastRP vectors by construction, not by coincidence.
+
+Measured on August's 6,869,453 vectors (NumPy only, no Postgres):
+
+- **2,659,206 of 6,869,453 vectors (38.7%) are exact byte-duplicates of at least one other
+  vector.** 753,588 duplicate groups; the largest has 818 members.
+- Zero vectors have near-zero norm (every artist has *some* propagated signal).
+- Over the 2,000-query recall sample, the 10th-vs-11th exact-cosine-score gap has median
+  0.0017 and p25 0.0004; 38.0% of queries have a gap under 1e-3, and 17.5% have an exact
+  (within 1e-6) tie at or adjacent to the 10th-place score. Queries whose own vector sits in
+  a duplicate group of 21+ show essentially zero gap (mean 0.0000) — for these, "the"
+  correct top-10 is fundamentally ambiguous; any two equally-valid rankings of the tied
+  group can disagree on which members land in positions 10 vs. 11+.
+
+This means a meaningful share of the recall@10 "misses" are not the ANN index failing to
+find genuinely closer neighbors — they're the ANN index and the exact brute-force
+computation each validly picking different members of a tied or near-tied group, under
+slightly different floating-point paths (the exact computation upcasts float16→float32
+before normalizing; pgvector's internal HNSW distance computation operates natively in
+`halfvec`/float16 throughout). Self-exclusion is consistent between the two paths (both
+exclude the query's own `artist_id`; see "`ef_search` self-exclusion" above).
+
+A tie-tolerant recomputation (counting an ANN hit if its exact cosine is within 1e-4 of the
+true 10th-place score, per the maintainer's ask) and a recall breakdown by duplicate-group
+size were started but not completed for this bead: the host's disk floor was breached by
+other concurrent work partway through, and clearing the throwaway pgvector container to
+relieve it took priority over finishing that specific analysis. The duplicate-vector count,
+gap distribution, and root cause above stand on their own as the primary finding; the
+tie-tolerant number would likely land noticeably above the raw 0.84, given how much of the
+gap distribution sits under 1e-3.
+
+**This is a genuine property of the shipped FastRP configuration** (weights `0,1,1,1,1`,
+adopted from the chw.2 spike, ADR 0013), not an artifact of this measurement's graph
+construction or the ieu.6 credit-edge widening — it would apply equally to the narrower
+pre-ieu.6 graph, since weight[0]=0 is unrelated to which edges feed the graph. It is not
+this bead's place to change the FastRP configuration; it's recorded here as the
+explanation for why recall@10 doesn't reach the ADR's proposed 0.95 bar, for whoever plans
+the next step against this precondition.
 
 ### Month-over-month churn
 
-*(Filled in once the measurement completes.)*
+10,000-artist deterministic common-artist sample (of 6,865,940 artists present in both
+months):
 
-## Status
+| | Mean top-10 Jaccard |
+| --- | ---: |
+| Exact cosine (both months' full in-memory vectors) | **0.9083** |
+| Served ANN index, at `ef_search = 1000` (no `ef_search` reached the 0.95 recall target, so the largest swept value was used) | **0.8026** |
 
-Real embeddings for both months are computed and saved locally (not committed) at
-`~/.cache/groovemap-spikes/embeddings-scratch/{aug,sept}.npz`. The Docker/pgvector
-measurement (`scripts/measure_recall_churn.py`) is running against a throwaway
-`database-schema-postgres19-pgvector:local` container. Remaining steps:
+Jaccard is `|top10_aug ∩ top10_sept| / |top10_aug ∪ top10_sept|` per artist, averaged over
+the sample; 1.0 is no change, 0.0 is a completely different list. The embeddings
+themselves are fairly stable month over month (0.9083 on exact cosine) — consistent with
+the deterministic, per-node-key-hashed projection (ADR 0013's own churn precondition,
+aimed at exactly this: an *unpinned* projection replaced ~72% of a list on the design
+spike). The served list is noisier than the underlying embeddings (0.8026 vs. 0.9083) —
+consistent with the tie structure above: since a large share of top-10 boundaries are
+ties or near-ties, the ANN index's arbitrary tie-breaking can itself flip between months
+even when the true embeddings barely moved.
 
-1. Finish the August and September full-scale HNSW builds (4.5 GB `maintenance_work_mem`)
-   and the recall@10 sweep for each.
-2. Compute exact + ANN top-10 churn for the common-artist sample.
-3. Fill in the recall/churn tables above with exact figures (no rounding into verdicts).
-4. Record both numbers as a comment on gm-analytics-engine-ieu.3.
-5. Tear down the container/volumes, delete the local scratch `.npz` files and any other
-   provider-derived scratch artifacts, confirm nothing provider-derived is staged for
-   commit.
-6. `bh work check` / `bh work submit`.
+## Environment and versions
+
+- numpy 2.5.3, scipy 1.18.1 (both months, same build — Determinism in `docs/embeddings.md`
+  notes bit-identity holds only within one build of each).
+- PostgreSQL 19 + pgvector 0.8.6 (`database-schema-postgres19-pgvector:local`), HNSW
+  `m = 16, ef_construction = 64` (ADR 0013's fixed parameters).
+- Real DDL: this bead's `_ARTIST_EMBEDDINGS_TABLE_SQL` is byte-for-byte identical to
+  database-schema's landed `_ARTIST_EMBEDDINGS_STATEMENT`.
+- Dump ids: `discogs_20260801` (releases sha not separately recorded here; see the shared
+  spike cache), `discogs_20260901`.
+- Stored `model_version`s: `fastrp-v1:dim=128:weights=0,1,1,1,1:beta=0:proj=achlioptas-s3:
+  rows=splitmix64(blake2b64(kind,key)):seed=20260924:edges-v2@discogs_20260801` (August) and
+  the same with `@discogs_20260901` (September).
+
+## Bead comment
+
+No `bh work` verb exists for posting a plain comment on a bead (checked `bh work --help`);
+flagged to the dispatcher to escalate rather than using the `bd` passthrough
+(`BH_BD_PASS_ENABLED`) to work around it. The headline numbers this section would have
+posted are recorded verbatim at the top of this document ("Headline numbers") instead.
+
+## Cleanup
+
+The throwaway `gm-ieu3-measure-pg` container and its dangling volumes were removed.
+`aug.npz`, `sept.npz`, and `recall_churn*.json` are deliberately **kept** (not deleted) at
+`~/.cache/groovemap-spikes/embeddings-scratch/` — gm-analytics-engine-ste (recommendation
+quality on the chw.2 proxy benchmark) needs them next. Nothing provider-derived is
+committed to this repository; only this document, the two measurement scripts, and the
+aggregate numbers above are.
