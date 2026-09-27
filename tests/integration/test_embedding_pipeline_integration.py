@@ -229,3 +229,183 @@ async def test_credited_artist_edges_are_filtered_resolved_and_embedded(
     assert embedded == set(ARTIST_IDS) | {"7", "9", "10", "11"}
     assert "8" not in embedded  # dropped by role_category, not by an unresolvable name
     assert result.rows_written == len(ARTIST_IDS) + 4
+
+
+# ── Track-level credits and performers (gm-analytics-engine-x3d) ───────────────────────────────
+#
+# `graph.track_credited_on` and `graph.track_by_artist` are, like `graph.credited_on` and
+# `graph.same_as` above, session-scoped base tables the autouse `_reset_artist_embeddings`
+# fixture does not touch, so a test that inserts rows into them cleans up after itself the same
+# way `_credited_rows` does.
+
+TRACK_DUMP_ID = "fixture-dump-2026-12-tracks"
+TRACK_DUMP_DATE = date(2026, 12, 1)
+
+
+@asynccontextmanager
+async def _track_credited_rows(
+    schema_owner_pool: AsyncPostgreSQLPool,
+    *,
+    track_credited_on: Iterable[tuple[str, str, int, int, str | None, str]],
+    same_as: Iterable[tuple[str, str]],
+) -> AsyncIterator[None]:
+    """Insert `graph.track_credited_on`/`graph.same_as` rows for the duration of one test.
+
+    `track_credited_on` rows are `(person_name, release_id, track_ordinal, sub_track_ordinal,
+    track_position, role)` -- the real stored shape (`gm-database-schema-ug3v`), including a
+    `track_position` of `None` (an empty string in the dump, e.g. a heading entry) and two rows
+    sharing one `track_position` across different `track_ordinal`s, exactly the case
+    `track_ordinal`/`sub_track_ordinal` being the real key -- not `track_position` -- exists to
+    handle. `role_category` is GENERATED, never inserted.
+    """
+    track_credited_on = list(track_credited_on)
+    same_as = list(same_as)
+    async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+        for person_name, release_id, track_ordinal, sub_track_ordinal, track_position, role in track_credited_on:
+            await cursor.execute(
+                "INSERT INTO graph.track_credited_on "
+                "(person_name, release_id, track_ordinal, sub_track_ordinal, track_position, role) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (person_name, release_id, track_ordinal, sub_track_ordinal, track_position, role),
+            )
+        for person_name, artist_id in same_as:
+            await cursor.execute("INSERT INTO graph.same_as (person_name, artist_id) VALUES (%s, %s)", (person_name, artist_id))
+    try:
+        yield
+    finally:
+        async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+            for person_name, release_id, track_ordinal, sub_track_ordinal, _track_position, role in track_credited_on:
+                await cursor.execute(
+                    "DELETE FROM graph.track_credited_on "
+                    "WHERE person_name = %s AND release_id = %s AND track_ordinal = %s AND sub_track_ordinal = %s AND role = %s",
+                    (person_name, release_id, track_ordinal, sub_track_ordinal, role),
+                )
+            for person_name, artist_id in same_as:
+                await cursor.execute("DELETE FROM graph.same_as WHERE person_name = %s AND artist_id = %s", (person_name, artist_id))
+
+
+@asynccontextmanager
+async def _track_performer_rows(
+    schema_owner_pool: AsyncPostgreSQLPool, *, rows: Iterable[tuple[str, int, int, str | None, str]]
+) -> AsyncIterator[None]:
+    """Insert `graph.track_by_artist` rows -- `(release_id, track_ordinal, sub_track_ordinal,
+    track_position, artist_id)` -- for the duration of one test."""
+    rows = list(rows)
+    async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+        for release_id, track_ordinal, sub_track_ordinal, track_position, artist_id in rows:
+            await cursor.execute(
+                "INSERT INTO graph.track_by_artist (release_id, track_ordinal, sub_track_ordinal, track_position, artist_id) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (release_id, track_ordinal, sub_track_ordinal, track_position, artist_id),
+            )
+    try:
+        yield
+    finally:
+        async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+            for release_id, track_ordinal, sub_track_ordinal, _track_position, artist_id in rows:
+                await cursor.execute(
+                    "DELETE FROM graph.track_by_artist WHERE release_id = %s AND track_ordinal = %s AND sub_track_ordinal = %s AND artist_id = %s",
+                    (release_id, track_ordinal, sub_track_ordinal, artist_id),
+                )
+
+
+async def test_track_credited_artist_edges_are_filtered_resolved_and_embedded(
+    schema_owner_pool: AsyncPostgreSQLPool, pipeline_pool: AsyncPostgreSQLPool
+) -> None:
+    """Mirrors `test_credited_artist_edges_are_filtered_resolved_and_embedded` one level deeper:
+    a kept-category track credit resolves and gets embedded, a dropped-category one does not
+    even though its name resolves, an unresolvable name contributes nothing, and this also
+    exercises the real-shape edge cases a track table adds that a release-level one does not --
+    an empty `track_position` (`None`, row 1) and two entries sharing a `track_position` across
+    different `track_ordinal`s (rows 2 and 3, both `"A1"`) -- neither of which is part of any
+    table's primary key, so both insert and resolve without conflict.
+    """
+    config = FastRPConfig()
+    async with _track_credited_rows(
+        schema_owner_pool,
+        track_credited_on=[
+            ("Track Session Player", "101", 1, 0, None, "Bass"),  # session -> kept; empty track_position
+            ("Track Dropped Person", "101", 1, 0, "A1", "Design"),  # design -> dropped, despite resolving
+            ("Track Unresolvable Ghost", "101", 2, 0, "A1", "Engineer"),  # kept, but never resolved; shares "A1" with the row above
+        ],
+        same_as=[
+            ("Track Session Player", "12"),
+            ("Track Dropped Person", "13"),
+        ],
+    ):
+        result = await load_embeddings(pipeline_pool, config, TRACK_DUMP_ID, TRACK_DUMP_DATE)
+        embedded = await _embedded_artist_ids(pipeline_pool, result.model_version)
+
+    assert result.skipped is False
+    assert embedded == set(ARTIST_IDS) | {"12"}
+    assert "13" not in embedded  # dropped by role_category, not by an unresolvable name
+    assert result.rows_written == len(ARTIST_IDS) + 1
+
+
+async def test_track_credit_merges_with_a_release_level_credit_to_the_same_artist(
+    schema_owner_pool: AsyncPostgreSQLPool, pipeline_pool: AsyncPostgreSQLPool
+) -> None:
+    """The dedup decision this bead documents (`_TRACK_CREDITED_ARTIST_EDGE_SQL`'s comment): a
+    release-level credit and a track-level credit that resolve to the same artist are the same
+    release<->artist edge, not two. There is no per-edge row in `artist_embeddings` to assert
+    on directly, so this only asserts what the real join and role_category filter can prove at
+    this layer -- the artist embeds exactly once, whichever relation named it -- while the
+    edge-count-collapse itself is unit-tested in `tests/test_embedding_pipeline.py` against the
+    real `AdjacencyBuilder`.
+    """
+    config = FastRPConfig()
+    async with (
+        _credited_rows(schema_owner_pool, credited_on=[("Merge Person", "101", "Bass")], same_as=[("Merge Person", "14")]),
+        _track_credited_rows(
+            schema_owner_pool, track_credited_on=[("Merge Person Track", "101", 1, 0, "A1", "Bass")], same_as=[("Merge Person Track", "14")]
+        ),
+    ):
+        result = await load_embeddings(pipeline_pool, config, TRACK_DUMP_ID, TRACK_DUMP_DATE)
+        embedded = await _embedded_artist_ids(pipeline_pool, result.model_version)
+
+    assert "14" in embedded
+    assert result.rows_written == len(ARTIST_IDS) + 1  # artist 14 embeds once, not twice
+
+
+async def test_track_performer_edges_are_embedded(schema_owner_pool: AsyncPostgreSQLPool, pipeline_pool: AsyncPostgreSQLPool) -> None:
+    """`graph.track_by_artist` carries `artist_id` directly, with no `same_as` resolution step --
+    exercised here with the same empty-`track_position`/shared-`track_position` real-shape
+    fixture as the track-credit test above."""
+    config = FastRPConfig()
+    async with _track_performer_rows(
+        schema_owner_pool,
+        rows=[
+            ("102", 1, 0, None, "15"),  # empty track_position
+            ("102", 2, 0, "B1", "16"),
+            ("102", 3, 0, "B1", "17"),  # shares "B1" with the row above, distinct track_ordinal
+        ],
+    ):
+        result = await load_embeddings(pipeline_pool, config, TRACK_DUMP_ID, TRACK_DUMP_DATE)
+        embedded = await _embedded_artist_ids(pipeline_pool, result.model_version)
+
+    assert result.skipped is False
+    assert embedded == set(ARTIST_IDS) | {"15", "16", "17"}
+    assert result.rows_written == len(ARTIST_IDS) + 3
+
+
+async def test_track_only_releases_with_no_vertex_degree_row_are_discovered(
+    schema_owner_pool: AsyncPostgreSQLPool, pipeline_pool: AsyncPostgreSQLPool
+) -> None:
+    """Real-SQL counterpart of the two `_read_vertices` unit tests asserting release discovery
+    against a fake connection: `_TRACK_CREDITED_RELEASE_IDS_SQL` and
+    `_TRACK_PERFORMER_RELEASE_IDS_SQL` run here against releases the base fixture's
+    `graph.vertex_degree` seed never names, proving the real column names and filter actually
+    match what `graph.track_credited_on`/`graph.track_by_artist` store."""
+    config = FastRPConfig()
+    async with (
+        _track_credited_rows(
+            schema_owner_pool,
+            track_credited_on=[("Track Only Release Credit", "901", 1, 0, "A1", "Bass")],
+            same_as=[("Track Only Release Credit", "18")],
+        ),
+        _track_performer_rows(schema_owner_pool, rows=[("902", 1, 0, "A1", "19")]),
+    ):
+        result = await load_embeddings(pipeline_pool, config, TRACK_DUMP_ID, TRACK_DUMP_DATE)
+        embedded = await _embedded_artist_ids(pipeline_pool, result.model_version)
+
+    assert embedded == set(ARTIST_IDS) | {"18", "19"}

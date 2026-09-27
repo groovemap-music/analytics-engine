@@ -11,10 +11,11 @@ it in its own `postgres_pool` fixture. That revision carries `gm-database-schema
 vector extension, `public.artist_embeddings`, the `embedding_pipeline` role and its grants),
 `gm-database-schema-19g5` (the per-`model_version` partial HNSW index procedure this repository
 does not exercise here — see `docs/embeddings.md`), and `gm-database-schema-ug3v`
-(`graph.track_credited_on` / `graph.track_by_artist`, unrelated to this pipeline's release-level
-reads). Applying the producer's own DDL — rather than a hand-rolled subset — is what keeps this
-fixture from drifting behind the objects `insights.embedding_pipeline` actually reads; see
-`test_real_databases.py` in `catalog-api` for the same rationale.
+(`graph.track_credited_on` / `graph.track_by_artist`, the two relations this bead,
+gm-analytics-engine-x3d, adds to the pipeline's edge set). Applying the producer's own DDL —
+rather than a hand-rolled subset — is what keeps this fixture from drifting behind the objects
+`insights.embedding_pipeline` actually reads; see `test_real_databases.py` in `catalog-api` for
+the same rationale.
 
 `create_postgres_schema` also declares `graph.credit_role_category`, the SQL rendering of
 `common.credit_roles.ROLE_CATEGORIES` (the same taxonomy
@@ -29,6 +30,14 @@ leaves behind. `public.catalog_document_sentinel` is the one object here with no
 counterpart: a stand-in for a catalog document table (e.g. `public.releases`) the pipeline role
 is never granted anything on, kept minimal rather than switched to a real table so this fixture
 does not have to seed one just to prove a permission boundary.
+
+`graph.track_credited_on` and `graph.track_by_artist` are likewise real, loader-written base
+tables, not views (the same shape `graph.credited_on`/`graph.same_as` already are) — seeded per
+test in `test_embedding_pipeline_integration.py`, not here, since their interesting cases (a
+track with an empty `track_position`, two tracks sharing one — a gap the loader bead's own
+parity fixture left, since `track_ordinal`/`sub_track_ordinal`, not `track_position`, are the
+real primary-key columns) need their own small fixtures rather than this session-scoped base
+graph.
 """
 
 from __future__ import annotations

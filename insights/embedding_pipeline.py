@@ -47,8 +47,10 @@ what lets two months coexist: each dump gets its own primary-key value, so a sec
 is a brand-new set of rows, never a write to the first month's. `_EDGE_SET_VERSION` is the same
 idea applied to the *graph* rather than the dump: it names which relations `_EDGE_RELATIONS`
 reads, bumped whenever one is added, removed, or refiltered (ieu.6 added the release-level
-credited-artist relation and bumped it to `"edges-v2"`), so a dump reprocessed under a changed
-edge set also lands on its own rows rather than upserting or being skipped as the old edge set's.
+credited-artist relation and bumped it to `"edges-v2"`; this bead, x3d, adds the track-credited-
+artist and track-performer relations and bumps it to `"edges-v3"`), so a dump reprocessed under
+a changed edge set also lands on its own rows rather than upserting or being skipped as the old
+edge set's.
 `config.model_version` (the pure method string) is recorded separately, in every log line here,
 as `method_version` — see "Bit-identity and lineage" below.
 
@@ -196,13 +198,78 @@ FROM graph.credited_on
 WHERE role_category = ANY(%s)
 """
 
+# Track and sub-track credits (gm-analytics-engine-x3d, follow-up to ieu.6). `graph.track_credited_on`
+# is `(person_name, release_id, track_ordinal, sub_track_ordinal, track_position, role, role_category)`
+# -- database-schema's `gm-database-schema-ug3v` -- one row per `tracklist[].extraartists` or
+# `tracklist[].sub_tracks[].extraartists` credit, the same free-text-name/role shape
+# `graph.credited_on` carries at release level, and it resolves through the identical
+# `graph.same_as` join: `person_name` is the key, never `artist_id`, since `same_as` has no
+# notion of "found at track level" versus "found at release level" to key on. Same kept/dropped
+# category split, same fan-out-on-ambiguity and drop-on-unresolved rules as
+# `_CREDITED_ARTIST_EDGE_SQL` above -- see that constant's comment for the full reasoning, which
+# applies unchanged here.
+#
+# **This is deliberately the *same* release<->artist edge as `_CREDITED_ARTIST_EDGE_SQL`, not a
+# second one.** A track-level credit and a release-level credit for the same (release, artist)
+# pair assert the same fact -- "this artist is credited on this release" -- discovered one
+# nesting level apart; `Adjacency`'s `build()` already collapses parallel edges between the same
+# two positions regardless of which `_EDGE_RELATIONS` entry contributed them (`insights/embeddings/
+# graph.py`: "parallel edges collapse to one"), so registering this as its own `_EDGE_RELATIONS`
+# entry, resolving through `same_as` exactly like the release-level query, reproduces the chw.2
+# spike's own treatment (`design/docs/spikes/gm-design-chw.2/parse_dump.py`: release, track, and
+# sub-track extraartists are unioned into one `credits` set per release *before* it ever becomes
+# an edge) without needing a hand-written `UNION` in SQL to get there -- the CSR build is where
+# the dedup already has to happen for every other pair of relations that can name the same edge
+# twice, and this pair is no exception. A track credit that never matches an existing
+# release-level one still contributes a genuinely new edge; one that does match contributes
+# nothing beyond what the release-level relation already said.
+_TRACK_CREDITED_ARTIST_EDGE_SQL: Final = """
+SELECT DISTINCT track_credited_on.release_id AS release_id, same_as.artist_id AS artist_id
+FROM graph.track_credited_on AS track_credited_on
+JOIN graph.same_as AS same_as ON same_as.person_name = track_credited_on.person_name
+WHERE track_credited_on.role_category = ANY(%s)
+"""
+_TRACK_CREDITED_ARTIST_IDS_SQL: Final = """
+SELECT DISTINCT same_as.artist_id AS artist_id
+FROM graph.track_credited_on AS track_credited_on
+JOIN graph.same_as AS same_as ON same_as.person_name = track_credited_on.person_name
+WHERE track_credited_on.role_category = ANY(%s)
+"""
+_TRACK_CREDITED_RELEASE_IDS_SQL: Final = """
+SELECT DISTINCT release_id
+FROM graph.track_credited_on
+WHERE role_category = ANY(%s)
+"""
+
+# Track performers (gm-analytics-engine-x3d). `graph.track_by_artist` is `(release_id,
+# track_ordinal, sub_track_ordinal, track_position, artist_id)` -- the same formal, id-bearing
+# `<artists>` shape `graph.by_artist` reads at release level, read instead from
+# `tracklist[].artists`/`tracklist[].sub_tracks[].artists`, so it carries `artist_id` directly
+# with no name-based `same_as` resolution step, exactly as `graph.by_artist` does.
+#
+# **This is a genuinely different signal from the credited-artist edge above, so it gets its
+# own edge rather than merging with it.** A various-artists compilation's track performer is
+# very often a different artist than whichever name the release itself is credited to --
+# that is the whole reason `by_artist` and `credited_on` are already two separate relations at
+# release level -- and the chw.2 spike keeps the same split: `trackartists` is its own CSR list,
+# disjoint from `credits` (`parse_dump.py`'s `LISTS` and the `_parse_chunk` row tuple never
+# combine them). One row per distinct (release, artist) mirrors the release-level `by_artist`
+# scan, which also does not deduplicate a repeated main-artist row itself -- the `DISTINCT` here
+# only collapses the same artist performing on more than one track of the same release, not
+# anything role- or track-identity-related the way the credited-artist queries collapse role
+# fan-out.
+_TRACK_PERFORMER_EDGE_SQL: Final = "SELECT DISTINCT release_id, artist_id FROM graph.track_by_artist"
+_TRACK_PERFORMER_ARTIST_IDS_SQL: Final = "SELECT DISTINCT artist_id FROM graph.track_by_artist"
+_TRACK_PERFORMER_RELEASE_IDS_SQL: Final = "SELECT DISTINCT release_id FROM graph.track_by_artist"
+
 # (name, query, params, source kind, target kind) for every edge relation that connects two of
 # the six kinds above -- release<->artist/label/master/genre/style and master<->artist/genre/
-# style, plus the release<->artist credited-artist edge ieu.6 added. The first eight are plain
-# table scans, declared in database-schema's `graph.catalog` property graph
-# (docs/architecture.md, "Property graph"); the ninth is a filtered join over two base tables
-# that are not (yet) a `graph.catalog` edge label, so it carries its own query and bind params
-# rather than being built from a bare table/column pair like the others.
+# style, plus the release<->artist credited-artist, track-credited-artist, and track-performer
+# edges ieu.6 and this bead added. The first eight are plain table scans, declared in
+# database-schema's `graph.catalog` property graph (docs/architecture.md, "Property graph");
+# the last three are filtered joins or DISTINCT scans over base tables that are not (yet) a
+# `graph.catalog` edge label, so each carries its own query and bind params rather than being
+# built from a bare table/column pair like the first eight.
 _EDGE_RELATIONS: Final[tuple[tuple[str, str, tuple[Any, ...], str, str], ...]] = (
     ("graph.by_artist", "SELECT release_id, artist_id FROM graph.by_artist", (), "r", "a"),
     ("graph.on_label", "SELECT release_id, label_id FROM graph.on_label", (), "r", "l"),
@@ -213,6 +280,22 @@ _EDGE_RELATIONS: Final[tuple[tuple[str, str, tuple[Any, ...], str, str], ...]] =
     ("graph.master_in_genre", "SELECT master_id, genre_name FROM graph.master_in_genre", (), "m", "g"),
     ("graph.master_in_style", "SELECT master_id, style_name FROM graph.master_in_style", (), "m", "s"),
     ("graph.credited_on", _CREDITED_ARTIST_EDGE_SQL, (list(_KEPT_CREDIT_CATEGORIES),), "r", "a"),
+    ("graph.track_credited_on", _TRACK_CREDITED_ARTIST_EDGE_SQL, (list(_KEPT_CREDIT_CATEGORIES),), "r", "a"),
+    ("graph.track_by_artist", _TRACK_PERFORMER_EDGE_SQL, (), "r", "a"),
+)
+
+# Every vertex-discovery query `_read_vertices` runs beyond `graph.vertex_degree` -- see that
+# function's docstring for why a credited-only or track-only artist or release needs one at
+# all. `kind` says which vertex kind the query's single returned column names ("a" artist, "r"
+# release); `_read_vertices` folds every "a" query's results into the same de-duplicated
+# `artist_ids` list it returns, in the order each id is first seen across all of them.
+_DISCOVERY_QUERIES: Final[tuple[tuple[str, str, tuple[Any, ...], str], ...]] = (
+    ("credited_artist_ids", _CREDITED_ARTIST_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),), "a"),
+    ("credited_release_ids", _CREDITED_RELEASE_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),), "r"),
+    ("track_credited_artist_ids", _TRACK_CREDITED_ARTIST_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),), "a"),
+    ("track_credited_release_ids", _TRACK_CREDITED_RELEASE_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),), "r"),
+    ("track_performer_artist_ids", _TRACK_PERFORMER_ARTIST_IDS_SQL, (), "a"),
+    ("track_performer_release_ids", _TRACK_PERFORMER_RELEASE_IDS_SQL, (), "r"),
 )
 
 # Rows fetched per round trip from a server-side (named) cursor. Bounds how much of one block
@@ -249,9 +332,10 @@ _STORED_VERSION_SEPARATOR: Final = "@"
 # under a different edge set can never land on, get skipped as, or silently overwrite that
 # earlier set's rows -- the two edge sets read a structurally different graph for the same
 # `FastRPConfig` and dump, and must never share a primary-key value. ieu.2 shipped the eight
-# relations in `_EDGE_RELATIONS` before this as (implicitly) "edges-v1"; ieu.6 is "edges-v2",
-# adding the release-level credited-artist relation.
-_EDGE_SET_VERSION: Final = "edges-v2"
+# relations in `_EDGE_RELATIONS` before this as (implicitly) "edges-v1"; ieu.6 added the
+# release-level credited-artist relation as "edges-v2"; this bead (x3d) adds the track-credited-
+# artist and track-performer relations as "edges-v3".
+_EDGE_SET_VERSION: Final = "edges-v3"
 
 
 @dataclass(frozen=True)
@@ -441,6 +525,23 @@ async def _already_loaded(conn: Any, model_version: str) -> bool:
         return await cursor.fetchone() is not None
 
 
+async def _discover_ids(conn: Any, cursor_name: str, query: str, params: tuple[Any, ...]) -> list[str]:
+    """Fetch every id a `_DISCOVERY_QUERIES` entry's single-column query returns, in blocks.
+
+    A thin wrapper so `_read_vertices` runs each discovery query the same way it runs every
+    other named-cursor scan in this module, without repeating the fetch loop once per query.
+    """
+    ids: list[str] = []
+    async with conn.cursor(name=f"embedding_pipeline_{cursor_name}") as cursor:
+        await cursor.execute(query, params)
+        while True:
+            batch = await cursor.fetchmany(_CURSOR_FETCH_SIZE)
+            if not batch:
+                break
+            ids.extend(row[0] for row in batch)
+    return ids
+
+
 async def _read_vertices(conn: Any) -> tuple[NodeIndex, list[str]]:
     """Stream every `(kind, key)` vertex of the six FastRP kinds; return it and the artist ids.
 
@@ -451,18 +552,20 @@ async def _read_vertices(conn: Any) -> tuple[NodeIndex, list[str]]:
 
     `graph.vertex_degree` sums only the ten path-traversal relations database-schema declares
     for it (by_artist, master_by_artist, on_label, in_genre/in_style, master_in_genre/in_style,
-    derived_from, alias_of, artist_member_of) — `credited_on` and `same_as` are deliberately
-    absent from that list. An artist credited only via `extraartists` — never a main artist, an
-    alias, or a group member — therefore has no `graph.vertex_degree` row at all, and the
-    release-level credited-artist edge ieu.6 added (`_CREDITED_ARTIST_EDGE_SQL`) would name a
-    node this pipeline had never seen; the same is true, in principle, of a release asserting
-    only credits and none of the other eight relations. `_CREDITED_ARTIST_IDS_SQL` and
-    `_CREDITED_RELEASE_IDS_SQL` discover exactly those extra artist and release ids, over the
-    same kept-category filter, so every endpoint `_stream_edge_blocks` will later ask
-    `NodeIndex.positions` for already has a node. Both discovery queries are unordered
-    `SELECT DISTINCT`s; the final `np.unique` sorts and dedupes the combined key array, so the
+    derived_from, alias_of, artist_member_of) — `credited_on`, `same_as`, `track_credited_on`,
+    and `track_by_artist` are deliberately absent from that list. An artist credited only via
+    `extraartists` (release- or track-level) — never a main artist, an alias, or a group member
+    — therefore has no `graph.vertex_degree` row at all, and the credited-artist edges
+    (`_CREDITED_ARTIST_EDGE_SQL`, `_TRACK_CREDITED_ARTIST_EDGE_SQL`) or the track-performer edge
+    (`_TRACK_PERFORMER_EDGE_SQL`) would then name a node this pipeline had never seen; the same
+    is true, in principle, of a release asserting only credits or track data and none of the
+    other eight relations. `_DISCOVERY_QUERIES` runs one extra query per artist- or
+    release-shaped gap each of the three added relations can open, over the same kept-category
+    filter the credit queries already use, so every endpoint `_stream_edge_blocks` will later
+    ask `NodeIndex.positions` for already has a node. Every discovery query is an unordered
+    `SELECT DISTINCT`; the final `np.unique` sorts and dedupes the combined key array, so the
     resulting node set (and therefore the resulting embeddings) does not depend on the order
-    PostgreSQL happens to return either of them in.
+    PostgreSQL happens to return any of them in.
     """
     key_chunks: list[NDArray[np.uint64]] = []
     artist_ids: list[str] = []
@@ -479,30 +582,22 @@ async def _read_vertices(conn: Any) -> tuple[NodeIndex, list[str]]:
                     if kind == "a" and key not in seen_artist_ids:
                         seen_artist_ids.add(key)
                         artist_ids.append(key)
-        async with conn.cursor(name="embedding_pipeline_credited_artist_ids") as cursor:
-            await cursor.execute(_CREDITED_ARTIST_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),))
-            while True:
-                batch = await cursor.fetchmany(_CURSOR_FETCH_SIZE)
-                if not batch:
-                    break
-                new_ids = [artist_id for (artist_id,) in batch if artist_id not in seen_artist_ids]
+        for cursor_name, query, params, kind in _DISCOVERY_QUERIES:
+            ids = await _discover_ids(conn, cursor_name, query, params)
+            if kind == "a":
+                new_ids = [artist_id for artist_id in ids if artist_id not in seen_artist_ids]
                 seen_artist_ids.update(new_ids)
                 if new_ids:
-                    key_chunks.append(node_keys(("a", artist_id) for artist_id in new_ids))
+                    key_chunks.append(node_keys((kind, artist_id) for artist_id in new_ids))
                     artist_ids.extend(new_ids)
-        async with conn.cursor(name="embedding_pipeline_credited_release_ids") as cursor:
-            await cursor.execute(_CREDITED_RELEASE_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),))
-            while True:
-                batch = await cursor.fetchmany(_CURSOR_FETCH_SIZE)
-                if not batch:
-                    break
-                key_chunks.append(node_keys(("r", release_id) for (release_id,) in batch))
+            elif ids:
+                key_chunks.append(node_keys((kind, key) for key in ids))
     keys = np.unique(np.concatenate(key_chunks)) if key_chunks else np.zeros(0, dtype=np.uint64)
     return NodeIndex(keys), artist_ids
 
 
 async def _stream_edge_blocks(conn: Any, builder: AdjacencyBuilder) -> None:
-    """Add every edge of the nine relations that connect the six FastRP kinds, in blocks.
+    """Add every edge of the eleven relations that connect the six FastRP kinds, in blocks.
 
     One read-only transaction for the whole scan — see `_read_vertices` on why a named
     cursor needs one.

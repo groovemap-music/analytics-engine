@@ -91,6 +91,15 @@ The 2026-08 dump gives a real count in place of the spike's extrapolation: about
 
 `estimate_peak_bytes(30_000_000, 174_000_000, 6_933_570, block_columns=4, out_itemsize=2)` gives an array estimate of about 7.6 GB (build 3.6 GB, compute 7.6 GB) — lower than the pre-ieu.6 9.4 GB estimate above despite the added edges and artist rows, because the real node/edge counts are themselves lower than the spike's guess. Adding the same roughly 1 GB of interpreter and allocator overhead this document already carries puts the estimated peak RSS at about 8.5 GB, still within the 12 GB budget with headroom to spare. The scaling table's proportions (6.77 undirected edges per node) no longer describe the graph exactly — the credited-artist relation shifts the edge-per-node ratio somewhat — but `estimate_peak_bytes` takes node and edge counts directly, so the estimate above does not depend on that ratio holding.
 
+### Updated for track-level credits and track performers (x3d)
+
+gm-analytics-engine-x3d adds the two track-level relations `gm-database-schema-ug3v` declared: `graph.track_credited_on` (per-track and sub-track `extraartists`, resolved through `graph.same_as` exactly like the release-level relation above) and `graph.track_by_artist` (per-track and sub-track `<artists>` performers, direct `artist_id`, no name resolution). Neither count below is a real-dump measurement of the resolved, catalog-scale graph this pipeline actually builds — that re-measurement is explicitly out of this bead's scope, left to a follow-up maintainer decision alongside the recall/churn re-run `_EDGE_SET_VERSION`'s bump to `"edges-v3"` calls for — but the chw.2 spike's own dump-scale sizing and the exact `gm-database-schema-ug3v` counts give a defensible estimate:
+
+- **Track and sub-track credits.** The chw.2 spike's combined credit scope (release, track, and sub-track `extraartists`, deduplicated into one per-release credit set — see "Track-level credits and track performers (x3d)" below for why this pipeline dedupes the same way) was about 96.5M kept-category credit edges on the 2026-08 dump, against 51.0M for the release-level relation alone. The difference, about 45.5M edges, is the estimated *net-new* contribution of track- and sub-track-level credits once deduplicated against the release-level relation this pipeline already reads — an estimate carried over from the spike's own scope figures, not a `same_as`-resolved measurement against the real catalog.
+- **Track performers.** `graph.track_by_artist` is sized on the real 2026-08 dump at 24,370,971 edges, naming 1,271,244 artists beyond the main-artist set — an exact loader-derived count, not an extrapolation.
+
+Extending the ieu.6 estimate: about 30M + 1.27M ≈ 31.3M nodes, 174M + 45.5M + 24.4M ≈ 243.9M edges, and 6.93M + 1.27M ≈ 8.2M artist rows written (an upper bound: it treats every track-performer artist beyond main as also beyond the 4.07M already-credited-only pool ieu.6 added, which the source data does not yet confirm one way or the other — the true figure is somewhere between 6.93M and 8.2M). `estimate_peak_bytes(31_271_244, 243_870_971, 8_204_814, block_columns=4, out_itemsize=2)` gives an array estimate of about 9.1 GB (build 4.8 GB, compute 9.1 GB). Adding the same roughly 1 GB of interpreter and allocator overhead puts the estimated peak RSS at about 10.1 GB — still within the 12 GB budget, but with markedly less headroom than the 8.5 GB the ieu.6 estimate carried (about 1.9 GB of margin left, against about 3.5 GB before). A real-dump measurement, not this estimate, should confirm the budget still holds before the next monthly load runs under `"edges-v3"`.
+
 ## The monthly load pipeline
 
 `insights/embedding_pipeline.py` is the pipeline the module docstring above defers to: it
@@ -104,15 +113,16 @@ for the grant: `SELECT` on every relation in `graph`, `SELECT, INSERT, UPDATE, D
 `public.artist_embeddings` alone, nothing else.
 
 **Reading the graph.** The pipeline reads the six vertex kinds this module's node identity
-covers (artist, release, label, master, genre, style) from `graph.vertex_degree`, and the nine
+covers (artist, release, label, master, genre, style) from `graph.vertex_degree`, and the eleven
 edge relations that connect them (`graph.by_artist`, `graph.on_label`, `graph.derived_from`,
 `graph.in_genre`, `graph.in_style`, `graph.master_by_artist`, `graph.master_in_genre`,
-`graph.master_in_style`, and — since ieu.6 — the release-level credited-artist relation below) —
-each via a named (server-side) PostgreSQL cursor, fetched in 50,000-row blocks, so the full
-vertex and edge sets are never materialized as Python lists in one piece. `fastrp` is then
-called with the defaults documented above: `out_dtype=np.float16`, `block_columns=4` (the
-default), and `threads=6` — the configuration the scaling table above was measured against,
-which stays within the 12 GB full-catalog budget.
+`graph.master_in_style`, the release-level credited-artist relation ieu.6 added, and — since
+this bead — the track-credited-artist and track-performer relations below) — each via a named
+(server-side) PostgreSQL cursor, fetched in 50,000-row blocks, so the full vertex and edge sets
+are never materialized as Python lists in one piece. `fastrp` is then called with the defaults
+documented above: `out_dtype=np.float16`, `block_columns=4` (the default), and `threads=6` —
+the configuration the scaling table above was measured against, which stays within the 12 GB
+full-catalog budget.
 
 **Release-level credited-artist edges (ieu.6).** The chw.2 spike's adopted FastRP
 configuration includes credit and track edges — "removing credit and track edges costs 10
@@ -165,7 +175,8 @@ the pipeline has not already seen; see that function's docstring.
 when the graph fed into it does. So that a dump reprocessed under a different edge set can
 never land on, be skipped as, or silently overwrite an earlier edge set's rows, the *stored*
 `model_version` composes in a separate `_EDGE_SET_VERSION` tag (`"edges-v1"` before this bead,
-`"edges-v2"` after) — see "The stored `model_version` is per dump, not per algorithm" below.
+`"edges-v2"` after — bumped again, to `"edges-v3"`, by x3d's track-level relations below) — see
+"The stored `model_version` is per dump, not per algorithm" below.
 
 On the 2026-08 dump this relation adds 51,004,385 edges and 5,124,569 distinct credited
 artists, of which 4,072,191 are never a main artist — beyond the 2,861,379 main-artist nodes
@@ -173,6 +184,50 @@ the eight relations above already carry. The full graph is therefore about 30M n
 edges, up from the pre-ieu.6 estimate this document carried before real dump-based counts were
 available (see "Memory and time at catalog scale" below for what that does to the peak-memory
 estimate).
+
+**Track-level credits and track performers (x3d).** `gm-database-schema-ug3v` declared two
+further relations once discogs-sql-loader and database-schema landed the derivation this bead
+was blocked on: `graph.track_credited_on` — `(person_name, release_id, track_ordinal,
+sub_track_ordinal, track_position, role, role_category)`, one row per `tracklist[].extraartists`
+or `tracklist[].sub_tracks[].extraartists` credit — and `graph.track_by_artist` —
+`(release_id, track_ordinal, sub_track_ordinal, track_position, artist_id)`, one row per
+`tracklist[].artists`/`tracklist[].sub_tracks[].artists` performer. Both key a track by
+`(track_ordinal, sub_track_ordinal)`, never by the dump's own `track_position` string: a heading
+entry's position is empty and two entries can share one, so a key built from it would drop the
+first case and collapse the second — the fixtures in
+`tests/integration/test_embedding_pipeline_integration.py` seed exactly that empty-position and
+shared-position shape, a gap left over from the loader bead's own parity fixture.
+
+`graph.track_credited_on` resolves through `graph.same_as` exactly like the release-level
+relation — same kept/dropped category split, same fan-out-on-ambiguity and drop-on-unresolved
+rules (see `_TRACK_CREDITED_ARTIST_EDGE_SQL`'s comment in `insights/embedding_pipeline.py`).
+**This pipeline treats a track-level credit and a release-level credit to the same
+(release, artist) pair as the same edge, not two.** Both assert the same fact — this artist is
+credited on this release — discovered one nesting level apart, and `AdjacencyBuilder` already
+collapses a parallel edge between the same two positions regardless of which `_EDGE_RELATIONS`
+entry contributed it, so registering the track-level query as its own entry reproduces the
+chw.2 spike's own treatment (`design/docs/spikes/gm-design-chw.2/parse_dump.py`: release, track,
+and sub-track extraartists are unioned into one `credits` set per release before it ever becomes
+an edge) without a hand-written `UNION` in SQL. `graph.track_by_artist`, by contrast, is a
+genuinely different signal — a various-artists compilation's track performer is very often a
+different artist than whichever name the release itself is credited to, the same reason
+`by_artist` and `credited_on` are already two separate relations at release level — so it gets
+its own edge, mirroring the spike's own separate `trackartists` list.
+
+`graph.vertex_degree`'s ten path-traversal relations cover neither new relation, so an artist or
+release reachable only through a track-level credit or performer needs the same discovery
+treatment ieu.6 introduced for release-level credits: `_read_vertices` runs one artist- and one
+release-discovery query per new relation (`_TRACK_CREDITED_ARTIST_IDS_SQL`/
+`_TRACK_CREDITED_RELEASE_IDS_SQL`, `_TRACK_PERFORMER_ARTIST_IDS_SQL`/
+`_TRACK_PERFORMER_RELEASE_IDS_SQL`), over the same kept-category filter where one applies, before
+building the node index.
+
+`_EDGE_SET_VERSION` bumps to `"edges-v3"` for these two relations — see "The stored
+`model_version` is per dump and per edge set, not per algorithm" below — and see "Updated for
+track-level credits and track performers (x3d)" above for the resulting node/edge/memory
+estimate. No real-dump re-embedding or recall/churn re-measurement is part of this bead; that is
+a separate, follow-up maintainer decision, the same way ieu.6's real-catalog measurement of the
+release-level relation's fan-out-vs-drop choice was left pending in the section above.
 
 **Lineage.** `SOURCE_DUMP_ID` and `SOURCE_DUMP_DATE` (required, no default — the invoker
 supplies them, since it is the one that knows which dump just landed) become
@@ -194,7 +249,8 @@ earlier revision of this job stored the bare `config.model_version`, which meant
 would silently overwrite the first month's rows in place; see the module docstring's "The
 stored model_version is per dump, not per algorithm" for the full rationale this review caught.
 `_EDGE_SET_VERSION` (`"edges-v1"` before ieu.6, `"edges-v2"` after it added the release-level
-credited-artist relation) applies the identical idea to the graph: bumping it whenever
+credited-artist relation, `"edges-v3"` after x3d added the track-credited-artist and
+track-performer relations) applies the identical idea to the graph: bumping it whenever
 `_EDGE_RELATIONS` changes means a dump reprocessed under a different edge set also lands on its
 own rows rather than colliding with, or being skipped as, the previous edge set's.
 
@@ -245,13 +301,22 @@ procedure) is a deployment-repo concern this bead does not fix; filed as gm-depl
 
 **Testing.** `tests/test_embedding_pipeline.py` exercises the real FastRP/graph code against
 small in-memory fakes of the PostgreSQL connection — no database, no Docker, including that two
-dumps under one config get different stored versions rather than one upserting the other.
+dumps under one config get different stored versions rather than one upserting the other, and,
+for x3d, that a track-level credit resolving to the same `(release, artist)` pair a release-level
+credit already named adds no extra degree to either endpoint — the dedup decision this document
+and `_TRACK_CREDITED_ARTIST_EDGE_SQL`'s comment describe, asserted directly against the real
+`AdjacencyBuilder`.
 `tests/integration/test_embedding_pipeline_integration.py` (`just test-integration-pg19`) runs
 against a real PostgreSQL 19 + pgvector container with a real `embedding_pipeline`-scoped
 login, asserting the idempotency, coexistence, and permission-boundary behavior above against
 the engine itself — including that an earlier dump's rows are byte-for-byte unchanged after a
-later dump loads — on a small synthetic graph. That tier's `conftest.py` applies the real ADR
-0013 schema objects via a pinned `groovemap-database-schema` dev dependency's own
-`create_postgres_schema` (gm-analytics-engine-qzl), the same way `catalog-api` applies it; see
-that `conftest.py`'s module docstring for the pinned revision. Neither test tier commits
-provider-derived data or real embeddings, per ADR 0013's data-rights section.
+later dump loads — on a small synthetic graph, plus, for x3d, the real `graph.track_credited_on`/
+`graph.track_by_artist` shape: a `track_position` of `NULL` (an empty string in the dump) and two
+entries sharing one `track_position` across distinct `track_ordinal`s — a gap left by the loader
+bead's own parity fixture, since `track_ordinal`/`sub_track_ordinal`, not `track_position`, are
+the real primary-key columns — plus artist and release discovery for both new relations against
+the real schema. That tier's `conftest.py` applies the real ADR 0013 schema objects via a pinned
+`groovemap-database-schema` dev dependency's own `create_postgres_schema` (gm-analytics-engine-qzl),
+the same way `catalog-api` applies it; see that `conftest.py`'s module docstring for the pinned
+revision. Neither test tier commits provider-derived data or real embeddings, per ADR 0013's
+data-rights section.
