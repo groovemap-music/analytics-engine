@@ -503,3 +503,164 @@ The throwaway `gm-ieu3-measure-pg` container and its dangling volumes were remov
 quality on the chw.2 proxy benchmark) needs them next. Nothing provider-derived is
 committed to this repository; only this document, the two measurement scripts, and the
 aggregate numbers above are.
+
+## Tie-tolerant recall, duplicate-group breakdown, and over-fetch + re-rank (gm-analytics-engine-kn3)
+
+Status: **complete**, except the degree-bucket breakdown (see "Degree-bucket gap" below).
+
+Maintainer decision 2026-09-26 (option A, step 1), following up on the "Recall and tie
+structure" finding above: strict recall@10 undercounts equally-correct neighbours whenever
+a query's true top-10 boundary sits inside a tie or near-tie — already shown above to be
+common (38.7% of vectors are exact duplicates; 17.5% of the 2,000-query sample has an
+exact tie at/adjacent to the 10th place). This measurement quantifies how much strict
+recall is undercounting, on the same September real embeddings (`sept.npz`, edges-v2,
+ieu.6) and the same deterministic 2,000-query sample (seed `1_374_462_234` = `0x51ECA11A`,
+`QUERY_SAMPLE_SIZE = 2000`) ieu.3 already used. Script:
+`scripts/measure_tie_tolerant_recall.py`, reusing ieu.3's own harness
+(`measure_recall_churn.py`, imported as a sibling module, not copied) for the real DDL,
+`_write_embeddings`, and the per-`model_version` partial HNSW index.
+
+**Tie-tolerant definition**, per the maintainer's ask: an ANN-returned candidate counts as
+a hit if its own exact cosine similarity to the query is ≥ the query's exact 10th-place
+cosine score − 1e-4 — not "is one of the exact top-10 ids" (what strict recall requires),
+which a tied 11th/12th/... place candidate fails even though it is equally correct.
+
+### Model-version labelling pitfall
+
+`insights.embedding_pipeline._EDGE_SET_VERSION` is a shared, still-moving constant — it
+was `"edges-v2"` when ieu.6/ieu.3 ran, but gm-analytics-engine-x3d has since bumped it to
+`"edges-v3"` (adds track-credited-artist/track-performer relations neither `sept.npz` nor
+this measurement's graph ever had). `measure_recall_churn.py`'s `_load_month` composes
+`model_version` via `stored_model_version(FastRPConfig(), dump_id)`, which reads whatever
+`_EDGE_SET_VERSION` **is at measurement time**, not at npz-*computation* time. Running
+this bead's script unmodified against `sept.npz` therefore silently mislabelled every row
+it wrote as `edges-v3`, even though the vectors are the same edges-v2 ones ieu.3 already
+measured — caught before submit. `scripts/measure_tie_tolerant_recall.py` now pins
+`_PINNED_EDGE_SET_VERSION = "edges-v2"` explicitly rather than trusting the live module
+constant; a verification run confirmed the pinned value reproduces ieu.3's exact recorded
+string byte for byte: `fastrp-v1:dim=128:weights=0,1,1,1,1:beta=0:proj=achlioptas-s3:
+rows=splitmix64(blake2b64(kind,key)):seed=20260924:edges-v2@discogs_20260901`. The numbers
+below are from this bead's real (first) measurement run, whose recorded `model_version`
+was corrected post hoc in `tie_tolerant_recall.json` (a `model_version_correction` field
+there explains it) — the mislabeling never affected the measurement itself, only a string
+that run's own throwaway table/index used consistently and privately; its `index_name`
+still embeds a hash of the original (wrong) string, cosmetic only. **Anyone re-running this
+class of script against an older `.npz` should pin the edge-set version the same way, not
+derive it from the live pipeline module.**
+
+### Setup
+
+This bead's own throwaway container (`gm-analytics-engine-kn3-pg`, removed after the run),
+`database-schema-postgres19-pgvector:local`, `--shm-size 9g`,
+`max_parallel_maintenance_workers=4`, `maintenance_work_mem=8GB` for the index build — the
+same parameters the "HNSW build" section above settled on. 6,896,892 September rows
+written (100k-row trial: 15.5s; remainder 1,081.4s; no `COPY` fallback needed), HNSW index
+(`m=16, ef_construction=64`) built in 616.9s.
+
+### Strict vs. tie-tolerant recall@10
+
+| `ef_search` | Strict recall@10 | Tie-tolerant recall@10 | Δ (tie − strict) |
+| --- | ---: | ---: | ---: |
+| 40 | 0.5955 | 0.6208 | +0.0253 |
+| 100 | 0.6779 | 0.7066 | +0.0287 |
+| 200 | 0.7370 | 0.7688 | +0.0317 |
+| 400 | 0.7842 | 0.8206 | +0.0364 |
+| 800 | 0.8310 | 0.8662 | +0.0352 |
+| 1000 | **0.8408** | **0.8778** | +0.0370 |
+
+Strict recall@10 at `ef_search=1000` reproduces ieu.3's recorded September value (0.8405)
+closely — 0.8408, a ~0.6-query difference out of 2,000, within normal HNSW build-order
+noise (parallel-worker insertion order isn't fixed run to run). Tie tolerance recovers a
+consistent 2.5–3.7 points of recall at every swept `ef_search`, growing slightly as
+`ef_search` increases — the ANN index is finding genuinely tied-or-near-tied neighbours it
+is being strictly marked wrong for, not missing them.
+
+### Breakdown by duplicate-group size
+
+Each query's own exact-duplicate-group size (byte-identical vector compare, over all of
+September's 6,896,892 vectors — 2,670,779 (38.7%) are exact duplicates of at least one
+other, matching ieu.3's August figure), bucketed {1 (unique), 2-4, 5-20, 21+}. Bucket
+sizes, of the 2,000-query sample: 1 (unique) n=1,226; 2-4 n=454; 5-20 n=268; 21+ n=52.
+
+| `ef_search` | 1 (unique) strict | 1 (unique) tie | 2-4 strict | 2-4 tie | 5-20 strict | 5-20 tie | 21+ strict | 21+ tie |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 40 | 0.6483 | 0.6586 | 0.5057 | 0.5104 | 0.5918 | 0.6280 | 0.1519 | 0.6538 |
+| 100 | 0.7237 | 0.7352 | 0.6090 | 0.6145 | 0.6784 | 0.7194 | 0.1962 | 0.7692 |
+| 200 | 0.7834 | 0.7953 | 0.6773 | 0.6837 | 0.7287 | 0.7735 | 0.2096 | 0.8615 |
+| 400 | 0.8281 | 0.8410 | 0.7425 | 0.7507 | 0.7757 | 0.8243 | 0.1577 | 0.9308 |
+| 800 | 0.8692 | 0.8821 | 0.7998 | 0.8088 | 0.8272 | 0.8713 | 0.2250 | 0.9692 |
+| 1000 | 0.8796 | 0.8929 | 0.8176 | 0.8269 | 0.8299 | 0.8769 | 0.1865 | 0.9692 |
+
+**The "21+" bucket (queries whose own vector sits in a duplicate group of 21 or more) is
+the headline finding here.** Its strict recall@10 is uniformly low (0.15–0.23, barely
+improving with `ef_search`) — but its tie-tolerant recall@10 is the *highest* of any bucket
+(0.65–0.97, reaching 0.97 at `ef_search ≥ 800`). This is exactly the mechanism the "Recall
+and tie structure" finding above predicted: for these queries, dozens of vectors are
+equally, exactly correct top-10 members, so "the" exact top-10 ordering pgvector's HNSW and
+this script's brute-force NumPy computation independently arrive at is close to arbitrary
+(both are valid; they just don't have to agree with each other) — strict recall punishes
+that disagreement as a miss even when it isn't one. The 2-4 and 5-20 buckets sit between
+the unique and 21+ buckets and do not move monotonically with group size (5-20 slightly
+out-recalls 2-4 at most `ef_search` values); sample sizes for these buckets (454 and 268
+queries respectively) are small enough that this is plausibly noise rather than a real
+non-monotonicity, and this bead did not chase it further.
+
+### Over-fetch + exact re-rank
+
+For k' ∈ {50,100,200} at `ef_search` ∈ {100,200,400}: fetch k' ANN candidates (`LIMIT
+k'+1`, self excluded client-side, same convention as the base recall sweep), re-rank them
+by exact cosine (September's vectors already resident in memory — no second Postgres round
+trip for the exact side), take the top 10 of the re-ranked list:
+
+| `ef_search` | k' | Strict recall@10 | Tie-tolerant recall@10 | Mean latency | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 50 | 0.6776 | 0.7066 | 21.95 ms | 20.51 ms | 34.94 ms | 49.86 ms |
+| 100 | 100 | 0.6774 | 0.7066 | 27.24 ms | 23.04 ms | 53.44 ms | 103.10 ms |
+| 100 | 200 | 0.6779 | 0.7066 | 28.36 ms | 24.96 ms | 49.99 ms | 82.79 ms |
+| 200 | 50 | 0.7383 | 0.7688 | 50.87 ms | 44.28 ms | 94.81 ms | 140.73 ms |
+| 200 | 100 | 0.7384 | 0.7688 | 31.58 ms | 28.79 ms | 52.00 ms | 79.41 ms |
+| 200 | 200 | 0.7384 | 0.7688 | 26.80 ms | 25.78 ms | 37.22 ms | 48.07 ms |
+| 400 | 50 | 0.7869 | 0.8206 | 37.75 ms | 36.94 ms | 49.74 ms | 71.22 ms |
+| 400 | 100 | 0.7864 | 0.8206 | 36.96 ms | 36.97 ms | 45.95 ms | 54.71 ms |
+| 400 | 200 | 0.7863 | 0.8206 | 45.99 ms | 43.54 ms | 66.65 ms | 104.22 ms |
+
+**Over-fetching at a fixed `ef_search` does not meaningfully improve recall.** At every
+swept `ef_search`, strict and tie-tolerant recall@10 barely move across k' = 50/100/200
+(largest strict shift: +0.0013, at `ef_search=200`; tie-tolerant is flat to 4 decimal
+places within an `ef_search`). Recall is governed by `ef_search` — how much of the HNSW
+graph gets explored — not by k' — how many of the already-explored candidates get returned
+and re-ranked. The (tiny) k'=50 gain over the plain ef-sweep at the same `ef_search` (e.g.
+strict 0.7383 vs. 0.7370 at `ef_search=200`) is consistent with exact re-ranking recovering
+a little precision pgvector's native `halfvec`-throughout HNSW distance loses relative to
+the float32-upcast exact computation, among candidates already retrieved — not with
+over-fetching finding new, better candidates the original top-10 missed. Latency (the
+single ANN round trip dominates; the NumPy re-rank itself is negligible) scales with
+`ef_search`, not cleanly with k' — the per-run variance visible here (e.g.
+`ef_search=200, k'=50` at 50.87ms mean vs. `k'=200` at 26.80ms) reflects ordinary
+container/host noise during this run rather than a real k'-latency relationship; no attempt
+was made to control for that noise (this bead reports what ran, not a controlled latency
+benchmark).
+
+### Degree-bucket gap
+
+**Not attempted in this bead.** A breakdown by the query artist's graph degree needs
+`insights.embeddings.graph.Adjacency.degree`, only available as a byproduct of
+`scripts/embeddings_from_dump.py`'s full 9-relation graph build, which needs September's
+`releases.xml.gz` dump. Only `artists`/`masters`/`labels` (~1.1 GB combined) were cached
+locally at `~/.cache/groovemap-spikes/dumps/`; `releases.xml.gz` (19.4M records — masters
+alone is 597 MB compressed for 2.6M records, so releases is plausibly several GB) was not,
+and this host's disk floor was already breached by other concurrent work before this bead
+started. Downloading it to compute degree would have made that worse. Flagged to the
+dispatcher rather than approximating a degree metric; per the dispatcher,
+gm-analytics-engine-x3d/gm-analytics-engine-i37 (which already streams and parses the
+September graph for its own purposes) will produce real per-artist degree as a natural
+byproduct, so this breakdown is deferred there rather than repeated here.
+
+### Cleanup
+
+The throwaway `gm-analytics-engine-kn3-pg` container was removed after the run.
+`sept.npz` was read-only throughout (never modified or deleted — shared with other beads
+reading the same scratch directory). Output:
+`~/.cache/groovemap-spikes/embeddings-scratch/tie_tolerant_recall.json` (aggregates only,
+plus the query-sample seed/rule for reproducibility); nothing provider-derived is committed
+to this repository.
