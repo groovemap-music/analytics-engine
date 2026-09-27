@@ -46,13 +46,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import json
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 import numpy as np
 from common import AsyncPostgreSQLPool
@@ -78,14 +79,73 @@ EF_SEARCH_SWEEP: tuple[int, ...] = (40, 100, 200, 400, 800, 1000)  # pgvector ca
 RECALL_TARGET: float = 0.95
 HNSW_M: int = 16
 HNSW_EF_CONSTRUCTION: int = 64
+# The larger-index variant the maintainer approved alongside i37's w0 sweep (kn3's edges-v2
+# Sept measurement, now merged as docs/recall_and_churn.md's "Recall and tie structure":
+# tie-tolerant recall tops out at 0.8778 at ef_search=1000, over-fetch+re-rank gains nothing
+# over the index at the same ef_search -- so index size and w0 are what's left to try).
+# Same `halfvec_cosine_ops`, same `maintenance_work_mem`/parallel-worker settings as the
+# standard variant; only `m`/`ef_construction` differ.
+HNSW_LARGER_M: int = 32
+HNSW_LARGER_EF_CONSTRUCTION: int = 128
+# `--skip-larger-variant`'s real finding, real enough to record even though the build never
+# finished (maintainer decision, 2026-09-27): September's m=32 build for w0=0 overflowed
+# maintenance_work_mem=8GB at ~6.1M of 9,366,416 tuples and fell to the on-disk build path
+# (workers on IO/DataFileRead, ~80 tuples/s), abandoned after ~4h50m -- finishing would take
+# ~8h per build, repeated per w0 and again for the winner run. That overflow, not a completed
+# measurement, IS the recorded outcome for the larger-index variant at this catalog scale.
+LARGER_VARIANT_SKIP_REASON: str = (
+    "September's m=32 build for w0=0 overflowed maintenance_work_mem=8GB at ~6.1M of 9,366,416 tuples and fell to the "
+    "on-disk build path (~80 tuples/s); finishing would take ~8h per build, repeated per w0 and again for the winner "
+    "run. Skipped per the maintainer's decision (2026-09-27); the overflow itself is the finding -- see "
+    "larger_variant_finding in the top-level results."
+)
 DEFAULT_MAINTENANCE_WORK_MEM: str = "2GB"  # database-schema's documented build-time value.
 TRIAL_BATCH_ROWS: int = 100_000
 TRIAL_TIME_BUDGET_S: float = 30 * 60  # 30 minutes, per the maintainer's condition.
+
+# The maintainer's tie-tolerant recall definition (docs/recall_and_churn.md, "Recall and tie
+# structure"): count an ANN top-10 candidate as a hit even when it's outside the EXACT top-10,
+# as long as its own exact cosine similarity is within this much of the exact 10th-place
+# score -- a large share of this graph's top-10 boundaries are ties or near-ties (FastRP's
+# zero-weight-on-self-projection artifact), so part of strict recall's "misses" are really
+# the ANN index and the brute-force exact computation each validly picking a different member
+# of a tied group, not a genuinely worse neighbour.
+TIE_TOLERANCE: Final = 1e-4
+
+# Power-of-two degree-bucket edges for gm-analytics-engine-i37's recall-by-degree breakdown
+# (kn3's measurement has no graph, so it can't compute this itself). FastRP's propagation is
+# degree-sensitive by construction -- a hub's embedding averages over far more neighbours
+# than a leaf's -- so recall is a-priori expected to vary by degree; these boundaries are a
+# reasonable default pending maintainer feedback, not a tuned choice.
+DEGREE_BUCKET_EDGES: Final[tuple[int, ...]] = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 
 # Resolved once to a full path, matching this repo's own `GIT = shutil.which("git")`
 # convention (tests/test_repository_compliance.py) -- S607 wants a full executable path,
 # not a bare name resolved via $PATH at call time.
 DOCKER: Final = shutil.which("docker") or "docker"
+
+DOCKER_POLL_INTERVAL_S: Final = 60.0
+
+
+def wait_for_docker(*, poll_interval_s: float = DOCKER_POLL_INTERVAL_S) -> None:
+    """Block until `docker info` succeeds, polling and logging while waiting -- so the
+    recall/churn phase never fails outright just because Docker (or Colima's VM under it)
+    isn't up yet or is between containers when this script starts. Called once, at the very
+    top of `main_async`, before this script assumes it can talk to a container at all --
+    every other Docker interaction here (`_restart_container`, the throwaway container
+    `main()`'s caller starts) happens after this point.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        result = subprocess.run([DOCKER, "info"], capture_output=True)  # noqa: S603 -- DOCKER is a resolved full path (S607), no arguments.
+        if result.returncode == 0:
+            print(f"✅ Docker is reachable (attempt {attempt})", file=sys.stderr, flush=True)
+            return
+        stderr_tail = result.stderr.decode(errors="replace").strip().splitlines()[-1:] or [""]
+        print(f"⏳ Docker not reachable yet ({stderr_tail[0]}) -- waiting {poll_interval_s:.0f}s (attempt {attempt})", file=sys.stderr, flush=True)
+        time.sleep(poll_interval_s)
+
 
 _VECTOR_EXTENSION_SQL = "CREATE EXTENSION IF NOT EXISTS vector"
 
@@ -127,16 +187,35 @@ def _load_month(path: Path) -> dict[str, Any]:
     with np.load(path, allow_pickle=True) as data:
         method_version = str(data["model_version"])
         dump_id = str(data["dump_id"])
-        default_method_version = FastRPConfig().model_version
-        if method_version != default_method_version:
+        # `weights` (gm-analytics-engine-i37's w0 sweep, weights=w0,1,1,1,1): the actual tuple
+        # `embeddings_from_dump.py`'s `FastRPConfig` was built from for THIS file, not always
+        # `FastRPConfig()`'s w0=0 default -- a file from the sweep's w0=0.1 or w0=0.25 run has
+        # a genuinely different `model_version`, and reconstructing `config` from the saved
+        # weights (rather than assuming the default and rejecting anything else, this script's
+        # pre-sweep behaviour) is what lets `stored_model_version` below compose the SAME
+        # string for this file's own weights, whichever they are. An older npz without a
+        # `weights` array predates the sweep and used the w0=0 default throughout.
+        weights = tuple(data["weights"].tolist()) if "weights" in data else FastRPConfig().weights
+        config = FastRPConfig(weights=weights)
+        if method_version != config.model_version:
             raise ValueError(
-                f"{path}: saved method_version {method_version!r} does not match the current "
-                f"FastRPConfig() default {default_method_version!r} -- this script assumes the npz "
-                "was produced with the same defaults it reconstructs stored_model_version from."
+                f"{path}: saved method_version {method_version!r} does not match "
+                f"FastRPConfig(weights={weights}).model_version {config.model_version!r} reconstructed from "
+                "this same file's saved weights -- the npz is inconsistent with itself."
+            )
+        # `degrees` (i37's degree-bucketed recall breakdown): each artist's undirected degree
+        # in this month's graph, position-aligned with `artist_ids`/`vectors` -- this script
+        # has no graph of its own, so a file saved before this bead (no `degrees` array) just
+        # skips the degree breakdown rather than failing outright.
+        degrees = data.get("degrees", None)
+        if degrees is None:
+            print(
+                f"⚠️  {path}: no saved `degrees` array (predates gm-analytics-engine-i37) -- degree-bucketed recall will be skipped", file=sys.stderr
             )
         return {
             "artist_ids": [str(aid) for aid in data["artist_ids"]],
             "vectors": data["vectors"],
+            "degrees": degrees,
             # `embeddings_from_dump.py` saves the bare `FastRPConfig.model_version`
             # (`method_version` here), not production's *stored* value -- it never imports
             # `stored_model_version` at all. Composing it here, the same way production
@@ -146,28 +225,44 @@ def _load_month(path: Path) -> dict[str, Any]:
             # both), which would collide on `_index_name`'s composed index name too --
             # Sept's `CREATE INDEX IF NOT EXISTS` would then silently no-op against
             # Aug's (by-then-truncated, so empty) index instead of building a real one.
-            # Caught before this ran end to end against real data.
+            # Caught before this ran end to end against real data. `config` (not always the
+            # w0=0 default any more) is what keeps two DIFFERENT w0 sweep runs of the SAME
+            # month from colliding on that index name too.
             "method_version": method_version,
-            "model_version": stored_model_version(FastRPConfig(), dump_id),
+            "model_version": stored_model_version(config, dump_id),
             "dump_id": dump_id,
             "dump_date": str(data["dump_date"]),
         }
 
 
-def _exact_top_k(vectors: np.ndarray, query_positions: list[int], k: int) -> list[list[int]]:
-    """Exact top-`k` cosine neighbours (by position, excluding self) for each query
-    position, brute-force in NumPy against every row of VECTORS."""
+def _normalized(vectors: np.ndarray) -> np.ndarray:
+    """L2-normalize every row to unit length, float32. A zero row (no propagated signal
+    reaches an isolated vertex) is left as all-zeros rather than divided by zero."""
     norms = np.linalg.norm(vectors.astype(np.float32), axis=1)
     norms[norms == 0] = 1.0
-    normalized = vectors.astype(np.float32) / norms[:, None]
+    return vectors.astype(np.float32) / norms[:, None]
+
+
+def _exact_top_k(normalized: np.ndarray, query_positions: list[int], k: int) -> tuple[list[list[int]], list[float]]:
+    """Exact top-`k` cosine neighbours (by position, excluding self) for each query
+    position, brute-force in NumPy against every row of NORMALIZED, plus each query's exact
+    k-th-place (last) score -- `_tie_tolerant_recall_at_k` needs that threshold, and it costs
+    nothing extra to return alongside the top-k this function already computes.
+
+    Takes an already-`_normalized` matrix (not raw vectors) so a caller sweeping several
+    `ef_search` values, or also scoring arbitrary ANN candidates for tie-tolerance, normalizes
+    the month's vectors ONCE rather than once per use.
+    """
     results: list[list[int]] = []
+    kth_scores: list[float] = []
     for position in query_positions:
         scores = normalized @ normalized[position]
         scores[position] = -np.inf  # exclude self
         top = np.argpartition(-scores, k)[:k]
         top = top[np.argsort(-scores[top])]
         results.append(top.tolist())
-    return results
+        kth_scores.append(float(scores[top[-1]]) if len(top) else float("-inf"))
+    return results, kth_scores
 
 
 async def _apply_schema(conn: Any) -> None:
@@ -306,7 +401,9 @@ async def _write_month(conn: Any, month: dict[str, Any]) -> dict[str, Any]:
     return {"rows_written": rows_written, "trial_elapsed_s": trial_elapsed, "extrapolated_full_s": extrapolated_s, "used_copy": used_copy}
 
 
-async def _build_index(conn: Any, model_version: str, maintenance_work_mem: str) -> dict[str, Any]:
+async def _build_index(
+    conn: Any, model_version: str, maintenance_work_mem: str, *, m: int = HNSW_M, ef_construction: int = HNSW_EF_CONSTRUCTION
+) -> dict[str, Any]:
     """Build the full-scale HNSW index for MODEL_VERSION's rows, named by `_index_name`.
 
     A per-`model_version` PARTIAL index (`WHERE model_version = ...`), exactly the shape
@@ -327,6 +424,14 @@ async def _build_index(conn: Any, model_version: str, maintenance_work_mem: str)
     session-only `SET`, reverted after, matching `database-schema.build_artist_embeddings_
     index`'s own pattern -- the caller decides the value (August's first attempt used the
     documented 2GB; both months' final runs use more -- see docs/recall_and_churn.md).
+
+    `m`/`ef_construction` default to the standard variant (`HNSW_M`/`HNSW_EF_CONSTRUCTION`);
+    the caller passes `HNSW_LARGER_M`/`HNSW_LARGER_EF_CONSTRUCTION` for the larger-index
+    variant (gm-analytics-engine-i37's maintainer-approved addition) instead. Since
+    `_index_name` keys only on `model_version`, not on `m`/`ef_construction`, the two variants
+    can never coexist under the same name -- exactly the point: they're built, measured, and
+    dropped one at a time (`measure_index_variant`), never together, to keep Colima's VM
+    within its memory budget.
     """
     index_name = _index_name(model_version)
     async with conn.cursor() as cursor:
@@ -340,12 +445,29 @@ async def _build_index(conn: Any, model_version: str, maintenance_work_mem: str)
         # this exact WHERE clause) escapes it as a literal instead.
         await cursor.execute(
             f"CREATE INDEX IF NOT EXISTS {index_name} ON {ARTIST_EMBEDDINGS_TABLE} "
-            f"USING hnsw (embedding halfvec_cosine_ops) WITH (m = {HNSW_M}, ef_construction = {HNSW_EF_CONSTRUCTION}) "
+            f"USING hnsw (embedding halfvec_cosine_ops) WITH (m = {m}, ef_construction = {ef_construction}) "
             f"WHERE model_version = {_sql_string_literal(model_version)}"
         )
         elapsed = time.perf_counter() - started
         await cursor.execute("RESET maintenance_work_mem")
-    return {"index_name": index_name, "build_elapsed_s": elapsed, "maintenance_work_mem": maintenance_work_mem}
+    return {
+        "index_name": index_name,
+        "build_elapsed_s": elapsed,
+        "maintenance_work_mem": maintenance_work_mem,
+        "m": m,
+        "ef_construction": ef_construction,
+    }
+
+
+async def _index_size_bytes(conn: Any, model_version: str) -> int:
+    """The live index's on-disk size in bytes (`pg_relation_size`) -- part of the
+    maintainer-approved standard-vs-larger-variant comparison (index size is a real cost, not
+    just a build-time one)."""
+    index_name = _index_name(model_version)
+    async with conn.cursor() as cursor:
+        await cursor.execute(f"SELECT pg_relation_size({_sql_string_literal(index_name)}::regclass)")
+        (size,) = await cursor.fetchone()
+    return int(size)
 
 
 async def _drop_index(conn: Any, model_version: str) -> None:
@@ -360,7 +482,15 @@ async def _drop_index(conn: Any, model_version: str) -> None:
 
 
 async def _ann_top_k(
-    conn: Any, model_version: str, vectors: np.ndarray, artist_ids: list[str], positions: list[int], ef_search: int, k: int
+    conn: Any,
+    model_version: str,
+    vectors: np.ndarray,
+    artist_ids: list[str],
+    positions: list[int],
+    ef_search: int,
+    k: int,
+    *,
+    latencies_ms: list[float] | None = None,
 ) -> list[list[str] | None]:
     """The live index's top-`k` artist_ids for each query position's vector, at EF_SEARCH.
 
@@ -379,21 +509,37 @@ async def _ann_top_k(
     Same shape catalog-api's own kNN endpoint (gm-catalog-api-2zsq) will need for its
     self-exclusion, there behind a `model_version`-filtered *partial* index instead of this
     script's whole-table one -- see docs/recall_and_churn.md.
+
+    `latencies_ms`, if given, gets one entry appended per query -- wall time for that single
+    round trip (execute + fetch), in milliseconds -- for `measure_index_variant`'s mean/p95
+    per-query latency report (gm-analytics-engine-i37's maintainer-approved index-variant
+    comparison). `None` (the default, and what every pre-existing caller still gets) skips
+    the timing calls entirely rather than paying for a throwaway list.
     """
     results: list[list[str] | None] = []
     async with conn.cursor() as cursor:
         await cursor.execute(f"SET hnsw.ef_search = {int(ef_search)}")
         for position in positions:
             literal = "[" + ",".join(f"{value:g}" for value in vectors[position].tolist()) + "]"
+            query_started = time.perf_counter() if latencies_ms is not None else None
             await cursor.execute(
                 f"SELECT artist_id FROM {ARTIST_EMBEDDINGS_TABLE} "  # noqa: S608
                 f"WHERE model_version = %s ORDER BY embedding <=> %s::halfvec LIMIT %s",
                 (model_version, literal, k + 1),
             )
             rows = await cursor.fetchall()
+            if query_started is not None:
+                latencies_ms.append((time.perf_counter() - query_started) * 1000.0)  # type: ignore[union-attr]
             own_id = artist_ids[position]
             results.append([artist_id for (artist_id,) in rows if artist_id != own_id][:k])
     return results
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    """Linear-interpolation percentile, matching `numpy.percentile`'s default -- pulled out to
+    a plain function so a caller with a `list[float]` (latency samples) doesn't need to build
+    a NumPy array just to ask for one number."""
+    return float(np.percentile(np.asarray(values, dtype=np.float64), pct)) if values else 0.0
 
 
 def _recall_at_k(ann: list[list[str]], exact_ids: list[list[str]], k: int) -> float:
@@ -406,11 +552,247 @@ def _recall_at_k(ann: list[list[str]], exact_ids: list[list[str]], k: int) -> fl
     return sum(scores) / len(scores) if scores else 0.0
 
 
+def _tie_tolerant_recall_at_k(
+    ann: list[list[str]],
+    exact_ids: list[list[str]],
+    kth_scores: list[float],
+    query_positions: list[int],
+    normalized: np.ndarray,
+    id_to_position: dict[str, int],
+    k: int,
+) -> float:
+    """`_recall_at_k`'s tie-tolerant counterpart (see `TIE_TOLERANCE`'s docstring for the
+    definition): an ANN candidate outside the exact top-`k` still counts as a hit when its
+    own exact cosine similarity to the query is within `TIE_TOLERANCE` of `kth_scores`, the
+    exact k-th-place score `_exact_top_k` already computed for that same query.
+
+    An ANN candidate this month's `id_to_position` doesn't recognise (shouldn't happen --
+    both come from the same month's `artist_ids` -- but the ANN index is a live, separately-
+    queried system) is treated as a miss rather than raising, the same permissive stance
+    `_recall_at_k`'s plain set-intersection already takes toward an ANN id absent from the
+    exact top-`k`.
+    """
+    scores = []
+    for ann_ids, exact, kth_score, query_position in zip(ann, exact_ids, kth_scores, query_positions, strict=True):
+        if not exact:
+            continue
+        exact_set = set(exact[:k])
+        hits = 0
+        for candidate in ann_ids[:k]:
+            if candidate in exact_set:
+                hits += 1
+                continue
+            candidate_position = id_to_position.get(candidate)
+            if candidate_position is None:
+                continue
+            candidate_score = float(normalized[candidate_position] @ normalized[query_position])
+            if candidate_score >= kth_score - TIE_TOLERANCE:
+                hits += 1
+        scores.append(hits / min(k, len(exact)))
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _degree_bucket_label(degree: int) -> str:
+    """A human-readable power-of-two bucket label for one artist's undirected graph degree,
+    e.g. ``"4-7"``, ``"256+"`` -- see `DEGREE_BUCKET_EDGES`."""
+    if degree < DEGREE_BUCKET_EDGES[0]:
+        return "0"
+    for lo, hi in itertools.pairwise(DEGREE_BUCKET_EDGES):
+        if lo <= degree < hi:
+            return f"{lo}-{hi - 1}"
+    return f"{DEGREE_BUCKET_EDGES[-1]}+"
+
+
+def _degree_bucket_sort_key(label: str) -> int:
+    """Numeric sort key for a `_degree_bucket_label` string: its own lower bound (``"0"`` ->
+    0, ``"4-7"`` -> 4, ``"256+"`` -> 256) -- a plain string sort would put ``"128-255"``
+    before ``"16-31"`` (lexical, not numeric, order)."""
+    return int(label.rstrip("+").split("-")[0])
+
+
+def _recall_by_degree_bucket(
+    ann_ids_by_query: list[list[str]],
+    exact_ids_by_query: list[list[str]],
+    kth_scores: list[float],
+    query_positions: list[int],
+    degrees: np.ndarray | None,
+    normalized: np.ndarray,
+    id_to_position: dict[str, int],
+    k: int,
+) -> dict[str, dict[str, Any]] | None:
+    """Strict and tie-tolerant recall@`k`, grouped by the QUERY artist's degree bucket in
+    THIS month's graph (gm-analytics-engine-i37: kn3's own measurement has no graph, hence no
+    degree, to compute this from). Free of any extra ANN queries -- it re-groups the SAME
+    per-query `ann_ids_by_query`/`exact_ids_by_query` rows the caller's `ef_search` sweep
+    already fetched for the full query sample, it never re-queries the index.
+
+    Returns `None` (rather than an empty dict) when `degrees` itself is `None` -- an npz
+    saved before this bead -- so a caller can tell "not computed" apart from "computed, but
+    every bucket happened to be empty".
+    """
+    if degrees is None:
+        return None
+    buckets: dict[str, list[int]] = {}
+    for index, position in enumerate(query_positions):
+        buckets.setdefault(_degree_bucket_label(int(degrees[position])), []).append(index)
+    result: dict[str, dict[str, Any]] = {}
+    for label, indices in sorted(buckets.items(), key=lambda item: _degree_bucket_sort_key(item[0])):
+        ann_subset = [ann_ids_by_query[i] for i in indices]
+        exact_subset = [exact_ids_by_query[i] for i in indices]
+        kth_subset = [kth_scores[i] for i in indices]
+        positions_subset = [query_positions[i] for i in indices]
+        result[label] = {
+            "n": len(indices),
+            "recall_strict": _recall_at_k(ann_subset, exact_subset, k),
+            "recall_tie_tolerant": _tie_tolerant_recall_at_k(ann_subset, exact_subset, kth_subset, positions_subset, normalized, id_to_position, k),
+        }
+    return result
+
+
 def _jaccard(a: set[str], b: set[str]) -> float:
     if not a and not b:
         return 1.0
     union = a | b
     return len(a & b) / len(union) if union else 0.0
+
+
+async def _sweep_recall(
+    conn: Any,
+    month: dict[str, Any],
+    *,
+    label: str,
+    query_sample_positions: list[int],
+    exact_ids_by_query: list[list[str]],
+    kth_scores: list[float],
+    normalized: np.ndarray,
+    id_to_position: dict[str, int],
+) -> dict[str, Any]:
+    """Strict + tie-tolerant + degree-bucketed recall@10, AND per-query ANN latency, across
+    `EF_SEARCH_SWEEP`, against whatever HNSW index for `month["model_version"]` is currently
+    live. Shared by `measure_index_variant` for both the standard and larger-index variants
+    (gm-analytics-engine-i37) -- everything here is variant-agnostic; `measure_index_variant`
+    is what builds/drops the index around this call.
+    """
+    print(f"=== {label}: recall@10 sweep (strict + tie-tolerant + degree-bucketed + latency) ===", file=sys.stderr)
+    recall_by_ef: dict[int, float] = {}
+    recall_tie_tolerant_by_ef: dict[int, float] = {}
+    recall_by_ef_by_degree_bucket: dict[int, dict[str, dict[str, Any]] | None] = {}
+    latency_ms_by_ef: dict[int, dict[str, float]] = {}
+    production_ef_search: int | None = None
+    for ef_search in EF_SEARCH_SWEEP:
+        ann_started = time.perf_counter()
+        latencies_ms: list[float] = []
+        ann_ids_by_query = await _ann_top_k(
+            conn, month["model_version"], month["vectors"], month["artist_ids"], query_sample_positions, ef_search, 10, latencies_ms=latencies_ms
+        )
+        ann_elapsed = time.perf_counter() - ann_started
+        recall = _recall_at_k(ann_ids_by_query, exact_ids_by_query, 10)
+        tie_recall = _tie_tolerant_recall_at_k(
+            ann_ids_by_query, exact_ids_by_query, kth_scores, query_sample_positions, normalized, id_to_position, 10
+        )
+        recall_by_ef[ef_search] = recall
+        recall_tie_tolerant_by_ef[ef_search] = tie_recall
+        # gm-analytics-engine-i37: re-groups this SAME sweep point's per-query results by the
+        # query artist's degree in this month's graph -- no extra ANN queries, kn3's own
+        # measurement has no graph to compute this breakdown from at all.
+        recall_by_ef_by_degree_bucket[ef_search] = _recall_by_degree_bucket(
+            ann_ids_by_query, exact_ids_by_query, kth_scores, query_sample_positions, month.get("degrees"), normalized, id_to_position, 10
+        )
+        latency_ms_by_ef[ef_search] = {
+            "mean_ms": sum(latencies_ms) / len(latencies_ms) if latencies_ms else 0.0,
+            "p95_ms": _percentile(latencies_ms, 95),
+        }
+        print(
+            f"  ef_search={ef_search}: recall@10={recall:.4f} (tie-tolerant {tie_recall:.4f}) "
+            f"latency mean={latency_ms_by_ef[ef_search]['mean_ms']:.2f}ms p95={latency_ms_by_ef[ef_search]['p95_ms']:.2f}ms "
+            f"({ann_elapsed:.1f}s for {len(query_sample_positions):,} queries)",
+            file=sys.stderr,
+        )
+        if production_ef_search is None and recall >= RECALL_TARGET:
+            production_ef_search = ef_search
+
+    return {
+        "recall_by_ef_search": recall_by_ef,
+        "recall_tie_tolerant_by_ef_search": recall_tie_tolerant_by_ef,
+        "recall_by_ef_search_by_degree_bucket": recall_by_ef_by_degree_bucket,
+        "latency_ms_by_ef_search": latency_ms_by_ef,
+        "production_ef_search": production_ef_search,
+    }
+
+
+async def measure_index_variant(
+    conn: Any,
+    month: dict[str, Any],
+    *,
+    label: str,
+    m: int,
+    ef_construction: int,
+    maintenance_work_mem: str,
+    query_sample_positions: list[int],
+    exact_ids_by_query: list[list[str]],
+    kth_scores: list[float],
+    normalized: np.ndarray,
+    id_to_position: dict[str, int],
+    drop_after: bool,
+) -> dict[str, Any]:
+    """Build ONE HNSW index variant (`m`/`ef_construction`), measure it (build time, on-disk
+    size, then the full `_sweep_recall`), and -- unless `drop_after` is False -- drop it
+    before returning. `drop_after=False` is for the standard variant inside `measure_month`,
+    whose index `churn_top_k` still needs to query after this returns; every other caller
+    (the larger-index variant, gm-analytics-engine-i37's maintainer-approved addition) drops
+    it, so at most one index for this `model_version` exists in Postgres/Colima at a time --
+    "build the variants one at a time... drop each index after measuring" is a memory
+    constraint on the host running Colima's VM, not a suggestion.
+    """
+    print(
+        f"=== {label} variant (m={m}, ef_construction={ef_construction}): building (maintenance_work_mem={maintenance_work_mem}) ===", file=sys.stderr
+    )
+    index_result = await _build_index(conn, month["model_version"], maintenance_work_mem, m=m, ef_construction=ef_construction)
+    index_size_bytes = await _index_size_bytes(conn, month["model_version"])
+    print(f"  {index_result['index_name']}: {index_result['build_elapsed_s']:.1f}s, size {index_size_bytes / 1e6:.1f} MB", file=sys.stderr)
+
+    sweep = await _sweep_recall(
+        conn,
+        month,
+        label=f"{label} ({m=}, {ef_construction=})",
+        query_sample_positions=query_sample_positions,
+        exact_ids_by_query=exact_ids_by_query,
+        kth_scores=kth_scores,
+        normalized=normalized,
+        id_to_position=id_to_position,
+    )
+
+    if drop_after:
+        print(f"=== {label} variant: dropping index ({index_result['index_name']}) ===", file=sys.stderr)
+        await _drop_index(conn, month["model_version"])
+
+    return {"index": index_result, "index_size_bytes": index_size_bytes, **sweep}
+
+
+class ExactGroundTruth(NamedTuple):
+    """The brute-force NumPy ground truth for one month's query sample -- computed ONCE per
+    month (`compute_exact_ground_truth`) and reused for both the standard and larger-index
+    variants, since neither depends on which HNSW variant happens to be live: recomputing it
+    a second time for the larger variant would cost another ~exact_elapsed_s (measured at
+    ~4 minutes on edges-v2's real catalog scale) for byte-identical output."""
+
+    normalized: np.ndarray
+    id_to_position: dict[str, int]
+    exact_ids_by_query: list[list[str]]
+    kth_scores: list[float]
+    exact_elapsed_s: float
+
+
+def compute_exact_ground_truth(month: dict[str, Any], query_sample_positions: list[int], *, label: str) -> ExactGroundTruth:
+    print(f"=== {label}: exact ground truth ({len(query_sample_positions):,} queries) ===", file=sys.stderr)
+    exact_started = time.perf_counter()
+    normalized = _normalized(month["vectors"])
+    id_to_position = {aid: index for index, aid in enumerate(month["artist_ids"])}
+    exact_positions_by_query, kth_scores = _exact_top_k(normalized, query_sample_positions, 10)
+    exact_ids_by_query = [[month["artist_ids"][position] for position in row] for row in exact_positions_by_query]
+    exact_elapsed = time.perf_counter() - exact_started
+    print(f"  exact: {exact_elapsed:.1f}s", file=sys.stderr)
+    return ExactGroundTruth(normalized, id_to_position, exact_ids_by_query, kth_scores, exact_elapsed)
 
 
 async def measure_month(
@@ -421,37 +803,30 @@ async def measure_month(
     query_sample_positions: list[int],
     query_sample_ids: list[str],
     maintenance_work_mem: str,
+    ground_truth: ExactGroundTruth,
 ) -> dict[str, Any]:
     print(f"\n=== {label}: writing embeddings ===", file=sys.stderr)
     write_result = await _write_month(conn, month)
     print(f"  wrote {write_result['rows_written']:,} rows", file=sys.stderr)
 
-    print(f"=== {label}: building HNSW index (full scale, maintenance_work_mem={maintenance_work_mem}) ===", file=sys.stderr)
-    index_result = await _build_index(conn, month["model_version"], maintenance_work_mem)
-    print(f"  {index_result['index_name']}: {index_result['build_elapsed_s']:.1f}s", file=sys.stderr)
+    # The standard variant's index is kept alive (drop_after=False): churn_top_k, called by
+    # the caller right after this returns, still needs to query it at churn_ef_search_used.
+    variant = await measure_index_variant(
+        conn,
+        month,
+        label="standard",
+        m=HNSW_M,
+        ef_construction=HNSW_EF_CONSTRUCTION,
+        maintenance_work_mem=maintenance_work_mem,
+        query_sample_positions=query_sample_positions,
+        exact_ids_by_query=ground_truth.exact_ids_by_query,
+        kth_scores=ground_truth.kth_scores,
+        normalized=ground_truth.normalized,
+        id_to_position=ground_truth.id_to_position,
+        drop_after=False,
+    )
 
-    print(f"=== {label}: exact ground truth ({len(query_sample_positions):,} queries) ===", file=sys.stderr)
-    exact_started = time.perf_counter()
-    exact_ids_by_query = [[month["artist_ids"][position] for position in row] for row in _exact_top_k(month["vectors"], query_sample_positions, 10)]
-    exact_elapsed = time.perf_counter() - exact_started
-    print(f"  exact: {exact_elapsed:.1f}s", file=sys.stderr)
-
-    print(f"=== {label}: recall@10 sweep ===", file=sys.stderr)
-    recall_by_ef: dict[int, float] = {}
-    production_ef_search: int | None = None
-    for ef_search in EF_SEARCH_SWEEP:
-        ann_started = time.perf_counter()
-        ann_ids_by_query = await _ann_top_k(
-            conn, month["model_version"], month["vectors"], month["artist_ids"], query_sample_positions, ef_search, 10
-        )
-        ann_elapsed = time.perf_counter() - ann_started
-        recall = _recall_at_k(ann_ids_by_query, exact_ids_by_query, 10)
-        recall_by_ef[ef_search] = recall
-        print(f"  ef_search={ef_search}: recall@10={recall:.4f} ({ann_elapsed:.1f}s for {len(query_sample_positions):,} queries)", file=sys.stderr)
-        if production_ef_search is None and recall >= RECALL_TARGET:
-            production_ef_search = ef_search
-
-    churn_ef_search = production_ef_search or EF_SEARCH_SWEEP[-1]
+    churn_ef_search = variant["production_ef_search"] or EF_SEARCH_SWEEP[-1]
     print(
         f"=== {label}: churn top-10 at ef_search={churn_ef_search} ({len(query_sample_ids)} query positions reused for churn sample separately) ===",
         file=sys.stderr,
@@ -459,24 +834,34 @@ async def measure_month(
 
     return {
         "write": write_result,
-        "index": index_result,
-        "exact_elapsed_s": exact_elapsed,
-        "recall_by_ef_search": recall_by_ef,
-        "production_ef_search": production_ef_search,
+        "exact_elapsed_s": ground_truth.exact_elapsed_s,
+        **variant,
         "churn_ef_search_used": churn_ef_search,
     }
+
+
+def exact_churn_top_k(month: dict[str, Any], churn_sample_ids: list[str]) -> dict[str, list[str]]:
+    """EXACT top-10 (brute-force NumPy, no Postgres/index touched at all) for
+    CHURN_SAMPLE_IDS, keyed by artist_id -- the index-free half of `churn_top_k`, split out
+    so a month whose Postgres/index work is skipped entirely can still get its churn side
+    measured (gm-analytics-engine-i37's maintainer-approved recall-phase trim: exact churn
+    runs for every w0, ANN churn only for the single best one -- see `main_async`)."""
+    id_to_position = {aid: index for index, aid in enumerate(month["artist_ids"])}
+    positions = [id_to_position[aid] for aid in churn_sample_ids if aid in id_to_position]
+    exact, _kth_scores = _exact_top_k(_normalized(month["vectors"]), positions, 10)
+    return {month["artist_ids"][position]: [month["artist_ids"][n] for n in row] for position, row in zip(positions, exact, strict=True)}
 
 
 async def churn_top_k(conn: Any, month: dict[str, Any], churn_sample_ids: list[str], ef_search: int) -> dict[str, list[str]]:
     """Both exact and ANN top-10 (at EF_SEARCH) for CHURN_SAMPLE_IDS, keyed by artist_id.
 
-    Exact: brute-force in NumPy against this month's full in-memory vector array.
-    ANN: the live index, at the production `ef_search` -- what the served list would be.
+    Exact: `exact_churn_top_k`, brute-force in NumPy against this month's full in-memory
+    vector array. ANN: the live index, at the production `ef_search` -- what the served list
+    would be.
     """
+    exact_by_id = exact_churn_top_k(month, churn_sample_ids)
     id_to_position = {aid: index for index, aid in enumerate(month["artist_ids"])}
     positions = [id_to_position[aid] for aid in churn_sample_ids if aid in id_to_position]
-    exact = _exact_top_k(month["vectors"], positions, 10)
-    exact_by_id = {month["artist_ids"][position]: [month["artist_ids"][n] for n in row] for position, row in zip(positions, exact, strict=True)}
     ann = await _ann_top_k(conn, month["model_version"], month["vectors"], month["artist_ids"], positions, ef_search, 10)
     ann_by_id = {month["artist_ids"][position]: (row or []) for position, row in zip(positions, ann, strict=True)}
     return {"exact": exact_by_id, "ann": ann_by_id}
@@ -487,26 +872,159 @@ def compute_churn(aug_top10: dict[str, list[str]], sept_top10: dict[str, list[st
     return {"mean_jaccard": sum(jaccards) / len(jaccards) if jaccards else 0.0, "n": len(jaccards)}
 
 
-def _save_checkpoint(path: Path, aug_result: dict[str, Any], aug_churn: dict[str, Any], model_version: str) -> None:
-    """Persist August's full result (recall sweep + churn top-10) to disk immediately after
-    it's computed, before September starts -- so a restart between months (a container
-    swap for a higher maintenance_work_mem, say) can skip re-doing August's multi-hour
-    build entirely, per the dispatcher's ask about resumability. Keyed on August's own
-    stored model_version so a checkpoint from a different config/dump is never reused."""
-    path.write_text(json.dumps({"model_version": model_version, "aug_result": aug_result, "aug_churn": aug_churn}, default=str))
+def _save_checkpoint(
+    path: Path, aug_result: dict[str, Any], aug_churn: dict[str, Any], aug_larger_variant: dict[str, Any] | None, model_version: str
+) -> None:
+    """Persist August's full result (recall sweep + churn top-10 + the larger-index variant,
+    if measured) to disk immediately after it's computed, before September starts -- so a
+    restart between months (a container swap for a higher maintenance_work_mem, say) can skip
+    re-doing August's multi-hour build entirely, per the dispatcher's ask about resumability.
+    Keyed on August's own stored model_version so a checkpoint from a different config/dump is
+    never reused."""
+    path.write_text(
+        json.dumps(
+            {"model_version": model_version, "aug_result": aug_result, "aug_churn": aug_churn, "aug_larger_variant": aug_larger_variant}, default=str
+        )
+    )
 
 
-def _load_checkpoint(path: Path, model_version: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+def _load_checkpoint(path: Path, model_version: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None] | None:
     if not path.exists():
         return None
     data = json.loads(path.read_text())
     if data.get("model_version") != model_version:
         print(f"  checkpoint at {path} is for a different model_version ({data.get('model_version')!r}); ignoring", file=sys.stderr)
         return None
-    return data["aug_result"], data["aug_churn"]
+    # `aug_larger_variant` predates a checkpoint saved before this bead's addition; `.get`
+    # rather than a plain key lookup lets an older checkpoint still resume (just without
+    # that data, same as `_load_month`'s own `degrees`-missing fallback).
+    return data["aug_result"], data["aug_churn"], data.get("aug_larger_variant")
+
+
+async def _main_async_trimmed(
+    args: argparse.Namespace,
+    aug: dict[str, Any],
+    sept: dict[str, Any],
+    common_ids: list[str],
+    churn_sample_ids: list[str],
+    sept_query_ids: list[str],
+    sept_query_positions: list[int],
+) -> dict[str, Any]:
+    """gm-analytics-engine-i37's maintainer-approved recall-phase trim (`--skip-ann-churn`):
+    process ONLY September's Postgres/index work (standard-variant recall sweep, and the
+    larger-index variant unless `--skip-larger-variant` is also set -- see that flag's own
+    help text for why it usually is: the m=32 build overflowed maintenance_work_mem and fell
+    to an ~8h on-disk path per build). August contributes only its raw vectors, for EXACT
+    churn -- no Postgres write, no index, no recall sweep, and no ANN churn for August at all.
+
+    Writes a PARTIAL result to `args.out` right after September's standard-variant recall
+    sweep and the exact churn are both in hand, BEFORE attempting the larger variant (if not
+    skipped) -- so a cancel during that step (the m=32 overflow that prompted `--skip-larger-
+    variant` in the first place) never loses the numbers that already exist.
+
+    Run this for every w0 except the single best one (selected afterward by tie-tolerant
+    recall + quality, from September's results across the sweep -- see docs/
+    embedding_weight_sweep.md for the exact rule and the winner), which instead runs the full
+    (non-trimmed) flow in `main_async` below, the only place ANN churn is computed.
+    """
+    print(
+        "\n=== --skip-ann-churn: September only (write+index+recall+larger variant); August contributes raw vectors for exact churn only ===",
+        file=sys.stderr,
+    )
+    pool = AsyncPostgreSQLPool(
+        connection_params={"host": args.host, "port": args.port, "dbname": args.database, "user": args.username, "password": args.password},
+        min_connections=1,
+        max_connections=1,
+    )
+    await pool.initialize()
+    try:
+        async with pool.connection() as conn:
+            await _apply_schema(conn)
+            sept_ground_truth = compute_exact_ground_truth(sept, sept_query_positions, label="September")
+            sept_result = await measure_month(
+                conn,
+                sept,
+                label="September",
+                query_sample_positions=sept_query_positions,
+                query_sample_ids=sept_query_ids,
+                maintenance_work_mem=args.sept_maintenance_work_mem,
+                ground_truth=sept_ground_truth,
+            )
+
+            print("\n=== September: exact-only churn against August's raw vectors (no ANN -- trimmed mode) ===", file=sys.stderr)
+            aug_churn_exact = exact_churn_top_k(aug, churn_sample_ids)
+            sept_churn_exact = exact_churn_top_k(sept, churn_sample_ids)
+            churn_exact = compute_churn(aug_churn_exact, sept_churn_exact, churn_sample_ids)
+            print(f"  churn (exact cosine): mean_jaccard={churn_exact['mean_jaccard']:.4f} (n={churn_exact['n']})", file=sys.stderr)
+
+            partial = {
+                "mode": "skip_ann_churn",
+                "partial": True,
+                "sampling": {
+                    "churn_sample_seed": CHURN_SAMPLE_SEED,
+                    "churn_sample_size_requested": CHURN_SAMPLE_SIZE,
+                    "churn_sample_size_actual": len(churn_sample_ids),
+                    "common_artists": len(common_ids),
+                    "rule": "smallest N by splitmix64(node_key('a', artist_id) XOR seed)",
+                },
+                "august": {
+                    "dump_id": aug["dump_id"],
+                    "dump_date": aug["dump_date"],
+                    "model_version": aug["model_version"],
+                    "n_vectors": len(aug["artist_ids"]),
+                    "note": "no Postgres/index work in this mode -- raw vectors only, for exact churn",
+                },
+                "september": {
+                    "dump_id": sept["dump_id"],
+                    "dump_date": sept["dump_date"],
+                    "model_version": sept["model_version"],
+                    "n_vectors": len(sept["artist_ids"]),
+                    **sept_result,
+                },
+                "churn_exact_cosine": churn_exact,
+                "churn_ann_at_production_ef_search": None,
+            }
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(json.dumps(partial, indent=2, default=str))
+            print(f"  partial result (standard variant + exact churn, before any larger-variant attempt) written to {args.out}", file=sys.stderr)
+
+            if args.skip_larger_variant:
+                print("=== September: --skip-larger-variant set -- skipping the larger-index (m=32) variant ===", file=sys.stderr)
+                sept_larger_variant = {"skipped": True, "reason": LARGER_VARIANT_SKIP_REASON}
+            else:
+                print(
+                    f"\n=== September: dropping the standard index ({sept_result['index']['index_name']}) before the larger-index variant ===",
+                    file=sys.stderr,
+                )
+                await _drop_index(conn, sept["model_version"])
+
+                sept_larger_variant = await measure_index_variant(
+                    conn,
+                    sept,
+                    label="larger",
+                    m=HNSW_LARGER_M,
+                    ef_construction=HNSW_LARGER_EF_CONSTRUCTION,
+                    maintenance_work_mem=args.sept_maintenance_work_mem,
+                    query_sample_positions=sept_query_positions,
+                    exact_ids_by_query=sept_ground_truth.exact_ids_by_query,
+                    kth_scores=sept_ground_truth.kth_scores,
+                    normalized=sept_ground_truth.normalized,
+                    id_to_position=sept_ground_truth.id_to_position,
+                    drop_after=True,
+                )
+    finally:
+        await pool.close()
+
+    result = dict(partial)
+    result["partial"] = False
+    result["september"] = {**result["september"], "larger_index_variant": sept_larger_variant}
+    return result
 
 
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
+    print("=== waiting for Docker to be reachable ===", file=sys.stderr)
+    wait_for_docker()
+
     print(f"loading {args.aug}", file=sys.stderr)
     aug = _load_month(args.aug)
     print(f"loading {args.sept}", file=sys.stderr)
@@ -516,19 +1034,32 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     print(f"common artists (both months): {len(common_ids):,}", file=sys.stderr)
     churn_sample_ids = _deterministic_sample(common_ids, CHURN_SAMPLE_SIZE, CHURN_SAMPLE_SEED)
 
-    aug_query_ids = _deterministic_sample(aug["artist_ids"], QUERY_SAMPLE_SIZE, QUERY_SAMPLE_SEED)
-    aug_id_to_position = {aid: index for index, aid in enumerate(aug["artist_ids"])}
-    aug_query_positions = [aug_id_to_position[aid] for aid in aug_query_ids]
-
     sept_query_ids = _deterministic_sample(sept["artist_ids"], QUERY_SAMPLE_SIZE, QUERY_SAMPLE_SEED)
     sept_id_to_position = {aid: index for index, aid in enumerate(sept["artist_ids"])}
     sept_query_positions = [sept_id_to_position[aid] for aid in sept_query_ids]
+
+    if args.skip_ann_churn:
+        return await _main_async_trimmed(args, aug, sept, common_ids, churn_sample_ids, sept_query_ids, sept_query_positions)
+
+    # ---- Full flow below: both months' Postgres/index work, ANN churn between them. Used
+    # only for the single best w0 (see _main_async_trimmed's docstring) -- every other w0
+    # takes the trimmed branch above and returns before reaching here. ----
+    aug_query_ids = _deterministic_sample(aug["artist_ids"], QUERY_SAMPLE_SIZE, QUERY_SAMPLE_SEED)
+    aug_id_to_position = {aid: index for index, aid in enumerate(aug["artist_ids"])}
+    aug_query_positions = [aug_id_to_position[aid] for aid in aug_query_ids]
 
     checkpoint_path = args.out.with_suffix(".august_checkpoint.json")
     checkpoint = _load_checkpoint(checkpoint_path, aug["model_version"])
     if checkpoint is not None:
         print(f"\n=== August: resuming from checkpoint {checkpoint_path} (skipping write/build/sweep) ===", file=sys.stderr)
-        aug_result, aug_churn = checkpoint
+        aug_result, aug_churn, aug_larger_variant = checkpoint
+        if aug_larger_variant is None:
+            print(
+                "  ⚠️  checkpoint has no larger-index-variant result (predates gm-analytics-engine-i37, or that "
+                "step hadn't run yet) -- skipping it for August rather than backfilling: the checkpoint-resume "
+                "path assumes no further container work is needed for August, and backfilling would need one.",
+                file=sys.stderr,
+            )
     else:
         pool = AsyncPostgreSQLPool(
             connection_params={"host": args.host, "port": args.port, "dbname": args.database, "user": args.username, "password": args.password},
@@ -538,6 +1069,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         await pool.initialize()
         async with pool.connection() as conn:
             await _apply_schema(conn)
+            aug_ground_truth = compute_exact_ground_truth(aug, aug_query_positions, label="August")
             aug_result = await measure_month(
                 conn,
                 aug,
@@ -545,11 +1077,40 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 query_sample_positions=aug_query_positions,
                 query_sample_ids=aug_query_ids,
                 maintenance_work_mem=args.aug_maintenance_work_mem,
+                ground_truth=aug_ground_truth,
             )
             print("\n=== August: churn top-10 (exact + ANN) for the common-artist sample, BEFORE dropping the table ===", file=sys.stderr)
             aug_churn = await churn_top_k(conn, aug, churn_sample_ids, aug_result["churn_ef_search_used"])
+
+            print(
+                f"\n=== August: dropping the standard index ({aug_result['index']['index_name']}) before the larger-index variant ===",
+                file=sys.stderr,
+            )
+            await _drop_index(conn, aug["model_version"])
+
+            if args.skip_larger_variant:
+                print("=== August: --skip-larger-variant set -- skipping the larger-index (m=32) variant ===", file=sys.stderr)
+                aug_larger_variant = {"skipped": True, "reason": LARGER_VARIANT_SKIP_REASON}
+            elif args.skip_larger_variant_aug:
+                print("=== August: --skip-larger-variant-aug set -- measuring the larger variant on September only ===", file=sys.stderr)
+                aug_larger_variant = {"skipped": True, "reason": "--skip-larger-variant-aug: measured on September only"}
+            else:
+                aug_larger_variant = await measure_index_variant(
+                    conn,
+                    aug,
+                    label="larger",
+                    m=HNSW_LARGER_M,
+                    ef_construction=HNSW_LARGER_EF_CONSTRUCTION,
+                    maintenance_work_mem=args.aug_maintenance_work_mem,
+                    query_sample_positions=aug_query_positions,
+                    exact_ids_by_query=aug_ground_truth.exact_ids_by_query,
+                    kth_scores=aug_ground_truth.kth_scores,
+                    normalized=aug_ground_truth.normalized,
+                    id_to_position=aug_ground_truth.id_to_position,
+                    drop_after=True,
+                )
         await pool.close()
-        _save_checkpoint(checkpoint_path, aug_result, aug_churn, aug["model_version"])
+        _save_checkpoint(checkpoint_path, aug_result, aug_churn, aug_larger_variant, aug["model_version"])
         print(f"  checkpoint saved: {checkpoint_path}", file=sys.stderr)
 
     if checkpoint is not None:
@@ -598,6 +1159,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 async with conn.cursor() as cursor:
                     await cursor.execute(f"TRUNCATE {ARTIST_EMBEDDINGS_TABLE}")
 
+            sept_ground_truth = compute_exact_ground_truth(sept, sept_query_positions, label="September")
             sept_result = await measure_month(
                 conn,
                 sept,
@@ -605,41 +1167,84 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 query_sample_positions=sept_query_positions,
                 query_sample_ids=sept_query_ids,
                 maintenance_work_mem=args.sept_maintenance_work_mem,
+                ground_truth=sept_ground_truth,
             )
             print("\n=== September: churn top-10 (exact + ANN) for the common-artist sample ===", file=sys.stderr)
             sept_churn = await churn_top_k(conn, sept, churn_sample_ids, sept_result["churn_ef_search_used"])
+
+            churn_exact = compute_churn(aug_churn["exact"], sept_churn["exact"], churn_sample_ids)
+            churn_ann = compute_churn(aug_churn["ann"], sept_churn["ann"], churn_sample_ids)
+            print(
+                f"  churn (exact cosine): mean_jaccard={churn_exact['mean_jaccard']:.4f} (n={churn_exact['n']}); "
+                f"churn (ANN @ production ef_search): mean_jaccard={churn_ann['mean_jaccard']:.4f} (n={churn_ann['n']})",
+                file=sys.stderr,
+            )
+
+            partial = {
+                "sampling": {
+                    "query_sample_seed": QUERY_SAMPLE_SEED,
+                    "query_sample_size": QUERY_SAMPLE_SIZE,
+                    "churn_sample_seed": CHURN_SAMPLE_SEED,
+                    "churn_sample_size_requested": CHURN_SAMPLE_SIZE,
+                    "churn_sample_size_actual": len(churn_sample_ids),
+                    "common_artists": len(common_ids),
+                    "rule": "smallest N by splitmix64(node_key('a', artist_id) XOR seed)",
+                },
+                "august": {
+                    "dump_id": aug["dump_id"],
+                    "dump_date": aug["dump_date"],
+                    "model_version": aug["model_version"],
+                    "n_vectors": len(aug["artist_ids"]),
+                    **aug_result,
+                    "larger_index_variant": aug_larger_variant,
+                },
+                "september": {
+                    "dump_id": sept["dump_id"],
+                    "dump_date": sept["dump_date"],
+                    "model_version": sept["model_version"],
+                    "n_vectors": len(sept["artist_ids"]),
+                    **sept_result,
+                },
+                "churn_exact_cosine": churn_exact,
+                "churn_ann_at_production_ef_search": churn_ann,
+                "partial": True,
+            }
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(json.dumps(partial, indent=2, default=str))
+            print(
+                f"  partial result (both months' standard variant + exact/ANN churn, before September's larger-variant attempt) written to {args.out}",
+                file=sys.stderr,
+            )
+
+            if args.skip_larger_variant:
+                print("=== September: --skip-larger-variant set -- skipping the larger-index (m=32) variant ===", file=sys.stderr)
+                sept_larger_variant = {"skipped": True, "reason": LARGER_VARIANT_SKIP_REASON}
+            else:
+                print(
+                    f"\n=== September: dropping the standard index ({sept_result['index']['index_name']}) before the larger-index variant ===",
+                    file=sys.stderr,
+                )
+                await _drop_index(conn, sept["model_version"])
+                sept_larger_variant = await measure_index_variant(
+                    conn,
+                    sept,
+                    label="larger",
+                    m=HNSW_LARGER_M,
+                    ef_construction=HNSW_LARGER_EF_CONSTRUCTION,
+                    maintenance_work_mem=args.sept_maintenance_work_mem,
+                    query_sample_positions=sept_query_positions,
+                    exact_ids_by_query=sept_ground_truth.exact_ids_by_query,
+                    kth_scores=sept_ground_truth.kth_scores,
+                    normalized=sept_ground_truth.normalized,
+                    id_to_position=sept_ground_truth.id_to_position,
+                    drop_after=True,
+                )
     finally:
         await pool.close()
 
-    churn_exact = compute_churn(aug_churn["exact"], sept_churn["exact"], churn_sample_ids)
-    churn_ann = compute_churn(aug_churn["ann"], sept_churn["ann"], churn_sample_ids)
-
     return {
-        "sampling": {
-            "query_sample_seed": QUERY_SAMPLE_SEED,
-            "query_sample_size": QUERY_SAMPLE_SIZE,
-            "churn_sample_seed": CHURN_SAMPLE_SEED,
-            "churn_sample_size_requested": CHURN_SAMPLE_SIZE,
-            "churn_sample_size_actual": len(churn_sample_ids),
-            "common_artists": len(common_ids),
-            "rule": "smallest N by splitmix64(node_key('a', artist_id) XOR seed)",
-        },
-        "august": {
-            "dump_id": aug["dump_id"],
-            "dump_date": aug["dump_date"],
-            "model_version": aug["model_version"],
-            "n_vectors": len(aug["artist_ids"]),
-            **aug_result,
-        },
-        "september": {
-            "dump_id": sept["dump_id"],
-            "dump_date": sept["dump_date"],
-            "model_version": sept["model_version"],
-            "n_vectors": len(sept["artist_ids"]),
-            **sept_result,
-        },
-        "churn_exact_cosine": churn_exact,
-        "churn_ann_at_production_ef_search": churn_ann,
+        **{k: v for k, v in partial.items() if k != "partial"},
+        "september": {**partial["september"], "larger_index_variant": sept_larger_variant},
     }
 
 
@@ -658,6 +1263,34 @@ def main() -> None:
     parser.add_argument("--aug-maintenance-work-mem", default=DEFAULT_MAINTENANCE_WORK_MEM)
     parser.add_argument("--sept-maintenance-work-mem", default=DEFAULT_MAINTENANCE_WORK_MEM)
     parser.add_argument("--sept-shm-size", default="2g", help="only used if --sept-maintenance-work-mem differs from --aug-maintenance-work-mem")
+    parser.add_argument(
+        "--skip-larger-variant-aug",
+        action="store_true",
+        help="skip the larger-index variant (m=32, ef_construction=128) for August, measuring it on September only -- "
+        "the dispatcher's escape hatch for when time per w0 becomes excessive (say so in the report if used). Has no "
+        "effect together with --skip-ann-churn, which already never measures a larger variant for August. Superseded "
+        "by --skip-larger-variant, which skips it everywhere.",
+    )
+    parser.add_argument(
+        "--skip-larger-variant",
+        action="store_true",
+        help="skip the larger-index variant (m=32, ef_construction=128) in BOTH months and in both --skip-ann-churn "
+        "and full mode. Maintainer decision, 2026-09-27: September's m=32 build for w0=0 overflowed "
+        "maintenance_work_mem=8GB at ~6.1M of 9,366,416 tuples and fell to an on-disk build path at ~80 tuples/s -- "
+        "an ~8h build per weight, repeated per w0 and again for the winner run. That overflow IS the recorded "
+        "finding (LARGER_VARIANT_SKIP_REASON, also in the results JSON's larger_variant_finding); this flag stops "
+        "actually attempting the build. The standard-variant recall sweep, degree buckets, latency, and churn are "
+        "all unaffected and still run.",
+    )
+    parser.add_argument(
+        "--skip-ann-churn",
+        action="store_true",
+        help="maintainer-approved recall-phase trim: process ONLY September (write, standard-index recall sweep, "
+        "always the larger-index variant too), and compute churn on EXACT top-10 alone -- no Postgres write, no "
+        "index, and no ANN churn for August at all. Use for every w0 except the single best one (by tie-tolerant "
+        "recall + quality, chosen from the September results), which should instead run WITHOUT this flag so both "
+        "months' standard indexes exist and ANN churn between them can be computed.",
+    )
     args = parser.parse_args()
 
     result = asyncio.run(main_async(args))
