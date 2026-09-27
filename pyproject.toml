@@ -52,6 +52,7 @@ dev = [
     "commitizen>=4.18.0",
     "cyclonedx-bom>=7.3.1",
     "fakeredis>=2.37.1",
+    "groovemap-database-schema==0.4.1",
     "mypy>=2.3.1",
     "pip-audit>=2.10.1",
     "pip-licenses>=5.5.5",
@@ -70,7 +71,8 @@ packages = ["insights"]
 exclude-newer = "2 days"
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "2d7b1a5b8766ff915a39e66a3e70013d092c1bc1" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef" }
+groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "26d03e66c0b815d15870768a92b7d49521658838" }
 
 [tool.ruff]
 extend-exclude = ["insights/catalog_api_contract.py"]

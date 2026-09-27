@@ -4,32 +4,31 @@ Run via `just test-integration-pg19` / `scripts/test-integration-pg19.sh`, never
 that script starts the disposable PostgreSQL 19 + pgvector container and supplies every
 environment variable `_required_env` below reads. See that script and `docs/embeddings.md`.
 
-The schema applied here is a minimal, self-contained stand-in for the objects ADR 0013's
-2026-09-24 amendment adds in `database-schema` — `public.artist_embeddings`, the
-`embedding_pipeline` role and its grants, and the nine `graph` schema edge relations plus
-`graph.vertex_degree` this pipeline reads — declared inline rather than taken as a dependency
-on that repository's package. `database-schema`'s own molecule that adds these objects
-(`gm-database-schema-lhp2`) has not been pushed to `origin/main` as of this bead (see the
-submission notes), so a pinned `groovemap-database-schema` git dependency cannot resolve; this
-suite tests this repository's own `insights.embedding_pipeline` code against the *documented*
-shapes (docs/embeddings.md, and database-schema's docs/architecture.md, "Vector embeddings and
-the embedding pipeline role") instead of the producer's authoritative DDL. Once that molecule
-lands, `groovemap-database-schema` should become a pinned dev dependency the way
-`catalog-api` already does it, and this fixture should apply its real
-`create_postgres_schema` instead.
+The schema applied here is the real one: `groovemap_schema.postgres.create_postgres_schema`,
+from a pinned `groovemap-database-schema` dev dependency (rev
+`26d03e66c0b815d15870768a92b7d49521658838`, version 0.4.1), the same way `catalog-api` applies
+it in its own `postgres_pool` fixture. That revision carries `gm-database-schema-lhp2` (the
+vector extension, `public.artist_embeddings`, the `embedding_pipeline` role and its grants),
+`gm-database-schema-19g5` (the per-`model_version` partial HNSW index procedure this repository
+does not exercise here — see `docs/embeddings.md`), and `gm-database-schema-ug3v`
+(`graph.track_credited_on` / `graph.track_by_artist`, unrelated to this pipeline's release-level
+reads). Applying the producer's own DDL — rather than a hand-rolled subset — is what keeps this
+fixture from drifting behind the objects `insights.embedding_pipeline` actually reads; see
+`test_real_databases.py` in `catalog-api` for the same rationale.
 
-`graph.credited_on` and `graph.same_as` (ieu.6) are the two exceptions to "plain two-column
-edge table": `credited_on.role_category` is a GENERATED column bound to
-`graph.credit_role_category`, a SQL rendering of `common.credit_roles.ROLE_CATEGORIES` (the
-same taxonomy `insights.embedding_pipeline._KEPT_CREDIT_CATEGORIES` filters against), built here
-by `_credit_role_category_function_sql()` from that shared, already-vendored dependency rather
-than hand-copied — so a taxonomy change in `groovemap-runtime` changes this fixture's function
-body the same way it would change database-schema's real one, and this suite cannot silently
-drift from what `role_category` actually resolves to.
+`create_postgres_schema` also declares `graph.credit_role_category`, the SQL rendering of
+`common.credit_roles.ROLE_CATEGORIES` (the same taxonomy
+`insights.embedding_pipeline._KEPT_CREDIT_CATEGORIES` filters against) that
+`graph.credited_on.role_category` and `graph.track_credited_on.role_category` are GENERATED
+from — this fixture no longer renders its own copy of that function.
 
-The graph tables here are created directly, not projected from catalog documents: they are
-base tables in the real schema too (loader-written, not views), so seeding them directly is
-representative of what a loader's `extraction_complete` pass leaves behind.
+The eight plain-scan `graph` edge relations plus `graph.vertex_degree` are base tables in the
+real schema (loader-written, not views) — `create_postgres_schema` creates them empty, and this
+fixture seeds them directly, representative of what a loader's `extraction_complete` pass
+leaves behind. `public.catalog_document_sentinel` is the one object here with no real-schema
+counterpart: a stand-in for a catalog document table (e.g. `public.releases`) the pipeline role
+is never granted anything on, kept minimal rather than switched to a real table so this fixture
+does not have to seed one just to prove a permission boundary.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ from typing import TYPE_CHECKING
 import pytest
 import pytest_asyncio
 from common import AsyncPostgreSQLPool, parse_postgres_host_port
-from common.credit_roles import ROLE_CATEGORIES
+from groovemap_schema.postgres import EMBEDDING_PIPELINE_ROLE, create_postgres_schema
 from psycopg import sql
 
 
@@ -48,7 +47,6 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
 
-EMBEDDING_PIPELINE_ROLE = "embedding_pipeline"
 _PIPELINE_LOGIN_ROLE = "embedding_pipeline_login"
 
 # A small, fully-connected synthetic graph exercising all six FastRP vertex kinds and all
@@ -98,121 +96,6 @@ _EDGE_COLUMNS: dict[str, tuple[str, str]] = {
 }
 
 
-def _sql_literal(value: str) -> str:
-    """A single-quoted SQL string literal for embedding directly into DDL text."""
-    return "'" + value.replace("'", "''") + "'"
-
-
-def _credit_role_category_function_sql() -> str:
-    """Return `graph.credit_role_category`, rendered from the real, vendored taxonomy.
-
-    Verbatim shape of database-schema's `_credit_role_category_function`/`_role_category_branches`
-    (docs/architecture.md, "Vector embeddings and the embedding pipeline role"), but built from
-    `common.credit_roles.ROLE_CATEGORIES` here rather than hand-copied, so this fixture's
-    function body tracks the shared taxonomy `insights.embedding_pipeline._KEPT_CREDIT_CATEGORIES`
-    filters against exactly, including its longest-fragment-first, cross-category specificity
-    rule for a compound credit like "Recorded By, Mastered By".
-    """
-    fragments = {role: category for category, roles in ROLE_CATEGORIES.items() for role in roles}
-    branches = sorted(fragments.items(), key=lambda pair: (-len(pair[0]), pair[0]))
-    exact = "\n".join(f"        WHEN normalized.role = {_sql_literal(fragment)} THEN {_sql_literal(category)}" for fragment, category in branches)
-    contained = "\n".join(
-        f"        WHEN strpos(normalized.role, {_sql_literal(fragment)}) > 0 THEN {_sql_literal(category)}" for fragment, category in branches
-    )
-    return f"""
-    CREATE OR REPLACE FUNCTION graph.credit_role_category(raw_role text)
-    RETURNS text
-    LANGUAGE sql
-    IMMUTABLE
-    PARALLEL SAFE
-    RETURNS NULL ON NULL INPUT
-    AS $credit_role_category$
-    SELECT CASE
-{exact}
-{contained}
-        ELSE 'other'
-    END
-    FROM (SELECT btrim(lower(raw_role)) AS role) AS normalized
-    $credit_role_category$
-    """  # noqa: S608 -- built from the fixed, vendored ROLE_CATEGORIES taxonomy, never caller input.
-
-
-_SCHEMA_STATEMENTS: tuple[str, ...] = (
-    "CREATE EXTENSION IF NOT EXISTS vector",
-    "CREATE SCHEMA IF NOT EXISTS graph",
-    # `kind` is TEXT here rather than production's one-byte `"char"` — a fixture
-    # simplification; nothing this pipeline reads depends on the storage width.
-    """
-    CREATE TABLE IF NOT EXISTS graph.vertex_degree (
-        kind TEXT NOT NULL,
-        key TEXT NOT NULL,
-        degree BIGINT NOT NULL,
-        PRIMARY KEY (kind, key)
-    )
-    """,
-    *(
-        f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            {columns[0]} TEXT NOT NULL,
-            {columns[1]} TEXT NOT NULL,
-            PRIMARY KEY ({columns[0]}, {columns[1]})
-        )
-        """
-        for table, columns in _EDGE_COLUMNS.items()
-    ),
-    _credit_role_category_function_sql(),
-    # `role_category` is GENERATED, exactly like database-schema's real `credited_on` — see
-    # that table's DDL comment on why: nine downstream credits functions read it there, and a
-    # loader that forgot to set it would produce a silent null rather than a failure. Naming it
-    # in an INSERT is therefore an error, never a value this fixture's seed rows supply.
-    """
-    CREATE TABLE IF NOT EXISTS graph.credited_on (
-        person_name   TEXT NOT NULL,
-        release_id    TEXT NOT NULL,
-        role          TEXT NOT NULL,
-        role_category TEXT GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED,
-        PRIMARY KEY (person_name, release_id, role)
-    )
-    """,
-    # No release column: the same person credited by id on any release asserts the same row
-    # (database-schema's `derive_release` docstring on `same_as`) — additive, never pruned.
-    """
-    CREATE TABLE IF NOT EXISTS graph.same_as (
-        person_name TEXT NOT NULL,
-        artist_id   TEXT NOT NULL,
-        PRIMARY KEY (person_name, artist_id)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS public.artist_embeddings (
-        artist_id        TEXT NOT NULL,
-        model_version    TEXT NOT NULL,
-        embedding        halfvec(128) NOT NULL,
-        source_dump_id   TEXT NOT NULL,
-        source_dump_date DATE NOT NULL,
-        computed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (artist_id, model_version)
-    )
-    """,
-    # A stand-in for a catalog document table (e.g. `public.artists`) the pipeline role is
-    # never granted anything on — real database-schema tables aren't declared here (see the
-    # module docstring), but the permission boundary this exercises is the same one.
-    "CREATE TABLE IF NOT EXISTS public.catalog_document_sentinel (id TEXT PRIMARY KEY)",
-    f"""
-    DO $create_embedding_pipeline_role$
-    BEGIN
-        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{EMBEDDING_PIPELINE_ROLE}') THEN
-            CREATE ROLE {EMBEDDING_PIPELINE_ROLE} NOLOGIN;
-        END IF;
-    END
-    $create_embedding_pipeline_role$
-    """,  # noqa: S608 -- EMBEDDING_PIPELINE_ROLE is a module-level constant, not caller input.
-    f"GRANT USAGE ON SCHEMA graph TO {EMBEDDING_PIPELINE_ROLE}",
-    f"GRANT SELECT ON ALL TABLES IN SCHEMA graph TO {EMBEDDING_PIPELINE_ROLE}",
-    f"GRANT SELECT, INSERT, UPDATE, DELETE ON public.artist_embeddings TO {EMBEDDING_PIPELINE_ROLE}",
-)
-
-
 def _required_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
@@ -240,11 +123,21 @@ async def _open_pool(*, username: str, password: str) -> AsyncPostgreSQLPool:
 
 
 async def _apply_schema_and_seed(pool: AsyncPostgreSQLPool) -> None:
+    """Apply the real schema, then seed the graph tables and the sentinel it does not declare.
+
+    Every statement `create_postgres_schema` runs is `IF NOT EXISTS`/idempotent, so a non-zero
+    failure count means this integration image and the pinned producer revision disagree — a
+    fixture bug, not something a test should be left to discover as a missing relation (the
+    same assertion `catalog-api`'s `postgres_pool` fixture makes).
+    """
+    failures = await create_postgres_schema(pool)
+    assert failures == 0, f"{failures} schema statements failed against the integration container"
     async with pool.connection() as conn:
         await conn.set_autocommit(True)
         async with conn.cursor() as cursor:
-            for statement in _SCHEMA_STATEMENTS:
-                await cursor.execute(statement)
+            # A stand-in for a catalog document table (e.g. `public.releases`) the pipeline
+            # role is never granted anything on — see the module docstring.
+            await cursor.execute("CREATE TABLE IF NOT EXISTS public.catalog_document_sentinel (id TEXT PRIMARY KEY)")
             for kind, key, degree in _VERTEX_ROWS:
                 await cursor.execute(
                     "INSERT INTO graph.vertex_degree (kind, key, degree) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", (kind, key, degree)

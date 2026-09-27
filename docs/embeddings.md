@@ -250,9 +250,8 @@ dumps under one config get different stored versions rather than one upserting t
 against a real PostgreSQL 19 + pgvector container with a real `embedding_pipeline`-scoped
 login, asserting the idempotency, coexistence, and permission-boundary behavior above against
 the engine itself — including that an earlier dump's rows are byte-for-byte unchanged after a
-later dump loads — on a small synthetic graph. That tier's `conftest.py` applies a minimal,
-inline stand-in for the ADR 0013 schema objects rather than taking `database-schema` as a
-dependency — `database-schema`'s own molecule that adds them (`gm-database-schema-lhp2`) had
-not reached `origin/main` as of this bead; filed as gm-analytics-engine-qzl, and see that
-`conftest.py`'s module docstring for the detail. Neither test tier commits provider-derived
-data or real embeddings, per ADR 0013's data-rights section.
+later dump loads — on a small synthetic graph. That tier's `conftest.py` applies the real ADR
+0013 schema objects via a pinned `groovemap-database-schema` dev dependency's own
+`create_postgres_schema` (gm-analytics-engine-qzl), the same way `catalog-api` applies it; see
+that `conftest.py`'s module docstring for the pinned revision. Neither test tier commits
+provider-derived data or real embeddings, per ADR 0013's data-rights section.
