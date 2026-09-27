@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
-PYTHON_LIBRARIES_REVISION = "2d7b1a5b8766ff915a39e66a3e70013d092c1bc1"
+PYTHON_LIBRARIES_REVISION = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef"
 GIT = shutil.which("git")
 if GIT is None:
     raise RuntimeError("git is required to establish the tracked first-party source boundary")
