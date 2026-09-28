@@ -146,7 +146,15 @@ _WRITE_CHUNK_BYTES: Final = 256 * 1024 * 1024  # ditto, for streaming a month's 
 
 HOST_PRESSURE_POLL_INTERVAL_S: Final = 60.0
 HOST_PRESSURE_LOG_INTERVAL_S: Final = 600.0  # log at most once per 10 minutes while waiting -- never abort.
-MIN_FREE_SWAP_GB: Final = 2.0
+# `kern.memorystatus_level` (0-100, "% free" in Activity Monitor's own "Memory Pressure"
+# sense) is the primary signal, not free swap: macOS grows its swap files dynamically in
+# ~1 GB increments and rarely shrinks them back, so `vm.swapusage`'s "free" figure sits under
+# 2 GB almost permanently even on a healthy machine (gm-analytics-engine-i37, 2026-09-28 --
+# this guard's first version used free swap and would have waited forever: 0.79 GB free with
+# memorystatus_level=71%, a perfectly healthy host). Swap USED, not free, is kept as a
+# backstop against the specific runaway this bead hit (~30 GB used on 2026-09-27).
+MIN_MEMORYSTATUS_LEVEL_PCT: Final = 25
+MAX_SWAP_USED_GB: Final = 26.0
 MIN_FREE_DISK_GB: Final = 8.0
 
 
@@ -160,47 +168,69 @@ def _peak_rss_mb() -> float:
     return raw / (1024 * 1024) if sys.platform == "darwin" else raw / 1024
 
 
-def _free_swap_gb() -> float | None:
-    """Free swap, in GB, parsed from `sysctl vm.swapusage` (macOS/Colima host only) --
-    `None` if that sysctl isn't available (e.g. this ever runs on Linux CI), so
-    `wait_for_host_pressure` degrades to a disk-only check rather than failing outright."""
+def _memorystatus_level_pct() -> int | None:
+    """`kern.memorystatus_level` (0-100): macOS's own "% of memory free" figure -- the same
+    number Activity Monitor's "Memory Pressure" gauge is built from. `None` if that sysctl
+    isn't available (e.g. this ever runs on Linux CI), so `wait_for_host_pressure` degrades
+    to its swap-used and disk checks rather than failing outright."""
+    result = subprocess.run(["sysctl", "-n", "kern.memorystatus_level"], capture_output=True, text=True, check=False)  # noqa: S607
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _swap_used_gb() -> float | None:
+    """Swap USED, in GB, parsed from `sysctl vm.swapusage` -- the backstop against the
+    specific runaway gm-analytics-engine-i37 hit on 2026-09-27 (~30 GB used), not the primary
+    signal (see `MIN_MEMORYSTATUS_LEVEL_PCT`'s comment for why free swap alone is the wrong
+    metric on macOS). `None` if that sysctl isn't available."""
     result = subprocess.run(["sysctl", "vm.swapusage"], capture_output=True, text=True, check=False)  # noqa: S607 -- fixed argv, read-only.
     if result.returncode != 0:
         return None
-    match = re.search(r"free\s*=\s*([\d.]+)M", result.stdout)
+    match = re.search(r"used\s*=\s*([\d.]+)M", result.stdout)
     return float(match.group(1)) / 1024.0 if match else None
 
 
 def wait_for_host_pressure(
     *,
-    min_free_swap_gb: float = MIN_FREE_SWAP_GB,
+    min_memorystatus_level_pct: float = MIN_MEMORYSTATUS_LEVEL_PCT,
+    max_swap_used_gb: float = MAX_SWAP_USED_GB,
     min_free_disk_gb: float = MIN_FREE_DISK_GB,
     poll_interval_s: float = HOST_PRESSURE_POLL_INTERVAL_S,
     log_interval_s: float = HOST_PRESSURE_LOG_INTERVAL_S,
     label: str = "",
 ) -> None:
     """Block (polling, never aborting) while the HOST -- not the throwaway container -- is
-    under memory or disk pressure: free swap below MIN_FREE_SWAP_GB, or free disk below
-    MIN_FREE_DISK_GB. Called before every heavy step (load, write, index build, sweep,
-    churn) and between `EF_SEARCH_SWEEP` iterations (gm-analytics-engine-i37, 2026-09-28 --
-    see the module-level comment above `_DEFAULT_CHUNK_BYTES`). Logs at most once per
-    LOG_INTERVAL_S while waiting, not on every poll -- this can legitimately wait a long
-    time without anything having gone wrong.
+    under memory or disk pressure: `kern.memorystatus_level` below MIN_MEMORYSTATUS_LEVEL_PCT
+    (primary signal), swap used above MAX_SWAP_USED_GB (backstop against the specific
+    2026-09-27 runaway), or free disk below MIN_FREE_DISK_GB. Called before every heavy step
+    (load, write, index build, sweep, churn) and between `EF_SEARCH_SWEEP` iterations
+    (gm-analytics-engine-i37, 2026-09-28 -- see the module-level comment above
+    `_DEFAULT_CHUNK_BYTES`, and `MIN_MEMORYSTATUS_LEVEL_PCT`'s own comment for why this isn't
+    a free-swap check). Logs at most once per LOG_INTERVAL_S while waiting, not on every
+    poll -- this can legitimately wait a long time without anything having gone wrong.
     """
     last_logged = 0.0
     while True:
-        free_swap_gb = _free_swap_gb()
+        level_pct = _memorystatus_level_pct()
+        swap_used_gb = _swap_used_gb()
         free_disk_gb = shutil.disk_usage("/").free / 1e9
-        swap_ok = free_swap_gb is None or free_swap_gb >= min_free_swap_gb
+        memory_ok = level_pct is None or level_pct >= min_memorystatus_level_pct
+        swap_ok = swap_used_gb is None or swap_used_gb <= max_swap_used_gb
         disk_ok = free_disk_gb >= min_free_disk_gb
-        if swap_ok and disk_ok:
+        if memory_ok and swap_ok and disk_ok:
             return
         now = time.monotonic()
         if now - last_logged >= log_interval_s:
-            swap_text = "n/a" if free_swap_gb is None else f"{free_swap_gb:.2f} GB"
+            level_text = "n/a" if level_pct is None else f"{level_pct}%"
+            swap_text = "n/a" if swap_used_gb is None else f"{swap_used_gb:.2f} GB"
             print(
-                f"⏳ {label}host under pressure (free swap={swap_text}, free disk={free_disk_gb:.2f} GB) -- "
-                f"waiting for swap>={min_free_swap_gb:.1f} GB and disk>={min_free_disk_gb:.1f} GB",
+                f"⏳ {label}host under pressure (memorystatus_level={level_text}, swap used={swap_text}, "
+                f"free disk={free_disk_gb:.2f} GB) -- waiting for level>={min_memorystatus_level_pct:.0f}%, "
+                f"swap used<={max_swap_used_gb:.1f} GB, disk>={min_free_disk_gb:.1f} GB",
                 file=sys.stderr,
                 flush=True,
             )

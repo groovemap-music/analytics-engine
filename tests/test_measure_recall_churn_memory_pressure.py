@@ -129,40 +129,102 @@ class TestStreamExactTopKMatchesFullMatrix:
 
 class TestHostPressureGuard:
     """`wait_for_host_pressure` must never abort -- it blocks (via `time.sleep`, mocked away
-    here) while free swap or free disk is below threshold, and returns as soon as both clear.
+    here) while `kern.memorystatus_level` is low, swap used is high, or free disk is low, and
+    returns as soon as all three clear.
+
+    gm-analytics-engine-i37, 2026-09-28: this guard's FIRST version checked free swap, which
+    is the wrong metric on macOS -- swap files grow dynamically in ~1 GB increments and are
+    rarely shrunk back, so free swap sits under 2 GB almost permanently even on a healthy
+    host (caught live: 0.79 GB free with memorystatus_level=71%, a perfectly healthy
+    machine -- that guard would have waited forever). `kern.memorystatus_level` (0-100, "%
+    free") is the primary signal now; swap USED (not free) is kept only as a backstop against
+    the specific ~30 GB runaway this bead hit on 2026-09-27.
     """
 
-    def test_free_swap_gb_parses_sysctl_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_memorystatus_level_parses_sysctl_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class _Result:
             returncode = 0
-            stdout = "vm.swapusage: total = 15360.00M  used = 14225.81M  free = 1134.19M  (encrypted)\n"
+            stdout = "71\n"
 
         monkeypatch.setattr(mrc.subprocess, "run", lambda *a, **k: _Result())
-        assert mrc._free_swap_gb() == pytest.approx(1134.19 / 1024.0, abs=1e-6)
+        assert mrc._memorystatus_level_pct() == 71
 
-    def test_free_swap_gb_returns_none_when_sysctl_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_memorystatus_level_returns_none_when_sysctl_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class _Result:
             returncode = 1
             stdout = ""
 
         monkeypatch.setattr(mrc.subprocess, "run", lambda *a, **k: _Result())
-        assert mrc._free_swap_gb() is None
+        assert mrc._memorystatus_level_pct() is None
+
+    def test_memorystatus_level_returns_none_on_unparseable_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _Result:
+            returncode = 0
+            stdout = "not-a-number\n"
+
+        monkeypatch.setattr(mrc.subprocess, "run", lambda *a, **k: _Result())
+        assert mrc._memorystatus_level_pct() is None
+
+    def test_swap_used_gb_parses_sysctl_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _Result:
+            returncode = 0
+            stdout = "vm.swapusage: total = 15360.00M  used = 14225.81M  free = 1134.19M  (encrypted)\n"
+
+        monkeypatch.setattr(mrc.subprocess, "run", lambda *a, **k: _Result())
+        assert mrc._swap_used_gb() == pytest.approx(14225.81 / 1024.0, abs=1e-6)
+
+    def test_swap_used_gb_returns_none_when_sysctl_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _Result:
+            returncode = 1
+            stdout = ""
+
+        monkeypatch.setattr(mrc.subprocess, "run", lambda *a, **k: _Result())
+        assert mrc._swap_used_gb() is None
 
     def test_returns_immediately_when_pressure_is_fine(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(mrc, "_free_swap_gb", lambda: 10.0)
+        monkeypatch.setattr(mrc, "_memorystatus_level_pct", lambda: 71)
+        monkeypatch.setattr(mrc, "_swap_used_gb", lambda: 5.0)
         monkeypatch.setattr(mrc.shutil, "disk_usage", lambda _path: type("U", (), {"free": 50 * 1024**3})())
 
         def _boom(_seconds: float) -> None:
-            raise AssertionError("must not sleep when neither swap nor disk is under pressure")
+            raise AssertionError("must not sleep when memory, swap, and disk are all fine")
 
         monkeypatch.setattr(mrc.time, "sleep", _boom)
         mrc.wait_for_host_pressure()  # must return without sleeping.
 
-    def test_waits_while_swap_is_low_then_returns(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        swap_values = iter([0.5, 0.5, 3.0])  # under threshold twice, then clears.
+    def test_a_healthy_low_free_swap_host_does_not_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The exact incident this guard's rewrite fixes: 0.79 GB free swap (which the OLD
+        free-swap check would have blocked on forever) but memorystatus_level=71% (healthy)
+        and swap used well under the 26 GB backstop -- must return immediately."""
+        monkeypatch.setattr(mrc, "_memorystatus_level_pct", lambda: 71)
+        monkeypatch.setattr(mrc, "_swap_used_gb", lambda: 14.5)
+        monkeypatch.setattr(mrc.shutil, "disk_usage", lambda _path: type("U", (), {"free": 20 * 1024**3})())
+
+        def _boom(_seconds: float) -> None:
+            raise AssertionError("a healthy memorystatus_level must not wait on low free swap")
+
+        monkeypatch.setattr(mrc.time, "sleep", _boom)
+        mrc.wait_for_host_pressure()
+
+    def test_waits_while_memorystatus_level_is_low_then_returns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        level_values = iter([10, 10, 80])  # under threshold twice, then clears.
         sleep_calls = []
 
-        monkeypatch.setattr(mrc, "_free_swap_gb", lambda: next(swap_values))
+        monkeypatch.setattr(mrc, "_memorystatus_level_pct", lambda: next(level_values))
+        monkeypatch.setattr(mrc, "_swap_used_gb", lambda: 5.0)
+        monkeypatch.setattr(mrc.shutil, "disk_usage", lambda _path: type("U", (), {"free": 50 * 1024**3})())
+        monkeypatch.setattr(mrc.time, "sleep", sleep_calls.append)
+
+        mrc.wait_for_host_pressure(poll_interval_s=0.01, log_interval_s=0.0)
+
+        assert len(sleep_calls) == 2
+
+    def test_waits_while_swap_used_backstop_is_tripped_then_returns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        swap_values = iter([30.0, 30.0, 10.0])  # over the 26 GB backstop twice, then clears.
+        sleep_calls = []
+
+        monkeypatch.setattr(mrc, "_memorystatus_level_pct", lambda: 80)
+        monkeypatch.setattr(mrc, "_swap_used_gb", lambda: next(swap_values))
         monkeypatch.setattr(mrc.shutil, "disk_usage", lambda _path: type("U", (), {"free": 50 * 1024**3})())
         monkeypatch.setattr(mrc.time, "sleep", sleep_calls.append)
 
@@ -174,7 +236,8 @@ class TestHostPressureGuard:
         disk_frees = iter([1 * 1024**3, 1 * 1024**3, 20 * 1024**3])
         sleep_calls = []
 
-        monkeypatch.setattr(mrc, "_free_swap_gb", lambda: 10.0)
+        monkeypatch.setattr(mrc, "_memorystatus_level_pct", lambda: 80)
+        monkeypatch.setattr(mrc, "_swap_used_gb", lambda: 5.0)
         monkeypatch.setattr(mrc.shutil, "disk_usage", lambda _path: type("U", (), {"free": next(disk_frees)})())
         monkeypatch.setattr(mrc.time, "sleep", sleep_calls.append)
 
@@ -182,13 +245,15 @@ class TestHostPressureGuard:
 
         assert len(sleep_calls) == 2
 
-    def test_none_free_swap_degrades_to_disk_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """`sysctl` unavailable (e.g. non-macOS) must not make this guard wait forever."""
-        monkeypatch.setattr(mrc, "_free_swap_gb", lambda: None)
+    def test_none_signals_degrade_gracefully(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`sysctl` unavailable (e.g. non-macOS) for BOTH memory signals must not make this
+        guard wait forever -- it should fall back to the disk check alone."""
+        monkeypatch.setattr(mrc, "_memorystatus_level_pct", lambda: None)
+        monkeypatch.setattr(mrc, "_swap_used_gb", lambda: None)
         monkeypatch.setattr(mrc.shutil, "disk_usage", lambda _path: type("U", (), {"free": 50 * 1024**3})())
 
         def _boom(_seconds: float) -> None:
-            raise AssertionError("must not sleep when swap is unknown but disk is fine")
+            raise AssertionError("must not sleep when both memory signals are unknown but disk is fine")
 
         monkeypatch.setattr(mrc.time, "sleep", _boom)
         mrc.wait_for_host_pressure()
