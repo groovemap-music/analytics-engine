@@ -1206,11 +1206,18 @@ def print_parity_report(graph: dict) -> None:
     print(f"parse: {graph['parse_elapsed_s']:.1f}s, build: {graph['build_elapsed_s']:.1f}s", file=sys.stderr)
 
 
-def _out_path_for_w0(out: Path, w0: float, multiple: bool) -> Path:
-    """`out` unchanged when there is only one `--w0` value (backward compatible with every
-    existing caller); otherwise `out` with `.w0-<value>` inserted before the suffix, e.g.
-    `aug.npz` -> `aug.w0-0.1.npz`, so a sweep's outputs never collide on one filename."""
-    return out if not multiple else out.with_name(f"{out.stem}.w0-{w0:g}{out.suffix}")
+def _out_path_for_config(out: Path, w0: float, self_weight: float, multiple: bool) -> Path:
+    """`out` unchanged when there is only one `--w0` value and `--self-weight` is 0 (backward
+    compatible with every existing caller); otherwise `out` with `.w0-<value>` and/or
+    `.self-<value>` inserted before the suffix, e.g. `aug.npz` -> `aug.w0-0.1.npz` or
+    `aug.npz` -> `aug.self-0.05.npz`, so a sweep's outputs, or a non-default self weight,
+    never collide on one filename."""
+    stem = out.stem
+    if multiple:
+        stem = f"{stem}.w0-{w0:g}"
+    if self_weight:
+        stem = f"{stem}.self-{self_weight:g}"
+    return out if stem == out.stem else out.with_name(f"{stem}{out.suffix}")
 
 
 def _releases_source(value: str) -> Path | str:
@@ -1240,6 +1247,15 @@ def main() -> None:
         help="one or more step-0 FastRP weights (weights=w0,1,1,1,1); the graph is parsed and "
         "built ONCE and fastrp() re-run once per value, each as its own model_version and its "
         "own output file (see --out's per-w0 naming when more than one value is given).",
+    )
+    parser.add_argument(
+        "--self-weight",
+        type=float,
+        default=0.0,
+        help="FastRPConfig.self_weight (gm-analytics-engine-8ts): weight on normalize(R[v]), "
+        "the node's own hashed projection row -- breaks exact ties between artists with "
+        "identical graph neighbourhoods. Applied to every --w0 value in the sweep. 0.0 (the "
+        "default) is bit-identical to omitting it.",
     )
     parser.add_argument("--workers", type=int, default=5)
     parser.add_argument("--threads", type=int, default=6)
@@ -1354,8 +1370,8 @@ def main() -> None:
 
     multiple = len(args.w0) > 1
     for w0 in args.w0:
-        out = _out_path_for_w0(args.out, w0, multiple)
-        config = FastRPConfig(weights=(w0, 1.0, 1.0, 1.0, 1.0))
+        out = _out_path_for_config(args.out, w0, args.self_weight, multiple)
+        config = FastRPConfig(weights=(w0, 1.0, 1.0, 1.0, 1.0), self_weight=args.self_weight)
         print(f"\n🔢 running fastrp: {config.model_version}", file=sys.stderr)
         print(f"numpy {np.__version__}, scipy {scipy.__version__}", file=sys.stderr)
         fastrp_started = time.perf_counter()
@@ -1398,6 +1414,7 @@ def main() -> None:
             "dump_date": args.dump_date,
             "method_version": config.model_version,
             "w0": w0,
+            "self_weight": args.self_weight,
             "release_count": graph["release_count"],
             "master_count": graph["master_count"],
             "distinct_by_kind": graph["distinct_by_kind"],
