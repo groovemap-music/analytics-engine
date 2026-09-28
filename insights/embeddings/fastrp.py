@@ -1,10 +1,24 @@
 """FastRP (Chen et al., 2019) with the configuration ADR 0013 adopted.
 
-The embedding of node ``v`` is ``sum_k w_k * normalize((P^(k+1) R)[v])`` over the
-iteration weights ``w``, where ``P = D^-1 A`` is the random-walk transition matrix,
-``R`` the very sparse projection, and ``normalize`` scales a row to unit length.
-That is the spike's ``embed.fastrp`` (design ``docs/spikes/gm-design-chw.2/``) with
-two changes, neither of which changes the method:
+The embedding of node ``v`` is::
+
+    sum_k w_k * normalize((P^(k+1) R)[v]) + self_weight * normalize(R[v])
+
+over the iteration weights ``w``, where ``P = D^-1 A`` is the random-walk transition
+matrix, ``R`` the very sparse projection, and ``normalize`` scales a row to unit
+length. The trailing ``self_weight`` term (gm-analytics-engine-8ts) is a node's own
+row of ``R`` -- its hashed projection, never propagated through ``P`` -- and its
+default is ``0.0``, which reproduces the original sum bit for bit (no extra term is
+computed at all; see ``test_self_weight_zero_is_bit_identical_to_before``). Without
+it, two nodes with identical neighbourhoods out to ``len(weights) - 1`` hops get
+identical vectors -- gm-analytics-engine-i37 found this ties 42.22% of edges-v3
+artist vectors -- because nothing in the sum carries a node's own identity, only
+its neighbourhood's. A small positive ``self_weight`` breaks that tie deterministically
+(``R[v]`` is a pure function of ``v``'s stable key) while barely perturbing nodes
+whose neighbourhoods already differ.
+
+That base sum is the spike's ``embed.fastrp`` (design ``docs/spikes/gm-design-chw.2/``)
+with two changes, neither of which changes the method:
 
 - ``R`` is ``HashedProjection``: each node's row is a function of its stable key and
   the pinned seed, not a draw from a global random stream.
@@ -51,7 +65,7 @@ if TYPE_CHECKING:
 
 # Bump when a code change alters any output bit for the same graph and config; it
 # is part of model_version, so old and new vectors never share a key.
-FASTRP_ALGORITHM_VERSION: Final = 1
+FASTRP_ALGORITHM_VERSION: Final = 2
 # The pinned projection seed (the date ADR 0013's data-access amendment landed).
 DEFAULT_SEED: Final = 20260924
 # Four columns per block keeps the full-catalog run near 10 GB; see docs/embeddings.md.
@@ -67,6 +81,10 @@ class FastRPConfig:
     dim: int = 128
     weights: tuple[float, ...] = field(default=(0.0, 1.0, 1.0, 1.0, 1.0))
     beta: float = 0.0
+    # Weight on normalize(R[v]), the node's own hashed projection row, never propagated
+    # through P. 0.0 (the default) is bit-identical to the pre-8ts sum: see fastrp()'s
+    # `if config.self_weight:` guard, which skips the term's computation entirely.
+    self_weight: float = 0.0
     seed: int = DEFAULT_SEED
 
     def __post_init__(self) -> None:
@@ -81,6 +99,7 @@ class FastRPConfig:
         weights = ",".join(f"{w:g}" for w in self.weights)
         return (
             f"fastrp-v{FASTRP_ALGORITHM_VERSION}:dim={self.dim}:weights={weights}:beta={self.beta:g}"
+            f":self={self.self_weight:g}"
             f":proj=achlioptas-s3:rows=splitmix64(blake2b64(kind,key)):seed={self.seed}"
         )
 
@@ -137,10 +156,18 @@ def _fastrp(
     # Per-power scale w_k / |row| of the returned rows only; other rows' norms are
     # needed solely to be summed, never kept.
     scales: dict[int, NDArray[np.float32]] = {}
+    # normalize(R[v])'s scale, computed once up front like every P^(k+1) R scale below.
+    # `current` right after `project(start, stop)`, before any `propagate()` call, IS the
+    # R block for those columns -- the projection is already generated block by block for
+    # the propagated terms, so the self term needs no extra materialisation of R.
+    self_scale: NDArray[np.float32] | None = None
     if len(blocks) > 1:
         sums = {k: np.zeros(n, dtype=np.float64) for k, w in enumerate(config.weights) if w}
+        self_sum = np.zeros(n, dtype=np.float64) if config.self_weight else None
         for start, stop in blocks:
             current = project(start, stop)
+            if self_sum is not None:
+                _accumulate_squares(current, self_sum)
             for k in range(powers):
                 current = propagate(current)
                 if k in sums:
@@ -148,11 +175,27 @@ def _fastrp(
             del current
         for k in list(sums):
             scales[k] = _scale(config.weights[k], sums.pop(k), selected)
+        if self_sum is not None:
+            self_scale = _scale(config.self_weight, self_sum, selected)
+            del self_sum
 
     for start, stop in blocks:
         current = project(start, stop)
         block = np.zeros((out.shape[0], stop - start), dtype=np.float32)
         picked = None if selected is None else np.empty_like(block)
+        if config.self_weight:
+            if len(blocks) == 1:
+                total = np.zeros(n, dtype=np.float64)
+                _accumulate_squares(current, total)
+                self_scale = _scale(config.self_weight, total, selected)
+                del total
+            assert self_scale is not None  # set here (single block) or by the pass-1 loop above
+            if picked is None or selected is None:
+                block += self_scale[:, None] * current
+            else:
+                np.take(current, selected, axis=0, out=picked)
+                picked *= self_scale[:, None]
+                block += picked
         for k in range(powers):
             current = propagate(current)
             weight = config.weights[k]
@@ -274,7 +317,9 @@ def estimate_peak_bytes(
     # cursor, all live while the counting sort scatters.
     build = 8 * undirected_edges + entries * index + (n_nodes + 1) * index + 16 * n_nodes + keys
     width = min(block_columns, config.dim)
-    active = sum(1 for w in config.weights if w)
+    # The self term (self_weight != 0) holds its own float64 row-norm sum through pass 1 and
+    # its own float32 scale through pass 2, exactly like one more nonzero propagation weight.
+    active = sum(1 for w in config.weights if w) + (1 if config.self_weight else 0)
     resident = csr + keys + 8 * n_nodes + n_rows * config.dim * out_itemsize  # + degree, output
     blocks = 2 * 4 * n_nodes * width  # a block and its product with P
     # Pass 1 (two-pass only): float64 squared norms per active power, plus the float64
