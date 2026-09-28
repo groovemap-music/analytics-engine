@@ -25,6 +25,8 @@ The outbound client identifies itself as `analytics-engine/<version>` with the c
 | `POSTGRES_POOL_MIN_SIZE` | no | Minimum shared PostgreSQL pool size; defaults to `1` and is clamped to the maximum |
 | `POSTGRES_POOL_MAX_SIZE` | no | Maximum shared PostgreSQL pool size; defaults to `4`; invalid or non-positive values use the default |
 | `LOG_LEVEL` | no | Uvicorn and application log level; defaults to `INFO` |
+| `LOG_FILE_MAX_BYTES` | no | Size in bytes at which the `/logs/analytics-engine.log` file rolls over; defaults to `104857600` (100 MiB); a non-numeric or non-positive override falls back to the default |
+| `LOG_FILE_BACKUP_COUNT` | no | Number of rotated log backups retained; defaults to `5`; a non-numeric or non-positive override falls back to the default |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | no | Collector base URL (for example `http://otel-collector:4318`); unset disables both metrics and trace export |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | no | Metrics-only collector override; falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | no | Traces-only collector override; falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` |
