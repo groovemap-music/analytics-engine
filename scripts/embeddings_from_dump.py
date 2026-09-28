@@ -1399,6 +1399,12 @@ def main() -> None:
             # `stored_model_version` with, and re-parsing one back out of `model_version`'s
             # text is both more code and more fragile than saving the tuple that produced it.
             weights=np.asarray(config.weights, dtype=np.float64),
+            # `self_weight` (gm-analytics-engine-8ts): same reasoning as `weights` above --
+            # without it, `measure_recall_churn.py`'s `_load_month` would reconstruct a
+            # `FastRPConfig` with `self_weight`'s default (0.0) for every file, and its own
+            # self-consistency check (`method_version != config.model_version`) would reject
+            # any npz saved with a non-zero self weight as internally inconsistent.
+            self_weight=config.self_weight,
             # `degrees` (i37's degree-bucketed recall): each row of `vectors`/`artist_ids` is
             # one artist; `degrees[i]` is that SAME artist's undirected degree in this month's
             # graph, independent of `w0` (the graph -- and therefore every artist's degree --
