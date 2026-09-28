@@ -24,12 +24,26 @@ if TYPE_CHECKING:
 from scripts import measure_recall_churn as mrc
 
 
-def _synthetic_month(*, dump_id: str, dump_date: str, n: int, seed: int) -> dict[str, Any]:
+def _synthetic_month(tmp_path: Path, *, dump_id: str, dump_date: str, n: int, seed: int) -> dict[str, Any]:
+    """A month dict shaped exactly like `_load_month`'s real output -- gm-analytics-engine-
+    i37, 2026-09-28: `path` (not an in-memory `vectors` array) is what every real consumer
+    (`compute_exact_ground_truth`, `exact_churn_top_k`, `_ann_top_k` via the fakes below)
+    reads from now, so the synthetic month needs an actual tiny npz on disk, not a bare
+    array, or those real (unmocked) functions would KeyError on `month["path"]`."""
     rng = np.random.default_rng(seed)
     vectors = rng.normal(size=(n, 8)).astype(np.float32)
+    path = tmp_path / f"{dump_id}.npz"
+    np.savez_compressed(
+        path,
+        vectors=vectors,
+        artist_ids=np.array([f"a{i}" for i in range(n)], dtype=object),
+        model_version=np.array(f"test-model-version:{dump_id}"),
+        dump_id=np.array(dump_id),
+        dump_date=np.array(dump_date),
+    )
     return {
         "artist_ids": [f"a{i}" for i in range(n)],
-        "vectors": vectors,
+        "path": path,
         "degrees": None,
         "method_version": "test-method-version",
         "model_version": f"test-model-version:{dump_id}",
@@ -84,6 +98,12 @@ def _patch_infra(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mrc, "AsyncPostgreSQLPool", _FakePool)
     monkeypatch.setattr(mrc, "_apply_schema", _fake_apply_schema)
     monkeypatch.setattr(mrc, "measure_month", _fake_measure_month)
+    # gm-analytics-engine-i37, 2026-09-28: `wait_for_host_pressure` queries the REAL host's
+    # `sysctl vm.swapusage`/disk free space -- neutralized here so these control-flow tests
+    # never depend on (or block on) whatever the test-running machine's own memory/disk
+    # happens to look like. `TestHostPressureGuard` in test_measure_recall_churn_memory_
+    # pressure.py covers the guard's own logic directly, with mocked inputs.
+    monkeypatch.setattr(mrc, "wait_for_host_pressure", lambda **_kwargs: None)
 
 
 def _trimmed_args(tmp_path: Path, *, skip_larger_variant: bool) -> argparse.Namespace:
@@ -99,9 +119,9 @@ def _trimmed_args(tmp_path: Path, *, skip_larger_variant: bool) -> argparse.Name
     )
 
 
-def _months(n: int = 15) -> tuple[dict[str, Any], dict[str, Any], list[str], list[str], list[int]]:
-    aug = _synthetic_month(dump_id="aug-dump", dump_date="2026-08-01", n=n, seed=1)
-    sept = _synthetic_month(dump_id="sept-dump", dump_date="2026-09-01", n=n, seed=2)
+def _months(tmp_path: Path, n: int = 15) -> tuple[dict[str, Any], dict[str, Any], list[str], list[str], list[int]]:
+    aug = _synthetic_month(tmp_path, dump_id="aug-dump", dump_date="2026-08-01", n=n, seed=1)
+    sept = _synthetic_month(tmp_path, dump_id="sept-dump", dump_date="2026-09-01", n=n, seed=2)
     common_ids = sorted(set(aug["artist_ids"]) & set(sept["artist_ids"]))
     churn_sample_ids = common_ids
     sept_query_ids = sept["artist_ids"][:3]
@@ -124,7 +144,7 @@ async def test_skip_larger_variant_never_calls_the_build_and_records_the_reason(
     monkeypatch.setattr(mrc, "measure_index_variant", _unexpected_measure_index_variant)
     monkeypatch.setattr(mrc, "_drop_index", _unexpected_drop_index)
 
-    aug, sept, common_ids, churn_sample_ids, sept_query_ids, sept_query_positions = _months()
+    aug, sept, common_ids, churn_sample_ids, sept_query_ids, sept_query_positions = _months(tmp_path)
     args = _trimmed_args(tmp_path, skip_larger_variant=True)
 
     result = await mrc._main_async_trimmed(args, aug, sept, common_ids, churn_sample_ids, sept_query_ids, sept_query_positions)
@@ -157,7 +177,7 @@ async def test_without_the_flag_the_larger_variant_is_still_attempted(tmp_path: 
     monkeypatch.setattr(mrc, "measure_index_variant", _fake_measure_index_variant)
     monkeypatch.setattr(mrc, "_drop_index", _fake_drop_index)
 
-    aug, sept, common_ids, churn_sample_ids, sept_query_ids, sept_query_positions = _months()
+    aug, sept, common_ids, churn_sample_ids, sept_query_ids, sept_query_positions = _months(tmp_path)
     args = _trimmed_args(tmp_path, skip_larger_variant=False)
 
     result = await mrc._main_async_trimmed(args, aug, sept, common_ids, churn_sample_ids, sept_query_ids, sept_query_positions)

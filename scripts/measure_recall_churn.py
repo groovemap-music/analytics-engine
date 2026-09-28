@@ -48,14 +48,22 @@ import argparse
 import asyncio
 import itertools
 import json
+import re
+import resource
 import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
-from typing import Any, Final, NamedTuple
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 import numpy as np
+import numpy.lib.format as npy_format
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
 from common import AsyncPostgreSQLPool
 
 from insights.embedding_pipeline import (
@@ -125,6 +133,232 @@ DEGREE_BUCKET_EDGES: Final[tuple[int, ...]] = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 DOCKER: Final = shutil.which("docker") or "docker"
 
 DOCKER_POLL_INTERVAL_S: Final = 60.0
+
+# gm-analytics-engine-i37, 2026-09-28: the host (not the throwaway container) swapped to
+# 30 GB and its own free disk fell to 198 MB while this script held both months' vectors as
+# full float32 arrays (~10 GB combined) plus Postgres/Colima's own footprint. Two separate
+# fixes: (1) never materialize a whole month's vector array at once -- stream it from the
+# npz in bounded chunks instead (`_iter_npz_vector_chunks`, `_extract_rows`,
+# `_stream_exact_top_k`); (2) pause before every heavy step, and between ef_search sweep
+# iterations, while the HOST is under memory or disk pressure (`wait_for_host_pressure`).
+_DEFAULT_CHUNK_BYTES: Final = 256 * 1024 * 1024  # ~256 MB per streamed chunk of a month's vectors.
+_WRITE_CHUNK_BYTES: Final = 256 * 1024 * 1024  # ditto, for streaming a month's rows into Postgres.
+
+HOST_PRESSURE_POLL_INTERVAL_S: Final = 60.0
+HOST_PRESSURE_LOG_INTERVAL_S: Final = 600.0  # log at most once per 10 minutes while waiting -- never abort.
+MIN_FREE_SWAP_GB: Final = 2.0
+MIN_FREE_DISK_GB: Final = 8.0
+
+
+def _peak_rss_mb() -> float:
+    """This process's peak resident set size so far, in MB -- `resource.getrusage`'s
+    `ru_maxrss` is bytes on macOS/BSD and KiB on Linux, so this normalizes for whichever
+    platform is running. Logged after every heavy step (gm-analytics-engine-i37's
+    memory-pressure fix, 2026-09-28) so the measured peak, not a guess, is what gets reported.
+    """
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return raw / (1024 * 1024) if sys.platform == "darwin" else raw / 1024
+
+
+def _free_swap_gb() -> float | None:
+    """Free swap, in GB, parsed from `sysctl vm.swapusage` (macOS/Colima host only) --
+    `None` if that sysctl isn't available (e.g. this ever runs on Linux CI), so
+    `wait_for_host_pressure` degrades to a disk-only check rather than failing outright."""
+    result = subprocess.run(["sysctl", "vm.swapusage"], capture_output=True, text=True, check=False)  # noqa: S607 -- fixed argv, read-only.
+    if result.returncode != 0:
+        return None
+    match = re.search(r"free\s*=\s*([\d.]+)M", result.stdout)
+    return float(match.group(1)) / 1024.0 if match else None
+
+
+def wait_for_host_pressure(
+    *,
+    min_free_swap_gb: float = MIN_FREE_SWAP_GB,
+    min_free_disk_gb: float = MIN_FREE_DISK_GB,
+    poll_interval_s: float = HOST_PRESSURE_POLL_INTERVAL_S,
+    log_interval_s: float = HOST_PRESSURE_LOG_INTERVAL_S,
+    label: str = "",
+) -> None:
+    """Block (polling, never aborting) while the HOST -- not the throwaway container -- is
+    under memory or disk pressure: free swap below MIN_FREE_SWAP_GB, or free disk below
+    MIN_FREE_DISK_GB. Called before every heavy step (load, write, index build, sweep,
+    churn) and between `EF_SEARCH_SWEEP` iterations (gm-analytics-engine-i37, 2026-09-28 --
+    see the module-level comment above `_DEFAULT_CHUNK_BYTES`). Logs at most once per
+    LOG_INTERVAL_S while waiting, not on every poll -- this can legitimately wait a long
+    time without anything having gone wrong.
+    """
+    last_logged = 0.0
+    while True:
+        free_swap_gb = _free_swap_gb()
+        free_disk_gb = shutil.disk_usage("/").free / 1e9
+        swap_ok = free_swap_gb is None or free_swap_gb >= min_free_swap_gb
+        disk_ok = free_disk_gb >= min_free_disk_gb
+        if swap_ok and disk_ok:
+            return
+        now = time.monotonic()
+        if now - last_logged >= log_interval_s:
+            swap_text = "n/a" if free_swap_gb is None else f"{free_swap_gb:.2f} GB"
+            print(
+                f"⏳ {label}host under pressure (free swap={swap_text}, free disk={free_disk_gb:.2f} GB) -- "
+                f"waiting for swap>={min_free_swap_gb:.1f} GB and disk>={min_free_disk_gb:.1f} GB",
+                file=sys.stderr,
+                flush=True,
+            )
+            last_logged = now
+        time.sleep(poll_interval_s)
+
+
+def _iter_npz_vector_chunks(path: Path, *, member: str = "vectors", chunk_bytes: int = _DEFAULT_CHUNK_BYTES) -> Iterator[np.ndarray]:
+    """Stream MEMBER's rows from an `.npz` written by `np.savez_compressed`, roughly
+    CHUNK_BYTES worth at a time, decompressing incrementally via `zipfile` rather than
+    materializing the whole array in RAM the way `np.load` does -- the ~5 GB-per-month RSS
+    spike gm-analytics-engine-i37 hit on 2026-09-27/28 (host swapped to 30 GB with both
+    months' vectors live in Python RAM at once). Requires a 2D, C-contiguous member (true of
+    every `vectors` array `embeddings_from_dump.py` has ever written).
+    """
+    with zipfile.ZipFile(path) as zf, zf.open(f"{member}.npy") as fh:
+        major, _minor = npy_format.read_magic(fh)
+        if major == 1:
+            shape, fortran_order, dtype = npy_format.read_array_header_1_0(fh)
+        elif major == 2:
+            shape, fortran_order, dtype = npy_format.read_array_header_2_0(fh)
+        else:
+            raise ValueError(f"{path}:{member}: unsupported .npy format version {major}")
+        if fortran_order:
+            raise ValueError(f"{path}:{member}: fortran-order arrays are not supported by chunked reading")
+        if len(shape) != 2:
+            raise ValueError(f"{path}:{member}: expected a 2D array, got shape {shape}")
+        n_rows, n_cols = shape
+        row_bytes = n_cols * dtype.itemsize
+        chunk_rows = max(1, chunk_bytes // row_bytes)
+        remaining = n_rows
+        while remaining > 0:
+            take = min(chunk_rows, remaining)
+            buf = fh.read(take * row_bytes)
+            if len(buf) != take * row_bytes:
+                raise ValueError(f"{path}:{member}: truncated read ({len(buf)} of {take * row_bytes} bytes) -- npz may be corrupt")
+            yield np.frombuffer(buf, dtype=dtype).reshape(take, n_cols)
+            remaining -= take
+
+
+def _extract_rows(path: Path, positions: list[int], *, member: str = "vectors", chunk_bytes: int = _DEFAULT_CHUNK_BYTES) -> np.ndarray:
+    """Pull out exactly the rows at POSITIONS (must be sorted, ascending, and unique) from
+    MEMBER, in ONE streaming pass over PATH's npz (`_iter_npz_vector_chunks`) -- the
+    small-random-access counterpart to that function's bulk streaming, for the handful of
+    query/candidate positions the recall and churn computations need at any one time, never
+    the whole month's matrix."""
+    if positions != sorted(set(positions)):
+        raise ValueError("_extract_rows requires positions to be sorted, ascending, and unique")
+    if not positions:
+        return np.empty((0, 0), dtype=np.float32)
+    result: list[np.ndarray | None] = [None] * len(positions)
+    want_index = 0
+    global_position = 0
+    for chunk in _iter_npz_vector_chunks(path, member=member, chunk_bytes=chunk_bytes):
+        chunk_end = global_position + chunk.shape[0]
+        while want_index < len(positions) and positions[want_index] < chunk_end:
+            result[want_index] = chunk[positions[want_index] - global_position].copy()
+            want_index += 1
+        global_position = chunk_end
+        if want_index >= len(positions):
+            break
+    if want_index < len(positions):
+        raise ValueError(f"{path}:{member}: position {positions[want_index]} out of range (only {global_position} rows total)")
+    return np.stack(result)  # type: ignore[arg-type]
+
+
+def _ensure_normalized_cached(path: Path, cache: dict[int, np.ndarray], positions: Iterable[int], *, chunk_bytes: int = _DEFAULT_CHUNK_BYTES) -> None:
+    """Make sure CACHE has a normalized vector for every position in POSITIONS, streaming
+    PATH's `vectors` member once (bounded memory, `_extract_rows`) to fetch and normalize
+    whatever isn't already there. A no-op -- no I/O at all -- once everything's already
+    cached, which is the common case: a query's own position is cached once (by
+    `compute_exact_ground_truth` / `_stream_exact_top_k`) and reused for the rest of that
+    month's `EF_SEARCH_SWEEP`."""
+    missing = sorted({p for p in positions if p not in cache})
+    if not missing:
+        return
+    normalized = _normalized(_extract_rows(path, missing, chunk_bytes=chunk_bytes))
+    for position, vector in zip(missing, normalized, strict=True):
+        cache[position] = vector
+
+
+def _stream_exact_top_k(
+    path: Path,
+    query_positions: list[int],
+    k: int,
+    *,
+    member: str = "vectors",
+    chunk_bytes: int = _DEFAULT_CHUNK_BYTES,
+    cache: dict[int, np.ndarray] | None = None,
+) -> tuple[list[list[int]], list[float]]:
+    """`_exact_top_k`'s streaming counterpart: the same exact top-`k` cosine neighbours (by
+    position, excluding self) for each of QUERY_POSITIONS and each query's exact k-th-place
+    score, computed WITHOUT ever materializing PATH's full `vectors` array -- two streaming
+    passes over it instead (`_iter_npz_vector_chunks`): pass 1 (`_extract_rows`, via CACHE if
+    given) pulls out and normalizes just the query rows; pass 2 streams every row, scores it
+    against every query, and keeps a running top-`k` per query, merging each chunk's scores
+    into the running best-so-far the same way a single in-memory `argpartition` would.
+    Numerically equivalent to `_exact_top_k(_normalized(full_matrix), query_positions, k)` on
+    the same data for non-tied scores (verified directly against it on synthetic data with
+    continuous, effectively-never-tied random vectors); tie-break ORDER among exactly equal
+    scores may differ from the single-array version, which is fine here -- every caller
+    either treats the top-k as a SET (`_recall_at_k`, `_jaccard`) or explicitly tolerates
+    ties by score (`_tie_tolerant_recall_at_k`, `TIE_TOLERANCE`), never by position.
+    """
+    n_queries = len(query_positions)
+    if cache is not None:
+        _ensure_normalized_cached(path, cache, query_positions, chunk_bytes=chunk_bytes)
+        queries = np.stack([cache[p] for p in query_positions]).astype(np.float32)
+    else:
+        unique_sorted = sorted(set(query_positions))
+        normalized = _normalized(_extract_rows(path, unique_sorted, member=member, chunk_bytes=chunk_bytes))
+        by_position = dict(zip(unique_sorted, normalized, strict=True))
+        queries = np.stack([by_position[p] for p in query_positions]).astype(np.float32)
+
+    dim = queries.shape[1]
+    # Bound this pass's per-chunk memory by the DOMINANT cost -- the (chunk_rows, n_queries)
+    # score matrix, not the (chunk_rows, dim) vector chunk itself (dim=128 is tiny next to
+    # n_queries up to CHURN_SAMPLE_SIZE=10,000).
+    bytes_per_row = dim * 4 + n_queries * 4 + n_queries * 4  # chunk row (f32) + scores (f32) + positions (i32).
+    chunk_rows = max(1, chunk_bytes // bytes_per_row)
+
+    top_scores = np.full((n_queries, k), -np.inf, dtype=np.float32)
+    top_positions = np.full((n_queries, k), -1, dtype=np.int32)
+
+    position = 0
+    for chunk in _iter_npz_vector_chunks(path, member=member, chunk_bytes=chunk_rows * dim * 4):
+        chunk_normalized = _normalized(chunk)
+        scores = chunk_normalized @ queries.T  # (chunk_rows, n_queries)
+        for qi, qp in enumerate(query_positions):
+            if position <= qp < position + chunk.shape[0]:
+                scores[qp - position, qi] = -np.inf  # exclude self.
+        new_positions = np.broadcast_to((position + np.arange(chunk.shape[0], dtype=np.int32))[:, None], scores.shape)
+        combined_scores = np.concatenate([top_scores.T, scores], axis=0)
+        combined_positions = np.concatenate([top_positions.T, new_positions], axis=0)
+        # `argpartition` (O(n)), not `argsort` (O(n log n)): the running top-k doesn't need
+        # to stay SORTED between merges, only the final result does (sorted once, below, on
+        # just k elements). A full sort of (k + chunk_rows) elements every chunk was this
+        # function's actual dominant cost, not the matmul above -- gm-analytics-engine-i37,
+        # 2026-09-28, found while validating this fix's own peak-RSS claim: a 2,000-query
+        # ground-truth pass over 2M synthetic rows took 358s with a full sort per chunk.
+        keep = min(k, combined_scores.shape[0])
+        order = np.argpartition(-combined_scores, keep - 1, axis=0)[:keep] if keep > 0 else np.empty((0, n_queries), dtype=np.intp)
+        top_scores = np.full((n_queries, k), -np.inf, dtype=np.float32)
+        top_positions = np.full((n_queries, k), -1, dtype=np.int32)
+        top_scores[:, :keep] = np.take_along_axis(combined_scores, order, axis=0).T
+        top_positions[:, :keep] = np.take_along_axis(combined_positions, order, axis=0).T
+        position += chunk.shape[0]
+
+    # One final sort, on just k (small) elements per query, for the "highest score first"
+    # ordering `_exact_top_k` callers expect and to put the k-th (minimum, since sorted
+    # descending) score last.
+    final_order = np.argsort(-top_scores, axis=1)
+    top_scores = np.take_along_axis(top_scores, final_order, axis=1)
+    top_positions = np.take_along_axis(top_positions, final_order, axis=1)
+
+    results = [top_positions[i].tolist() for i in range(n_queries)]
+    kth_scores = [float(top_scores[i, -1]) if k > 0 else float("-inf") for i in range(n_queries)]
+    return results, kth_scores
 
 
 def wait_for_docker(*, poll_interval_s: float = DOCKER_POLL_INTERVAL_S) -> None:
@@ -206,7 +440,8 @@ def _load_month(path: Path) -> dict[str, Any]:
         # `degrees` (i37's degree-bucketed recall breakdown): each artist's undirected degree
         # in this month's graph, position-aligned with `artist_ids`/`vectors` -- this script
         # has no graph of its own, so a file saved before this bead (no `degrees` array) just
-        # skips the degree breakdown rather than failing outright.
+        # skips the degree breakdown rather than failing outright. Small enough (one int per
+        # artist) to load eagerly, unlike `vectors` below.
         degrees = data.get("degrees", None)
         if degrees is None:
             print(
@@ -214,7 +449,13 @@ def _load_month(path: Path) -> dict[str, Any]:
             )
         return {
             "artist_ids": [str(aid) for aid in data["artist_ids"]],
-            "vectors": data["vectors"],
+            # NOT `data["vectors"]`: gm-analytics-engine-i37, 2026-09-28 -- that materializes
+            # this month's whole (~5 GB at real catalog scale) vector array in RAM, and doing
+            # this for both months at once is most of what swapped the host to 30 GB.
+            # `path` is kept instead; every consumer that needs vectors streams them from it
+            # in bounded chunks (`_iter_npz_vector_chunks`, `_extract_rows`,
+            # `_stream_exact_top_k`) rather than holding the full array.
+            "path": path,
             "degrees": degrees,
             # `embeddings_from_dump.py` saves the bare `FastRPConfig.model_version`
             # (`method_version` here), not production's *stored* value -- it never imports
@@ -329,6 +570,23 @@ def _restart_container(*, name: str, image: str, shm_size: str, username: str, p
     return host or "127.0.0.1", int(port)
 
 
+async def _write_chunk_via_copy(conn: Any, month: dict[str, Any], ids_slice: list[str], vectors_chunk: np.ndarray) -> None:
+    """One COPY of IDS_SLICE/VECTORS_CHUNK -- pulled out of `_write_month` so its trial-vs-
+    COPY branch can call this once per streamed chunk instead of once for "the remainder"
+    of an in-memory array. `computed_at` is omitted from the column list, not passed as an
+    explicit NULL: the real column is `TIMESTAMPTZ NOT NULL DEFAULT NOW()`, and a DEFAULT
+    only fires when a COPY row's column list leaves it out entirely -- an explicit NULL (what
+    an earlier version of this fallback passed) violates NOT NULL outright.
+    """
+    async with (
+        conn.cursor() as cursor,
+        cursor.copy(f"COPY {ARTIST_EMBEDDINGS_TABLE} (artist_id, model_version, embedding, source_dump_id, source_dump_date) FROM STDIN") as copy,
+    ):
+        for index in range(len(ids_slice)):
+            vector_literal = "[" + ",".join(f"{value:g}" for value in vectors_chunk[index].tolist()) + "]"
+            await copy.write_row((ids_slice[index], month["model_version"], vector_literal, month["dump_id"], month["dump_date"]))
+
+
 async def _write_month(conn: Any, month: dict[str, Any]) -> dict[str, Any]:
     """Write one month's rows, timing a `TRIAL_BATCH_ROWS` trial through the real
     `_write_embeddings` first; falls back to `COPY` only if that trial extrapolates past
@@ -338,66 +596,79 @@ async def _write_month(conn: Any, month: dict[str, Any]) -> dict[str, Any]:
     `_already_loaded` idempotency check `insights.embedding_pipeline.load_embeddings` itself
     runs -- so a script restart against a container this month's rows already reached
     (a crash after write but before the index build, say) doesn't repeat an ~18-minute write.
+
+    Streams `month["path"]`'s vectors in `_WRITE_CHUNK_BYTES`-sized chunks
+    (`_iter_npz_vector_chunks`) rather than holding the whole month's array at once
+    (gm-analytics-engine-i37, 2026-09-28) -- the trial is measured on (up to)
+    `TRIAL_BATCH_ROWS` rows from the FIRST chunk; every row after that, in that chunk and
+    every subsequent one, goes through whichever path (`_write_embeddings` or COPY) the
+    trial's extrapolation picked.
     """
     if await _already_loaded(conn, month["model_version"]):
         print("  already loaded (skipping write)", file=sys.stderr)
         return {"rows_written": len(month["artist_ids"]), "trial_elapsed_s": 0.0, "extrapolated_full_s": 0.0, "used_copy": False, "skipped": True}
 
     artist_ids = month["artist_ids"]
-    vectors = month["vectors"]
     total = len(artist_ids)
-    trial_n = min(TRIAL_BATCH_ROWS, total)
 
-    trial_started = time.perf_counter()
-    trial_rows = await _write_embeddings(
-        conn,
-        model_version=month["model_version"],
-        dump_id=month["dump_id"],
-        dump_date=month["dump_date"],
-        artist_ids=artist_ids[:trial_n],
-        vectors=vectors[:trial_n],
-    )
-    trial_elapsed = time.perf_counter() - trial_started
-    extrapolated_s = trial_elapsed * (total / trial_n) if trial_n else 0.0
-    print(
-        f"  trial: {trial_rows:,} rows in {trial_elapsed:.1f}s -> extrapolated full month {extrapolated_s:.0f}s ({extrapolated_s / 60:.1f} min)",
-        file=sys.stderr,
-    )
-
+    rows_written = 0
+    trial_elapsed = 0.0
+    extrapolated_s = 0.0
     used_copy = False
-    if extrapolated_s > TRIAL_TIME_BUDGET_S and trial_n < total:
-        print(f"  extrapolated time exceeds {TRIAL_TIME_BUDGET_S / 60:.0f} min budget -- falling back to COPY for the remainder", file=sys.stderr)
-        used_copy = True
-        remaining_ids = artist_ids[trial_n:]
-        remaining_vectors = vectors[trial_n:]
-        # computed_at is omitted from the column list, not passed as an explicit NULL:
-        # the real column is `TIMESTAMPTZ NOT NULL DEFAULT NOW()`, and a DEFAULT only
-        # fires when a COPY row's column list leaves it out entirely -- an explicit NULL
-        # (what an earlier version of this fallback passed) violates NOT NULL outright.
-        async with (
-            conn.cursor() as cursor,
-            cursor.copy(f"COPY {ARTIST_EMBEDDINGS_TABLE} (artist_id, model_version, embedding, source_dump_id, source_dump_date) FROM STDIN") as copy,
-        ):
-            for index in range(len(remaining_ids)):
-                vector_literal = "[" + ",".join(f"{value:g}" for value in remaining_vectors[index].tolist()) + "]"
-                await copy.write_row((remaining_ids[index], month["model_version"], vector_literal, month["dump_id"], month["dump_date"]))
-        rows_written = trial_rows + len(remaining_ids)
-    elif trial_n < total:
-        write_started = time.perf_counter()
-        remaining_rows = await _write_embeddings(
-            conn,
-            model_version=month["model_version"],
-            dump_id=month["dump_id"],
-            dump_date=month["dump_date"],
-            artist_ids=artist_ids[trial_n:],
-            vectors=vectors[trial_n:],
-        )
-        write_elapsed = time.perf_counter() - write_started
-        print(f"  remainder: {remaining_rows:,} rows in {write_elapsed:.1f}s", file=sys.stderr)
-        rows_written = trial_rows + remaining_rows
-    else:
-        rows_written = trial_rows
+    trial_measured = False
+    position = 0
 
+    for chunk in _iter_npz_vector_chunks(month["path"], chunk_bytes=_WRITE_CHUNK_BYTES):
+        ids_slice = artist_ids[position : position + chunk.shape[0]]
+
+        if not trial_measured:
+            trial_n = min(TRIAL_BATCH_ROWS, chunk.shape[0])
+            trial_started = time.perf_counter()
+            trial_rows = await _write_embeddings(
+                conn,
+                model_version=month["model_version"],
+                dump_id=month["dump_id"],
+                dump_date=month["dump_date"],
+                artist_ids=ids_slice[:trial_n],
+                vectors=chunk[:trial_n],
+            )
+            trial_elapsed = time.perf_counter() - trial_started
+            extrapolated_s = trial_elapsed * (total / trial_n) if trial_n else 0.0
+            print(
+                f"  trial: {trial_rows:,} rows in {trial_elapsed:.1f}s -> extrapolated full month {extrapolated_s:.0f}s "
+                f"({extrapolated_s / 60:.1f} min)",
+                file=sys.stderr,
+            )
+            rows_written += trial_rows
+            trial_measured = True
+            if extrapolated_s > TRIAL_TIME_BUDGET_S and trial_n < total:
+                print(
+                    f"  extrapolated time exceeds {TRIAL_TIME_BUDGET_S / 60:.0f} min budget -- falling back to COPY for the remainder",
+                    file=sys.stderr,
+                )
+                used_copy = True
+            rest_ids, rest_vectors = ids_slice[trial_n:], chunk[trial_n:]
+        else:
+            rest_ids, rest_vectors = ids_slice, chunk
+
+        if rest_ids:
+            if used_copy:
+                await _write_chunk_via_copy(conn, month, rest_ids, rest_vectors)
+                rows_written += len(rest_ids)
+            else:
+                remaining_rows = await _write_embeddings(
+                    conn,
+                    model_version=month["model_version"],
+                    dump_id=month["dump_id"],
+                    dump_date=month["dump_date"],
+                    artist_ids=rest_ids,
+                    vectors=rest_vectors,
+                )
+                rows_written += remaining_rows
+
+        position += chunk.shape[0]
+
+    print(f"  peak RSS after write: {_peak_rss_mb():.0f} MB", file=sys.stderr)
     return {"rows_written": rows_written, "trial_elapsed_s": trial_elapsed, "extrapolated_full_s": extrapolated_s, "used_copy": used_copy}
 
 
@@ -484,7 +755,8 @@ async def _drop_index(conn: Any, model_version: str) -> None:
 async def _ann_top_k(
     conn: Any,
     model_version: str,
-    vectors: np.ndarray,
+    path: Path,
+    normalized_cache: dict[int, np.ndarray],
     artist_ids: list[str],
     positions: list[int],
     ef_search: int,
@@ -493,6 +765,13 @@ async def _ann_top_k(
     latencies_ms: list[float] | None = None,
 ) -> list[list[str] | None]:
     """The live index's top-`k` artist_ids for each query position's vector, at EF_SEARCH.
+
+    Takes PATH and NORMALIZED_CACHE rather than a full in-memory `vectors` array
+    (gm-analytics-engine-i37, 2026-09-28): `_ensure_normalized_cached` fetches (streaming,
+    bounded memory) whatever query positions aren't already cached, then this queries with
+    the cached NORMALIZED vector -- fine for `<=>` (cosine distance), which is invariant to
+    scaling either side by a positive constant, so a normalized query vector orders results
+    identically to the raw one the table itself stores.
 
     Excludes the query's own artist_id: its vector is stored verbatim in the table, so an
     un-excluded query always ranks itself first (distance 0), the same one-row exclusion
@@ -516,11 +795,12 @@ async def _ann_top_k(
     comparison). `None` (the default, and what every pre-existing caller still gets) skips
     the timing calls entirely rather than paying for a throwaway list.
     """
+    _ensure_normalized_cached(path, normalized_cache, positions)
     results: list[list[str] | None] = []
     async with conn.cursor() as cursor:
         await cursor.execute(f"SET hnsw.ef_search = {int(ef_search)}")
         for position in positions:
-            literal = "[" + ",".join(f"{value:g}" for value in vectors[position].tolist()) + "]"
+            literal = "[" + ",".join(f"{value:g}" for value in normalized_cache[position].tolist()) + "]"
             query_started = time.perf_counter() if latencies_ms is not None else None
             await cursor.execute(
                 f"SELECT artist_id FROM {ARTIST_EMBEDDINGS_TABLE} "  # noqa: S608
@@ -557,20 +837,25 @@ def _tie_tolerant_recall_at_k(
     exact_ids: list[list[str]],
     kth_scores: list[float],
     query_positions: list[int],
-    normalized: np.ndarray,
+    normalized_cache: dict[int, np.ndarray],
     id_to_position: dict[str, int],
     k: int,
 ) -> float:
     """`_recall_at_k`'s tie-tolerant counterpart (see `TIE_TOLERANCE`'s docstring for the
     definition): an ANN candidate outside the exact top-`k` still counts as a hit when its
     own exact cosine similarity to the query is within `TIE_TOLERANCE` of `kth_scores`, the
-    exact k-th-place score `_exact_top_k` already computed for that same query.
+    exact k-th-place score `_exact_top_k`/`_stream_exact_top_k` already computed for that
+    same query.
 
-    An ANN candidate this month's `id_to_position` doesn't recognise (shouldn't happen --
+    Takes NORMALIZED_CACHE (position -> normalized vector), not a full in-memory matrix
+    (gm-analytics-engine-i37, 2026-09-28) -- the caller (`_sweep_recall`) ensures every
+    candidate position this loop might look up is already cached before calling in, via
+    `_ensure_normalized_cached`, so this stays a plain dict lookup rather than doing I/O
+    itself. A candidate this month's `id_to_position` doesn't recognise (shouldn't happen --
     both come from the same month's `artist_ids` -- but the ANN index is a live, separately-
-    queried system) is treated as a miss rather than raising, the same permissive stance
-    `_recall_at_k`'s plain set-intersection already takes toward an ANN id absent from the
-    exact top-`k`.
+    queried system), or one somehow still missing from the cache, is treated as a miss
+    rather than raising, the same permissive stance `_recall_at_k`'s plain set-intersection
+    already takes toward an ANN id absent from the exact top-`k`.
     """
     scores = []
     for ann_ids, exact, kth_score, query_position in zip(ann, exact_ids, kth_scores, query_positions, strict=True):
@@ -585,7 +870,10 @@ def _tie_tolerant_recall_at_k(
             candidate_position = id_to_position.get(candidate)
             if candidate_position is None:
                 continue
-            candidate_score = float(normalized[candidate_position] @ normalized[query_position])
+            candidate_vector = normalized_cache.get(candidate_position)
+            if candidate_vector is None:
+                continue
+            candidate_score = float(candidate_vector @ normalized_cache[query_position])
             if candidate_score >= kth_score - TIE_TOLERANCE:
                 hits += 1
         scores.append(hits / min(k, len(exact)))
@@ -616,7 +904,7 @@ def _recall_by_degree_bucket(
     kth_scores: list[float],
     query_positions: list[int],
     degrees: np.ndarray | None,
-    normalized: np.ndarray,
+    normalized_cache: dict[int, np.ndarray],
     id_to_position: dict[str, int],
     k: int,
 ) -> dict[str, dict[str, Any]] | None:
@@ -644,7 +932,9 @@ def _recall_by_degree_bucket(
         result[label] = {
             "n": len(indices),
             "recall_strict": _recall_at_k(ann_subset, exact_subset, k),
-            "recall_tie_tolerant": _tie_tolerant_recall_at_k(ann_subset, exact_subset, kth_subset, positions_subset, normalized, id_to_position, k),
+            "recall_tie_tolerant": _tie_tolerant_recall_at_k(
+                ann_subset, exact_subset, kth_subset, positions_subset, normalized_cache, id_to_position, k
+            ),
         }
     return result
 
@@ -664,7 +954,7 @@ async def _sweep_recall(
     query_sample_positions: list[int],
     exact_ids_by_query: list[list[str]],
     kth_scores: list[float],
-    normalized: np.ndarray,
+    normalized_cache: dict[int, np.ndarray],
     id_to_position: dict[str, int],
 ) -> dict[str, Any]:
     """Strict + tie-tolerant + degree-bucketed recall@10, AND per-query ANN latency, across
@@ -672,6 +962,13 @@ async def _sweep_recall(
     live. Shared by `measure_index_variant` for both the standard and larger-index variants
     (gm-analytics-engine-i37) -- everything here is variant-agnostic; `measure_index_variant`
     is what builds/drops the index around this call.
+
+    NORMALIZED_CACHE (position -> normalized vector) replaces a full in-memory matrix
+    (gm-analytics-engine-i37, 2026-09-28): each `ef_search` iteration fetches whichever new
+    candidate positions this sweep point's ANN results introduced (`_ensure_normalized_cached`,
+    streaming, bounded memory) before scoring tie-tolerance against them, and the host-
+    pressure guard (`wait_for_host_pressure`) runs between iterations too, not just before
+    this function is entered.
     """
     print(f"=== {label}: recall@10 sweep (strict + tie-tolerant + degree-bucketed + latency) ===", file=sys.stderr)
     recall_by_ef: dict[int, float] = {}
@@ -680,15 +977,29 @@ async def _sweep_recall(
     latency_ms_by_ef: dict[int, dict[str, float]] = {}
     production_ef_search: int | None = None
     for ef_search in EF_SEARCH_SWEEP:
+        wait_for_host_pressure(label=f"{label} (ef_search={ef_search}): ")
         ann_started = time.perf_counter()
         latencies_ms: list[float] = []
         ann_ids_by_query = await _ann_top_k(
-            conn, month["model_version"], month["vectors"], month["artist_ids"], query_sample_positions, ef_search, 10, latencies_ms=latencies_ms
+            conn,
+            month["model_version"],
+            month["path"],
+            normalized_cache,
+            month["artist_ids"],
+            query_sample_positions,
+            ef_search,
+            10,
+            latencies_ms=latencies_ms,
         )
         ann_elapsed = time.perf_counter() - ann_started
         recall = _recall_at_k(ann_ids_by_query, exact_ids_by_query, 10)
+        # Every candidate the ANN index just returned needs its own normalized vector for
+        # tie-tolerance scoring below -- fetch (streaming) whichever of them isn't already
+        # cached, in ONE pass, before either recall breakdown looks any of them up.
+        candidate_positions = {id_to_position[candidate] for ann_ids in ann_ids_by_query for candidate in ann_ids[:10] if candidate in id_to_position}
+        _ensure_normalized_cached(month["path"], normalized_cache, candidate_positions)
         tie_recall = _tie_tolerant_recall_at_k(
-            ann_ids_by_query, exact_ids_by_query, kth_scores, query_sample_positions, normalized, id_to_position, 10
+            ann_ids_by_query, exact_ids_by_query, kth_scores, query_sample_positions, normalized_cache, id_to_position, 10
         )
         recall_by_ef[ef_search] = recall
         recall_tie_tolerant_by_ef[ef_search] = tie_recall
@@ -696,7 +1007,7 @@ async def _sweep_recall(
         # query artist's degree in this month's graph -- no extra ANN queries, kn3's own
         # measurement has no graph to compute this breakdown from at all.
         recall_by_ef_by_degree_bucket[ef_search] = _recall_by_degree_bucket(
-            ann_ids_by_query, exact_ids_by_query, kth_scores, query_sample_positions, month.get("degrees"), normalized, id_to_position, 10
+            ann_ids_by_query, exact_ids_by_query, kth_scores, query_sample_positions, month.get("degrees"), normalized_cache, id_to_position, 10
         )
         latency_ms_by_ef[ef_search] = {
             "mean_ms": sum(latencies_ms) / len(latencies_ms) if latencies_ms else 0.0,
@@ -711,6 +1022,7 @@ async def _sweep_recall(
         if production_ef_search is None and recall >= RECALL_TARGET:
             production_ef_search = ef_search
 
+    print(f"  peak RSS after sweep: {_peak_rss_mb():.0f} MB", file=sys.stderr)
     return {
         "recall_by_ef_search": recall_by_ef,
         "recall_tie_tolerant_by_ef_search": recall_tie_tolerant_by_ef,
@@ -731,7 +1043,7 @@ async def measure_index_variant(
     query_sample_positions: list[int],
     exact_ids_by_query: list[list[str]],
     kth_scores: list[float],
-    normalized: np.ndarray,
+    normalized_cache: dict[int, np.ndarray],
     id_to_position: dict[str, int],
     drop_after: bool,
 ) -> dict[str, Any]:
@@ -744,6 +1056,7 @@ async def measure_index_variant(
     "build the variants one at a time... drop each index after measuring" is a memory
     constraint on the host running Colima's VM, not a suggestion.
     """
+    wait_for_host_pressure(label=f"{label} variant, before index build: ")
     print(
         f"=== {label} variant (m={m}, ef_construction={ef_construction}): building (maintenance_work_mem={maintenance_work_mem}) ===", file=sys.stderr
     )
@@ -758,7 +1071,7 @@ async def measure_index_variant(
         query_sample_positions=query_sample_positions,
         exact_ids_by_query=exact_ids_by_query,
         kth_scores=kth_scores,
-        normalized=normalized,
+        normalized_cache=normalized_cache,
         id_to_position=id_to_position,
     )
 
@@ -770,13 +1083,20 @@ async def measure_index_variant(
 
 
 class ExactGroundTruth(NamedTuple):
-    """The brute-force NumPy ground truth for one month's query sample -- computed ONCE per
-    month (`compute_exact_ground_truth`) and reused for both the standard and larger-index
+    """The brute-force ground truth for one month's query sample -- computed ONCE per month
+    (`compute_exact_ground_truth`) and reused for both the standard and larger-index
     variants, since neither depends on which HNSW variant happens to be live: recomputing it
     a second time for the larger variant would cost another ~exact_elapsed_s (measured at
-    ~4 minutes on edges-v2's real catalog scale) for byte-identical output."""
+    ~4 minutes on edges-v2's real catalog scale) for byte-identical output.
 
-    normalized: np.ndarray
+    `cache` (position -> normalized vector) replaces what used to be a full in-memory
+    `normalized` matrix (gm-analytics-engine-i37, 2026-09-28) -- it starts out seeded with
+    just the query positions (`_stream_exact_top_k` populates it as a side effect) and grows
+    on demand as `_sweep_recall` looks up new ANN candidate positions, never holding more
+    than the union of positions actually looked up.
+    """
+
+    cache: dict[int, np.ndarray]
     id_to_position: dict[str, int]
     exact_ids_by_query: list[list[str]]
     kth_scores: list[float]
@@ -786,13 +1106,13 @@ class ExactGroundTruth(NamedTuple):
 def compute_exact_ground_truth(month: dict[str, Any], query_sample_positions: list[int], *, label: str) -> ExactGroundTruth:
     print(f"=== {label}: exact ground truth ({len(query_sample_positions):,} queries) ===", file=sys.stderr)
     exact_started = time.perf_counter()
-    normalized = _normalized(month["vectors"])
+    cache: dict[int, np.ndarray] = {}
     id_to_position = {aid: index for index, aid in enumerate(month["artist_ids"])}
-    exact_positions_by_query, kth_scores = _exact_top_k(normalized, query_sample_positions, 10)
+    exact_positions_by_query, kth_scores = _stream_exact_top_k(month["path"], query_sample_positions, 10, cache=cache)
     exact_ids_by_query = [[month["artist_ids"][position] for position in row] for row in exact_positions_by_query]
     exact_elapsed = time.perf_counter() - exact_started
-    print(f"  exact: {exact_elapsed:.1f}s", file=sys.stderr)
-    return ExactGroundTruth(normalized, id_to_position, exact_ids_by_query, kth_scores, exact_elapsed)
+    print(f"  exact: {exact_elapsed:.1f}s (peak RSS {_peak_rss_mb():.0f} MB)", file=sys.stderr)
+    return ExactGroundTruth(cache, id_to_position, exact_ids_by_query, kth_scores, exact_elapsed)
 
 
 async def measure_month(
@@ -805,6 +1125,7 @@ async def measure_month(
     maintenance_work_mem: str,
     ground_truth: ExactGroundTruth,
 ) -> dict[str, Any]:
+    wait_for_host_pressure(label=f"{label}, before write: ")
     print(f"\n=== {label}: writing embeddings ===", file=sys.stderr)
     write_result = await _write_month(conn, month)
     print(f"  wrote {write_result['rows_written']:,} rows", file=sys.stderr)
@@ -821,7 +1142,7 @@ async def measure_month(
         query_sample_positions=query_sample_positions,
         exact_ids_by_query=ground_truth.exact_ids_by_query,
         kth_scores=ground_truth.kth_scores,
-        normalized=ground_truth.normalized,
+        normalized_cache=ground_truth.cache,
         id_to_position=ground_truth.id_to_position,
         drop_after=False,
     )
@@ -841,29 +1162,36 @@ async def measure_month(
 
 
 def exact_churn_top_k(month: dict[str, Any], churn_sample_ids: list[str]) -> dict[str, list[str]]:
-    """EXACT top-10 (brute-force NumPy, no Postgres/index touched at all) for
-    CHURN_SAMPLE_IDS, keyed by artist_id -- the index-free half of `churn_top_k`, split out
-    so a month whose Postgres/index work is skipped entirely can still get its churn side
-    measured (gm-analytics-engine-i37's maintainer-approved recall-phase trim: exact churn
-    runs for every w0, ANN churn only for the single best one -- see `main_async`)."""
+    """EXACT top-10 (brute-force, no Postgres/index touched at all) for CHURN_SAMPLE_IDS,
+    keyed by artist_id -- the index-free half of `churn_top_k`, split out so a month whose
+    Postgres/index work is skipped entirely can still get its churn side measured
+    (gm-analytics-engine-i37's maintainer-approved recall-phase trim: exact churn runs for
+    every w0, ANN churn only for the single best one -- see `main_async`). Streams
+    `month["path"]`'s vectors in bounded chunks (`_stream_exact_top_k`) rather than
+    materializing the whole month's array (gm-analytics-engine-i37, 2026-09-28)."""
     id_to_position = {aid: index for index, aid in enumerate(month["artist_ids"])}
     positions = [id_to_position[aid] for aid in churn_sample_ids if aid in id_to_position]
-    exact, _kth_scores = _exact_top_k(_normalized(month["vectors"]), positions, 10)
+    exact, _kth_scores = _stream_exact_top_k(month["path"], positions, 10)
+    print(f"  peak RSS after exact churn: {_peak_rss_mb():.0f} MB", file=sys.stderr)
     return {month["artist_ids"][position]: [month["artist_ids"][n] for n in row] for position, row in zip(positions, exact, strict=True)}
 
 
 async def churn_top_k(conn: Any, month: dict[str, Any], churn_sample_ids: list[str], ef_search: int) -> dict[str, list[str]]:
     """Both exact and ANN top-10 (at EF_SEARCH) for CHURN_SAMPLE_IDS, keyed by artist_id.
 
-    Exact: `exact_churn_top_k`, brute-force in NumPy against this month's full in-memory
-    vector array. ANN: the live index, at the production `ef_search` -- what the served list
-    would be.
+    Exact: `exact_churn_top_k`, brute-force, streamed straight from PATH -- see its own
+    docstring. ANN: the live index, at the production `ef_search` -- what the served list
+    would be. Uses a throwaway cache dict (gm-analytics-engine-i37, 2026-09-28), not the
+    recall sweep's -- churn only ever queries ONE ef_search value, once, so there is no reuse
+    to share a longer-lived cache for.
     """
+    wait_for_host_pressure(label="churn: ")
     exact_by_id = exact_churn_top_k(month, churn_sample_ids)
     id_to_position = {aid: index for index, aid in enumerate(month["artist_ids"])}
     positions = [id_to_position[aid] for aid in churn_sample_ids if aid in id_to_position]
-    ann = await _ann_top_k(conn, month["model_version"], month["vectors"], month["artist_ids"], positions, ef_search, 10)
+    ann = await _ann_top_k(conn, month["model_version"], month["path"], {}, month["artist_ids"], positions, ef_search, 10)
     ann_by_id = {month["artist_ids"][position]: (row or []) for position, row in zip(positions, ann, strict=True)}
+    print(f"  peak RSS after churn: {_peak_rss_mb():.0f} MB", file=sys.stderr)
     return {"exact": exact_by_id, "ann": ann_by_id}
 
 
@@ -899,6 +1227,29 @@ def _load_checkpoint(path: Path, model_version: str) -> tuple[dict[str, Any], di
     # rather than a plain key lookup lets an older checkpoint still resume (just without
     # that data, same as `_load_month`'s own `degrees`-missing fallback).
     return data["aug_result"], data["aug_churn"], data.get("aug_larger_variant")
+
+
+def is_result_complete(path: Path) -> bool:
+    """True when PATH is a `--out` result this script itself wrote, and it is non-partial --
+    i.e. a full, finished run (`_main_async_trimmed`/`main_async`'s final return), not a
+    partial checkpoint written before a since-interrupted later step. Any read/parse failure
+    (missing file, truncated JSON, wrong shape) is treated as "not complete" rather than
+    raised -- an orchestrator asking "can I skip re-running this?" should get a plain no, the
+    same way a never-run weight would.
+
+    gm-analytics-engine-i37, 2026-09-28: the recall+quality driver was killed by a host
+    memory/disk crisis mid-loop, after one weight's result had already been written
+    non-partial but before the driver's own state file recorded that -- this is the check
+    that lets a restart recognize "this weight is actually done" from the result file alone,
+    without redoing a possibly multi-hour build.
+    """
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError, OSError:
+        return False
+    return isinstance(data, dict) and data.get("partial") is False
 
 
 async def _main_async_trimmed(
@@ -940,6 +1291,7 @@ async def _main_async_trimmed(
     try:
         async with pool.connection() as conn:
             await _apply_schema(conn)
+            wait_for_host_pressure(label="September ground truth: ")
             sept_ground_truth = compute_exact_ground_truth(sept, sept_query_positions, label="September")
             sept_result = await measure_month(
                 conn,
@@ -951,6 +1303,7 @@ async def _main_async_trimmed(
                 ground_truth=sept_ground_truth,
             )
 
+            wait_for_host_pressure(label="exact churn: ")
             print("\n=== September: exact-only churn against August's raw vectors (no ANN -- trimmed mode) ===", file=sys.stderr)
             aug_churn_exact = exact_churn_top_k(aug, churn_sample_ids)
             sept_churn_exact = exact_churn_top_k(sept, churn_sample_ids)
@@ -1008,7 +1361,7 @@ async def _main_async_trimmed(
                     query_sample_positions=sept_query_positions,
                     exact_ids_by_query=sept_ground_truth.exact_ids_by_query,
                     kth_scores=sept_ground_truth.kth_scores,
-                    normalized=sept_ground_truth.normalized,
+                    normalized_cache=sept_ground_truth.cache,
                     id_to_position=sept_ground_truth.id_to_position,
                     drop_after=True,
                 )
@@ -1024,6 +1377,7 @@ async def _main_async_trimmed(
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     print("=== waiting for Docker to be reachable ===", file=sys.stderr)
     wait_for_docker()
+    wait_for_host_pressure(label="before loading months: ")
 
     print(f"loading {args.aug}", file=sys.stderr)
     aug = _load_month(args.aug)
@@ -1069,6 +1423,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         await pool.initialize()
         async with pool.connection() as conn:
             await _apply_schema(conn)
+            wait_for_host_pressure(label="August ground truth: ")
             aug_ground_truth = compute_exact_ground_truth(aug, aug_query_positions, label="August")
             aug_result = await measure_month(
                 conn,
@@ -1105,7 +1460,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                     query_sample_positions=aug_query_positions,
                     exact_ids_by_query=aug_ground_truth.exact_ids_by_query,
                     kth_scores=aug_ground_truth.kth_scores,
-                    normalized=aug_ground_truth.normalized,
+                    normalized_cache=aug_ground_truth.cache,
                     id_to_position=aug_ground_truth.id_to_position,
                     drop_after=True,
                 )
@@ -1159,6 +1514,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 async with conn.cursor() as cursor:
                     await cursor.execute(f"TRUNCATE {ARTIST_EMBEDDINGS_TABLE}")
 
+            wait_for_host_pressure(label="September ground truth: ")
             sept_ground_truth = compute_exact_ground_truth(sept, sept_query_positions, label="September")
             sept_result = await measure_month(
                 conn,
@@ -1235,7 +1591,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                     query_sample_positions=sept_query_positions,
                     exact_ids_by_query=sept_ground_truth.exact_ids_by_query,
                     kth_scores=sept_ground_truth.kth_scores,
-                    normalized=sept_ground_truth.normalized,
+                    normalized_cache=sept_ground_truth.cache,
                     id_to_position=sept_ground_truth.id_to_position,
                     drop_after=True,
                 )
