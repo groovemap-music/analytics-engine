@@ -226,7 +226,8 @@ def _vmmap_physical_footprint_bytes() -> int:
 
 
 def process_footprint_bytes() -> int:
-    """This process's current physical memory footprint, in bytes.
+    """This process's physical memory footprint, in bytes -- a monotonic high-water mark,
+    never a live/current reading.
 
     `wait_for_memory`'s footprint-aware threshold needs this: whatever THIS process already
     holds is memory it won't need to additionally acquire from the host's free pool to reach
@@ -234,22 +235,36 @@ def process_footprint_bytes() -> int:
     system-wide on top of what's already ours) is what makes the threshold accurate instead
     of double-counting.
 
-    Prefers `psutil` (`Process().memory_info().rss`, a project dependency already) for the
-    CURRENT resident set; falls back to `resource.getrusage`'s peak RSS (`peak_rss_bytes`,
-    monotonic -- an overestimate of "current" if memory was freed since the peak, which is
-    the safe direction to err) if `psutil` is unavailable for some reason, then to `vmmap`
-    (the dispatcher's own manual measurement tool for this host) as a last resort.
+    Prefers `resource.getrusage`'s peak RSS (`peak_rss_bytes`, `ru_maxrss` -- monotonic,
+    never decreasing for the life of this process) over a LIVE reading such as psutil's
+    `Process().memory_info().rss`. gm-analytics-engine-8ts, 2026-09-29: `wait_for_memory`'s
+    own poll loop is exactly where this process is idling (nothing touching its allocations
+    between polls), which is exactly when macOS is most likely to page out or compress its
+    inactive resident pages -- the underlying allocations (the parsed same_as map, the graph
+    being built) are still live and get paged straight back in the moment the next phase
+    touches them, so a live RSS reading collapsing toward 0 during the wait is not "no
+    longer needed", it's a false signal. Because `required_free = expected_peak_bytes -
+    footprint + margin`, a footprint that shrinks while waiting makes `required_free` RISE
+    each poll instead of converging -- caught live: September's run measured
+    `this_process_footprint` fall from 6.22 GB to 0.02 GB across five consecutive 60s polls,
+    pushing `required_free` from 13.78 GB to 19.98 GB, a bound this host cannot ever satisfy
+    while Colima holds 16 GiB of it -- an unconditional deadlock, not a slow wait.
+    `peak_rss_bytes()` doesn't have this failure mode: it only ever grows, so a value read
+    before any paging/compression happened stays valid afterward. `psutil` is tried only as
+    a fallback should `resource.getrusage` itself fail (not observed on macOS, where it's a
+    lightweight syscall wrapper); `vmmap` (the dispatcher's own manual measurement tool for
+    this host) is the last resort.
     """
-    try:
-        import psutil  # noqa: PLC0415 -- optional-preferred import, see docstring.
-
-        return int(psutil.Process().memory_info().rss)
-    except Exception as error:
-        print(f"⚠️  psutil footprint read failed ({error!r}), falling back to resource.getrusage", file=sys.stderr)
     try:
         return peak_rss_bytes()
     except Exception as error:
-        print(f"⚠️  resource.getrusage footprint read failed ({error!r}), falling back to vmmap", file=sys.stderr)
+        print(f"⚠️  resource.getrusage footprint read failed ({error!r}), falling back to psutil", file=sys.stderr)
+    try:
+        import psutil  # noqa: PLC0415 -- optional fallback import, see docstring.
+
+        return int(psutil.Process().memory_info().rss)
+    except Exception as error:
+        print(f"⚠️  psutil footprint read failed ({error!r}), falling back to vmmap", file=sys.stderr)
     return _vmmap_physical_footprint_bytes()
 
 
@@ -1206,11 +1221,18 @@ def print_parity_report(graph: dict) -> None:
     print(f"parse: {graph['parse_elapsed_s']:.1f}s, build: {graph['build_elapsed_s']:.1f}s", file=sys.stderr)
 
 
-def _out_path_for_w0(out: Path, w0: float, multiple: bool) -> Path:
-    """`out` unchanged when there is only one `--w0` value (backward compatible with every
-    existing caller); otherwise `out` with `.w0-<value>` inserted before the suffix, e.g.
-    `aug.npz` -> `aug.w0-0.1.npz`, so a sweep's outputs never collide on one filename."""
-    return out if not multiple else out.with_name(f"{out.stem}.w0-{w0:g}{out.suffix}")
+def _out_path_for_config(out: Path, w0: float, self_weight: float, multiple: bool) -> Path:
+    """`out` unchanged when there is only one `--w0` value and `--self-weight` is 0 (backward
+    compatible with every existing caller); otherwise `out` with `.w0-<value>` and/or
+    `.self-<value>` inserted before the suffix, e.g. `aug.npz` -> `aug.w0-0.1.npz` or
+    `aug.npz` -> `aug.self-0.05.npz`, so a sweep's outputs, or a non-default self weight,
+    never collide on one filename."""
+    stem = out.stem
+    if multiple:
+        stem = f"{stem}.w0-{w0:g}"
+    if self_weight:
+        stem = f"{stem}.self-{self_weight:g}"
+    return out if stem == out.stem else out.with_name(f"{stem}{out.suffix}")
 
 
 def _releases_source(value: str) -> Path | str:
@@ -1240,6 +1262,15 @@ def main() -> None:
         help="one or more step-0 FastRP weights (weights=w0,1,1,1,1); the graph is parsed and "
         "built ONCE and fastrp() re-run once per value, each as its own model_version and its "
         "own output file (see --out's per-w0 naming when more than one value is given).",
+    )
+    parser.add_argument(
+        "--self-weight",
+        type=float,
+        default=0.0,
+        help="FastRPConfig.self_weight (gm-analytics-engine-8ts): weight on normalize(R[v]), "
+        "the node's own hashed projection row -- breaks exact ties between artists with "
+        "identical graph neighbourhoods. Applied to every --w0 value in the sweep. 0.0 (the "
+        "default) is bit-identical to omitting it.",
     )
     parser.add_argument("--workers", type=int, default=5)
     parser.add_argument("--threads", type=int, default=6)
@@ -1354,8 +1385,8 @@ def main() -> None:
 
     multiple = len(args.w0) > 1
     for w0 in args.w0:
-        out = _out_path_for_w0(args.out, w0, multiple)
-        config = FastRPConfig(weights=(w0, 1.0, 1.0, 1.0, 1.0))
+        out = _out_path_for_config(args.out, w0, args.self_weight, multiple)
+        config = FastRPConfig(weights=(w0, 1.0, 1.0, 1.0, 1.0), self_weight=args.self_weight)
         print(f"\n🔢 running fastrp: {config.model_version}", file=sys.stderr)
         print(f"numpy {np.__version__}, scipy {scipy.__version__}", file=sys.stderr)
         fastrp_started = time.perf_counter()
@@ -1383,6 +1414,12 @@ def main() -> None:
             # `stored_model_version` with, and re-parsing one back out of `model_version`'s
             # text is both more code and more fragile than saving the tuple that produced it.
             weights=np.asarray(config.weights, dtype=np.float64),
+            # `self_weight` (gm-analytics-engine-8ts): same reasoning as `weights` above --
+            # without it, `measure_recall_churn.py`'s `_load_month` would reconstruct a
+            # `FastRPConfig` with `self_weight`'s default (0.0) for every file, and its own
+            # self-consistency check (`method_version != config.model_version`) would reject
+            # any npz saved with a non-zero self weight as internally inconsistent.
+            self_weight=config.self_weight,
             # `degrees` (i37's degree-bucketed recall): each row of `vectors`/`artist_ids` is
             # one artist; `degrees[i]` is that SAME artist's undirected degree in this month's
             # graph, independent of `w0` (the graph -- and therefore every artist's degree --
@@ -1398,6 +1435,7 @@ def main() -> None:
             "dump_date": args.dump_date,
             "method_version": config.model_version,
             "w0": w0,
+            "self_weight": args.self_weight,
             "release_count": graph["release_count"],
             "master_count": graph["master_count"],
             "distinct_by_kind": graph["distinct_by_kind"],

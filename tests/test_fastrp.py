@@ -6,7 +6,12 @@ appear in this repository (ADR 0013, data rights).
 
 from __future__ import annotations
 
+import hashlib
+import subprocess
+import sys
+import textwrap
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -202,9 +207,9 @@ class TestProjection:
 class TestFastRP:
     def test_config_defaults_are_the_adopted_configuration(self) -> None:
         config = FastRPConfig()
-        assert (config.dim, config.weights, config.beta) == (128, (0.0, 1.0, 1.0, 1.0, 1.0), 0.0)
+        assert (config.dim, config.weights, config.beta, config.self_weight) == (128, (0.0, 1.0, 1.0, 1.0, 1.0), 0.0, 0.0)
         assert config.model_version == (
-            "fastrp-v1:dim=128:weights=0,1,1,1,1:beta=0:proj=achlioptas-s3:rows=splitmix64(blake2b64(kind,key)):seed=20260924"
+            "fastrp-v2:dim=128:weights=0,1,1,1,1:beta=0:self=0:proj=achlioptas-s3:rows=splitmix64(blake2b64(kind,key)):seed=20260924"
         )
         with pytest.raises(ValueError, match="dim"):
             FastRPConfig(dim=0)
@@ -297,6 +302,101 @@ class TestFastRP:
             fastrp(adjacency, block_columns=0)
         with pytest.raises(ValueError, match="threads"):
             fastrp(adjacency, threads=0)
+
+
+def twins_graph() -> AdjacencyBuilder:
+    """Two nodes (positions 1, 2) whose one-hop neighbourhood is exactly {0} and nothing
+    else -- the same neighbour, the same (degree-1) transition weight. That alone ties
+    every ``(P^k R)[v]`` for ``k >= 1``: ``(PR)[1] == (PR)[2]`` because both are the same
+    weighted sum over the same neighbour, and induction over ``k`` carries the tie through
+    every later power regardless of what node 0 otherwise connects to (here, 3/4/5, so the
+    propagated value is not itself degenerate). Node 6's one-hop neighbourhood is {3}, not
+    shared with anything -- a non-tied control -- and node 7 hangs one hop further out."""
+    builder = AdjacencyBuilder(NodeIndex(np.arange(8, dtype=np.uint64)))
+    builder.add_edge_positions([0, 0, 0, 0, 0, 6, 3], [1, 2, 3, 4, 5, 3, 7])
+    return builder
+
+
+class TestSelfTerm:
+    """gm-analytics-engine-8ts: a configurable weight on normalize(R[v])."""
+
+    def test_self_weight_zero_matches_pre_self_term_output(self, catalog_edges: list) -> None:
+        # Pinned sha256 of fastrp(build(synthetic_catalog(seed=11)).build()) computed from
+        # insights/embeddings/fastrp.py at b27aedb (gm-analytics-engine-i37's merge, before
+        # this bead's self term existed). self_weight's default (0.0) must still produce
+        # this exact byte sequence -- the whole self-term computation is gated behind
+        # `if config.self_weight:`, so nothing new runs at all when it is 0.
+        adjacency = build(catalog_edges).build()
+        embedding = fastrp(adjacency)
+        assert hashlib.sha256(embedding.tobytes()).hexdigest() == "2340fe5fd2cc53014c3e551491506ee396f3c8541cea84e74f0233195595a6cc"
+        assert fastrp(adjacency, FastRPConfig(self_weight=0.0)).tobytes() == embedding.tobytes()
+
+    @pytest.mark.parametrize("block_columns", [1, 3, 16, 128])
+    def test_self_weight_breaks_exact_ties_from_identical_neighbourhoods(self, block_columns: int) -> None:
+        adjacency = twins_graph().build()
+        tied = fastrp(adjacency, block_columns=block_columns)
+        assert np.array_equal(tied[1], tied[2])  # the tie the bug produces, unchanged at self_weight=0
+
+        broken = fastrp(adjacency, FastRPConfig(self_weight=0.05), block_columns=block_columns)
+        assert not np.array_equal(broken[1], broken[2])
+        # Node 6 (neighbourhood {0, 3}) has no twin and stays untied either way.
+        assert not np.array_equal(tied[6], tied[1])
+        assert not np.array_equal(broken[6], broken[1])
+
+    def test_self_term_is_deterministic_across_runs_and_processes(self, catalog_edges: list) -> None:
+        adjacency = build(catalog_edges).build()
+        config = FastRPConfig(self_weight=0.05)
+        first = fastrp(adjacency, config)
+        second = fastrp(adjacency, config)
+        assert first.tobytes() == second.tobytes()
+        digest = hashlib.sha256(first.tobytes()).hexdigest()
+
+        script = textwrap.dedent(
+            """
+            import hashlib
+            from insights.embeddings import FastRPConfig, fastrp
+            from tests.test_fastrp import build, synthetic_catalog
+
+            adjacency = build(synthetic_catalog(seed=11)).build()
+            embedding = fastrp(adjacency, FastRPConfig(self_weight=0.05))
+            print(hashlib.sha256(embedding.tobytes()).hexdigest())
+            """
+        )
+        result = subprocess.run(  # noqa: S603 -- sys.executable and a fixed literal script, no untrusted input
+            [sys.executable, "-c", script], cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, check=True
+        )
+        assert result.stdout.strip() == digest
+
+    def test_small_self_weight_only_slightly_perturbs_non_tied_rankings(self, catalog_edges: list) -> None:
+        adjacency = build(catalog_edges).build()
+        base = fastrp(adjacency, FastRPConfig(self_weight=0.0))
+        nudged = fastrp(adjacency, FastRPConfig(self_weight=0.05))
+
+        base_norm = base / np.linalg.norm(base, axis=1, keepdims=True)
+        nudged_norm = nudged / np.linalg.norm(nudged, axis=1, keepdims=True)
+        cosine = np.sum(base_norm * nudged_norm, axis=1)
+        assert cosine.min() > 0.9
+        assert cosine.mean() > 0.99
+
+        # Degree >= 5 nodes are well clear of the near-isolated ties a self term targets;
+        # a small weight should barely move their nearest-neighbour ranking.
+        degree = adjacency.degree
+        candidates = np.flatnonzero(degree >= 5)
+        rng = np.random.default_rng(0)
+        queries = rng.choice(candidates, size=min(20, candidates.size), replace=False)
+        overlaps = []
+        for q in queries:
+            base_sims = base_norm @ base_norm[q]
+            nudged_sims = nudged_norm @ nudged_norm[q]
+            base_top = set(np.argsort(-base_sims)[1:11])
+            nudged_top = set(np.argsort(-nudged_sims)[1:11])
+            overlaps.append(len(base_top & nudged_top))
+        assert np.mean(overlaps) >= 8.0
+
+    def test_self_weight_is_named_in_model_version(self) -> None:
+        assert FastRPConfig(self_weight=0.05).model_version == (
+            "fastrp-v2:dim=128:weights=0,1,1,1,1:beta=0:self=0.05:proj=achlioptas-s3:rows=splitmix64(blake2b64(kind,key)):seed=20260924"
+        )
 
 
 class TestMemoryEstimate:

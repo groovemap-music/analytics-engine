@@ -460,7 +460,11 @@ def _load_month(path: Path) -> dict[str, Any]:
         # string for this file's own weights, whichever they are. An older npz without a
         # `weights` array predates the sweep and used the w0=0 default throughout.
         weights = tuple(data["weights"].tolist()) if "weights" in data else FastRPConfig().weights
-        config = FastRPConfig(weights=weights)
+        # `self_weight` (gm-analytics-engine-8ts): same backward-compat rule as `weights`
+        # above -- an npz saved before this bead has no `self_weight` array and used the
+        # 0.0 default throughout.
+        self_weight = float(data["self_weight"]) if "self_weight" in data else FastRPConfig().self_weight
+        config = FastRPConfig(weights=weights, self_weight=self_weight)
         if method_version != config.model_version:
             raise ValueError(
                 f"{path}: saved method_version {method_version!r} does not match "
