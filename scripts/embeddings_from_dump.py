@@ -226,7 +226,8 @@ def _vmmap_physical_footprint_bytes() -> int:
 
 
 def process_footprint_bytes() -> int:
-    """This process's current physical memory footprint, in bytes.
+    """This process's physical memory footprint, in bytes -- a monotonic high-water mark,
+    never a live/current reading.
 
     `wait_for_memory`'s footprint-aware threshold needs this: whatever THIS process already
     holds is memory it won't need to additionally acquire from the host's free pool to reach
@@ -234,22 +235,36 @@ def process_footprint_bytes() -> int:
     system-wide on top of what's already ours) is what makes the threshold accurate instead
     of double-counting.
 
-    Prefers `psutil` (`Process().memory_info().rss`, a project dependency already) for the
-    CURRENT resident set; falls back to `resource.getrusage`'s peak RSS (`peak_rss_bytes`,
-    monotonic -- an overestimate of "current" if memory was freed since the peak, which is
-    the safe direction to err) if `psutil` is unavailable for some reason, then to `vmmap`
-    (the dispatcher's own manual measurement tool for this host) as a last resort.
+    Prefers `resource.getrusage`'s peak RSS (`peak_rss_bytes`, `ru_maxrss` -- monotonic,
+    never decreasing for the life of this process) over a LIVE reading such as psutil's
+    `Process().memory_info().rss`. gm-analytics-engine-8ts, 2026-09-29: `wait_for_memory`'s
+    own poll loop is exactly where this process is idling (nothing touching its allocations
+    between polls), which is exactly when macOS is most likely to page out or compress its
+    inactive resident pages -- the underlying allocations (the parsed same_as map, the graph
+    being built) are still live and get paged straight back in the moment the next phase
+    touches them, so a live RSS reading collapsing toward 0 during the wait is not "no
+    longer needed", it's a false signal. Because `required_free = expected_peak_bytes -
+    footprint + margin`, a footprint that shrinks while waiting makes `required_free` RISE
+    each poll instead of converging -- caught live: September's run measured
+    `this_process_footprint` fall from 6.22 GB to 0.02 GB across five consecutive 60s polls,
+    pushing `required_free` from 13.78 GB to 19.98 GB, a bound this host cannot ever satisfy
+    while Colima holds 16 GiB of it -- an unconditional deadlock, not a slow wait.
+    `peak_rss_bytes()` doesn't have this failure mode: it only ever grows, so a value read
+    before any paging/compression happened stays valid afterward. `psutil` is tried only as
+    a fallback should `resource.getrusage` itself fail (not observed on macOS, where it's a
+    lightweight syscall wrapper); `vmmap` (the dispatcher's own manual measurement tool for
+    this host) is the last resort.
     """
-    try:
-        import psutil  # noqa: PLC0415 -- optional-preferred import, see docstring.
-
-        return int(psutil.Process().memory_info().rss)
-    except Exception as error:
-        print(f"⚠️  psutil footprint read failed ({error!r}), falling back to resource.getrusage", file=sys.stderr)
     try:
         return peak_rss_bytes()
     except Exception as error:
-        print(f"⚠️  resource.getrusage footprint read failed ({error!r}), falling back to vmmap", file=sys.stderr)
+        print(f"⚠️  resource.getrusage footprint read failed ({error!r}), falling back to psutil", file=sys.stderr)
+    try:
+        import psutil  # noqa: PLC0415 -- optional fallback import, see docstring.
+
+        return int(psutil.Process().memory_info().rss)
+    except Exception as error:
+        print(f"⚠️  psutil footprint read failed ({error!r}), falling back to vmmap", file=sys.stderr)
     return _vmmap_physical_footprint_bytes()
 
 
