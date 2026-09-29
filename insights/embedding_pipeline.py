@@ -19,10 +19,12 @@ DDL, no ownership, nothing on any other schema. Three consequences shape this mo
   forward-looking, `model_version`-filtered shape rather than something database-schema
   documents today. Retiring a superseded `model_version`'s rows and index is that follow-on's
   business, never this job's.
-- **No writes outside `artist_embeddings`.** Every read below is a `SELECT` against `graph`;
-  the one write statement targets `public.artist_embeddings` and nothing else. A connection
-  authenticated as this role gets a permission error on anything else — see
-  `tests/integration/test_embedding_pipeline_integration.py`.
+- **No writes outside its own tables.** Every read below is a `SELECT` against `graph`; the
+  load's one write statement targets `public.artist_embeddings`, and the similar-artist stage
+  that follows it (`insights.similar_artists`, gm-analytics-engine-d4d) writes only
+  `public.artist_similar_artists` and `public.artist_embedding_releases`, which
+  gm-database-schema-2xe0 grants this role. A connection authenticated as this role gets a
+  permission error on anything else — see `tests/integration/test_embedding_pipeline_integration.py`.
 - **No log table.** Other scheduled computations in `insights/computations.py` write their
   outcome to `insights.computation_log`; this role holds nothing on the `insights` schema, so
   this job cannot do that. `public.artist_embeddings` itself — `source_dump_id`,
