@@ -337,6 +337,15 @@ _STORED_VERSION_SEPARATOR: Final = "@"
 # artist and track-performer relations as "edges-v3".
 _EDGE_SET_VERSION: Final = "edges-v3"
 
+# The monthly job's FastRP configuration: ADR 0013's defaults (w0 = 0) plus the self term at
+# 0.05 (gm-analytics-engine-8ts, docs/embedding_tie_break.md), which took edges-v3's
+# byte-duplicate vectors from 42.22% to 0.0% and exact top-10 churn from 0.8886 to 0.9519.
+# `FastRPConfig()`'s own default stays 0.0 so the pre-8ts sum remains reproducible bit for bit;
+# this is the one place production opts in. Its `model_version` names `self=0.05` and
+# `fastrp-v2`, so the stored `model_version` changes with it and a dump already loaded under
+# the old configuration is recomputed rather than skipped.
+PRODUCTION_FASTRP_CONFIG: Final = FastRPConfig(self_weight=0.05)
+
 
 @dataclass(frozen=True)
 class EmbeddingPipelineConfig:
@@ -729,7 +738,7 @@ async def run_embedding_pipeline(
     `insights.computation_log` write that function's `_record_lifecycle` also does — this role
     cannot make it (see the module docstring).
     """
-    config = config or FastRPConfig()
+    config = config or PRODUCTION_FASTRP_CONFIG
     started = time.perf_counter()
     try:
         with computation_span(COMPUTATION_NAME):

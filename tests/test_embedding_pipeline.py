@@ -991,6 +991,21 @@ class TestLoadEmbeddings:
 
 class TestRunEmbeddingPipeline:
     @pytest.mark.asyncio
+    async def test_defaults_to_the_production_self_term_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        result = pipeline.LoadResult(method_version="m", model_version="m@dump-1", rows_written=0, skipped=True)
+        load = AsyncMock(return_value=result)
+        monkeypatch.setattr(pipeline, "load_embeddings", load)
+        monkeypatch.setattr(pipeline, "record_computation", Mock())
+        monkeypatch.setattr(pipeline, "record_embedding_rows_written", Mock())
+
+        await pipeline.run_embedding_pipeline(pool=object(), dump_id="dump-1", dump_date=date(2026, 9, 1))
+
+        config = load.call_args.args[1]
+        assert config == FastRPConfig(weights=(0.0, 1.0, 1.0, 1.0, 1.0), self_weight=0.05)
+        assert config.model_version.startswith("fastrp-v2:")
+        assert ":self=0.05:" in config.model_version
+
+    @pytest.mark.asyncio
     async def test_records_success_duration_and_rows_written(self, monkeypatch: pytest.MonkeyPatch) -> None:
         result = pipeline.LoadResult(method_version="fastrp-v1", model_version="fastrp-v1@dump-1", rows_written=42, skipped=False)
         monkeypatch.setattr(pipeline, "load_embeddings", AsyncMock(return_value=result))
