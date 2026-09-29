@@ -6,6 +6,7 @@ appear in this repository (ADR 0013, data rights).
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import date
 from typing import TYPE_CHECKING, Any
@@ -18,6 +19,7 @@ from insights.embeddings.exact_top_k import exact_top_k
 
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from pathlib import Path
 
 
@@ -174,10 +176,11 @@ class _FakeCopy:
 
 
 class _FakeCursor:
-    def __init__(self, log: list[tuple[str, Any]], copied: list[bytes], fetchall_rows: list[tuple[Any, ...]] | None = None) -> None:
-        self.log = log
-        self.copied = copied
-        self.fetchall_rows = fetchall_rows or []
+    def __init__(self, conn: _FakeConnection, name: str | None) -> None:
+        self.conn = conn
+        self.name = name
+        self._last_sql = ""
+        self._streamed = 0
 
     async def __aenter__(self) -> _FakeCursor:
         return self
@@ -186,14 +189,23 @@ class _FakeCursor:
         return False
 
     async def execute(self, sql: str, params: Any = None) -> None:
-        self.log.append((sql, params))
+        self.conn.log.append((sql, params))
+        self._last_sql = sql
+
+    async def fetchone(self) -> tuple[Any, ...] | None:
+        return self.conn.fetchone_by_sql.get(self._last_sql)
 
     async def fetchall(self) -> list[tuple[Any, ...]]:
-        return self.fetchall_rows
+        return self.conn.fetchall_rows
+
+    async def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        batch = self.conn.streamed_rows[self._streamed : self._streamed + min(size, 7)]
+        self._streamed += len(batch)
+        return batch
 
     def copy(self, sql: str) -> _FakeCopy:
-        self.log.append((sql, None))
-        return _FakeCopy(self.copied)
+        self.conn.log.append((sql, None))
+        return _FakeCopy(self.conn.copied)
 
 
 class _FakeTransaction:
@@ -209,16 +221,35 @@ class _FakeTransaction:
 
 
 class _FakeConnection:
-    def __init__(self, fetchall_rows: list[tuple[Any, ...]] | None = None) -> None:
+    def __init__(
+        self,
+        fetchall_rows: list[tuple[Any, ...]] | None = None,
+        *,
+        fetchone_by_sql: dict[str, tuple[Any, ...]] | None = None,
+        streamed_rows: list[tuple[Any, ...]] | None = None,
+    ) -> None:
         self.log: list[tuple[str, Any]] = []
         self.copied: list[bytes] = []
-        self.fetchall_rows = fetchall_rows
+        self.fetchall_rows = fetchall_rows or []
+        self.fetchone_by_sql = fetchone_by_sql or {}
+        self.streamed_rows = streamed_rows or []
 
     def transaction(self) -> _FakeTransaction:
         return _FakeTransaction(self.log)
 
-    def cursor(self) -> _FakeCursor:
-        return _FakeCursor(self.log, self.copied, self.fetchall_rows)
+    def cursor(self, name: str | None = None) -> _FakeCursor:
+        return _FakeCursor(self, name)
+
+
+class _FakePool:
+    def __init__(self, conn: _FakeConnection) -> None:
+        self.conn = conn
+        self.acquired = 0
+
+    @contextlib.asynccontextmanager
+    async def connection(self) -> AsyncIterator[_FakeConnection]:
+        self.acquired += 1
+        yield self.conn
 
 
 class TestWriteSimilarArtists:
@@ -334,3 +365,91 @@ class TestSchemaReleaseRegistry:
         assert await registry.publish("cur", "v1", **_PUBLISH_ARGS) == 0
         assert await registry.retire("cur", "v0", delete_release=True) == 1
         assert seen == [("publish", ("cur", "v1"), _PUBLISH_ARGS), ("retire", ("cur", "v0"), {"delete_release": True})]
+
+
+# ── Reading vectors back and the monthly stage ─────────────────────────────────────────────────
+
+
+def _halfvec_text(vector: np.ndarray) -> str:
+    return "[" + ",".join(str(float(x)) for x in vector) + "]"
+
+
+def _stored_rows(vectors: np.ndarray) -> list[tuple[str, str]]:
+    return [(f"a{i:04d}", _halfvec_text(v)) for i, v in enumerate(vectors)]
+
+
+class TestReadEmbeddings:
+    @pytest.mark.asyncio
+    async def test_streams_every_vector_in_order_at_half_precision(self) -> None:
+        vectors = _vectors(40, dim=8)
+        conn = _FakeConnection(fetchone_by_sql={sa._COUNT_EMBEDDINGS_SQL: (40,)}, streamed_rows=_stored_rows(vectors))
+
+        ids, read = await sa.read_embeddings(conn, "m1")
+
+        assert ids == [f"a{i:04d}" for i in range(40)]
+        assert read.dtype == np.float16
+        np.testing.assert_array_equal(read, vectors)
+        assert conn.log[0] == ("BEGIN", None)
+        assert conn.log[-1] == ("COMMIT", None)
+
+    @pytest.mark.asyncio
+    async def test_no_rows_reads_nothing(self) -> None:
+        conn = _FakeConnection(fetchone_by_sql={sa._COUNT_EMBEDDINGS_SQL: (0,)})
+        ids, read = await sa.read_embeddings(conn, "m1")
+        assert ids == []
+        assert read.shape == (0, 0)
+
+
+class TestRunSimilarArtists:
+    @pytest.mark.asyncio
+    async def test_computes_writes_publishes_and_cleans_up(self, tmp_path: Path) -> None:
+        vectors = _vectors(150, dim=8)
+        conn = _FakeConnection([("m2",), ("m1",)], fetchone_by_sql={sa._COUNT_EMBEDDINGS_SQL: (150,)}, streamed_rows=_stored_rows(vectors))
+        pool = _FakePool(conn)
+        registry = _FakeRegistry()
+
+        result = await sa.run_similar_artists(
+            pool,
+            model_version="m2",
+            source_dump_id="d2",
+            source_dump_date=date(2026, 9, 1),
+            spool_root=tmp_path,
+            registry=registry,
+            k=5,
+            threads=2,
+            guard=_quiet_guard(),
+        )
+
+        assert (result.artists, result.rows_written, result.skipped) == (150, 150 * 5, False)
+        assert registry.calls[0] == ("publish", "m2", {"source_dump_id": "d2", "source_dump_date": date(2026, 9, 1), "k": 5, "artists": 150})
+        assert result.rotation == sa.RotateResult("m2", "m1", (), ())
+        assert pool.acquired == 3  # read, write, publish: nothing held across the compute
+        assert list(tmp_path.iterdir()) == []
+        first = b"".join(conn.copied).decode().splitlines()[0].split("\t")
+        assert first[:3] == ["a0000", "m2", "1"]
+        assert first[3] == f"a{_expected(vectors, 5)[0][0, 0]:04d}"
+
+    @pytest.mark.asyncio
+    async def test_an_already_published_release_is_skipped(self, tmp_path: Path) -> None:
+        conn = _FakeConnection(fetchone_by_sql={sa._RELEASE_EXISTS_SQL: (1,)})
+        registry = _FakeRegistry()
+
+        result = await sa.run_similar_artists(
+            _FakePool(conn), model_version="m2", source_dump_id="d2", source_dump_date=date(2026, 9, 1), spool_root=tmp_path, registry=registry
+        )
+
+        assert result.skipped is True
+        assert registry.calls == []
+
+    @pytest.mark.asyncio
+    async def test_no_embeddings_is_an_error(self, tmp_path: Path) -> None:
+        conn = _FakeConnection(fetchone_by_sql={sa._COUNT_EMBEDDINGS_SQL: (0,)})
+        with pytest.raises(ValueError, match="no artist_embeddings rows"):
+            await sa.run_similar_artists(
+                _FakePool(conn),
+                model_version="m2",
+                source_dump_id="d2",
+                source_dump_date=date(2026, 9, 1),
+                spool_root=tmp_path,
+                registry=_FakeRegistry(),
+            )

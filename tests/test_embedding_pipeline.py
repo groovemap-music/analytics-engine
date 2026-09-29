@@ -206,6 +206,13 @@ class TestEmbeddingPipelineConfig:
         assert config.source_dump_id == "discogs-2026-09"
         assert config.source_dump_date == date(2026, 9, 1)
         assert config.postgres_host == "catalog-postgres:5432"
+        assert config.similar_artists_spool_dir == pipeline.DEFAULT_SIMILAR_ARTISTS_SPOOL_DIR
+
+    def test_reads_the_similar_artists_spool_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        self._set_valid_env(monkeypatch)
+        monkeypatch.setenv("SIMILAR_ARTISTS_SPOOL_DIR", str(tmp_path))
+
+        assert pipeline.EmbeddingPipelineConfig.from_env().similar_artists_spool_dir == tmp_path
 
     def test_reads_the_password_from_the_file_secret_convention(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         self._set_valid_env(monkeypatch)
@@ -1004,6 +1011,38 @@ class TestRunEmbeddingPipeline:
         assert config == FastRPConfig(weights=(0.0, 1.0, 1.0, 1.0, 1.0), self_weight=0.05)
         assert config.model_version.startswith("fastrp-v2:")
         assert ":self=0.05:" in config.model_version
+
+    @pytest.mark.asyncio
+    async def test_runs_the_similar_artists_stage_on_the_stored_model_version(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        result = pipeline.LoadResult(method_version="m", model_version="m@dump-1", rows_written=5, skipped=False)
+        monkeypatch.setattr(pipeline, "load_embeddings", AsyncMock(return_value=result))
+        stage = AsyncMock()
+        monkeypatch.setattr(pipeline, "run_similar_artists", stage)
+        monkeypatch.setattr(pipeline, "record_computation", Mock())
+        monkeypatch.setattr(pipeline, "record_embedding_rows_written", Mock())
+        pool = object()
+
+        await pipeline.run_embedding_pipeline(pool=pool, dump_id="dump-1", dump_date=date(2026, 9, 1), similar_artists_spool_dir=tmp_path)
+
+        stage.assert_awaited_once_with(
+            pool, model_version="m@dump-1", source_dump_id="dump-1", source_dump_date=date(2026, 9, 1), spool_root=tmp_path
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_similar_artists_stage_fails_the_run(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        result = pipeline.LoadResult(method_version="m", model_version="m@dump-1", rows_written=5, skipped=False)
+        monkeypatch.setattr(pipeline, "load_embeddings", AsyncMock(return_value=result))
+        monkeypatch.setattr(pipeline, "run_similar_artists", AsyncMock(side_effect=RuntimeError("publish failed")))
+        record_computation = Mock()
+        monkeypatch.setattr(pipeline, "record_computation", record_computation)
+        record_failure = Mock()
+        monkeypatch.setattr(pipeline, "record_embedding_pipeline_failure", record_failure)
+
+        with pytest.raises(RuntimeError, match="publish failed"):
+            await pipeline.run_embedding_pipeline(pool=object(), dump_id="dump-1", dump_date=date(2026, 9, 1), similar_artists_spool_dir=tmp_path)
+
+        assert record_computation.call_args.kwargs == {"success": False}
+        record_failure.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_records_success_duration_and_rows_written(self, monkeypatch: pytest.MonkeyPatch) -> None:

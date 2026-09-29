@@ -30,10 +30,13 @@ import the schema package until a real run needs it.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import importlib
 import json
 import os
 import resource
+import shutil
 import subprocess
 import sys
 import time
@@ -73,6 +76,11 @@ _DELETE_VERSION_SQL: Final = f"DELETE FROM {SIMILAR_ARTISTS_TABLE} WHERE model_v
 _COPY_SQL: Final = f"COPY {SIMILAR_ARTISTS_TABLE} (artist_id, model_version, rank, similar_artist_id, score) FROM STDIN"
 _RELEASES_BY_RECENCY_SQL: Final = f"SELECT model_version FROM {RELEASES_TABLE} ORDER BY published_at DESC, model_version DESC"  # noqa: S608
 _COPY_CHUNK_ARTISTS: Final = 20_000
+_RELEASE_EXISTS_SQL: Final = f"SELECT 1 FROM {RELEASES_TABLE} WHERE model_version = %s"  # noqa: S608
+# Artist order fixes catalog positions, and so the tie order: equal scores rank by artist_id.
+_COUNT_EMBEDDINGS_SQL: Final = "SELECT count(*) FROM public.artist_embeddings WHERE model_version = %s"
+_READ_EMBEDDINGS_SQL: Final = "SELECT artist_id, embedding::text FROM public.artist_embeddings WHERE model_version = %s ORDER BY artist_id"
+_FETCH_SIZE: Final = 50_000
 
 
 # ── Memory guard ──────────────────────────────────────────────────────────────────────────────
@@ -371,3 +379,95 @@ async def publish_and_rotate(
         logger.error("❌ Some superseded similar-artist versions were not retired", failed=failures)
     logger.info("✅ Similar-artist release published", model_version=model_version, kept_previous=previous, retired=retired)
     return RotateResult(model_version, previous, tuple(retired), tuple(failures))
+
+
+# ── The monthly stage ────────────────────────────────────────────────────────────────────────
+
+
+async def read_embeddings(conn: Any, model_version: str) -> tuple[list[str], NDArray[np.float16]]:
+    """Every artist's stored vector for ``model_version``, in ``artist_id`` order, as
+    ``float16`` (the ``halfvec`` column's own precision), streamed through a named cursor
+    in one read-only transaction into an array sized by a count taken in that same
+    transaction."""
+    ids: list[str] = []
+    async with conn.transaction():
+        async with conn.cursor() as cursor:
+            await cursor.execute(_COUNT_EMBEDDINGS_SQL, (model_version,))
+            (count,) = await cursor.fetchone()
+        vectors: NDArray[np.float16] | None = None
+        async with conn.cursor(name="similar_artists_embeddings") as cursor:
+            await cursor.execute(_READ_EMBEDDINGS_SQL, (model_version,))
+            while batch := await cursor.fetchmany(_FETCH_SIZE):
+                parsed = np.array([text[1:-1].split(",") for _artist_id, text in batch], dtype=np.float32)
+                if vectors is None:
+                    vectors = np.empty((count, parsed.shape[1]), dtype=np.float16)
+                vectors[len(ids) : len(ids) + len(batch)] = parsed
+                ids.extend(artist_id for artist_id, _text in batch)
+    if vectors is None:
+        return [], np.empty((0, 0), dtype=np.float16)
+    return ids, vectors[: len(ids)]
+
+
+@dataclass(frozen=True)
+class SimilarArtistsResult:
+    model_version: str
+    artists: int
+    rows_written: int
+    skipped: bool
+    rotation: RotateResult | None = None
+
+
+async def run_similar_artists(
+    pool: Any,
+    *,
+    model_version: str,
+    source_dump_id: str,
+    source_dump_date: date,
+    spool_root: Path,
+    registry: ReleaseRegistry | None = None,
+    k: int = DEFAULT_K,
+    threads: int = DEFAULT_THREADS,
+    guard: MemoryGuard | None = None,
+) -> SimilarArtistsResult:
+    """Compute, write, and publish ``model_version``'s similar-artist lists, or no-op if that
+    release already exists. Each database step takes its own connection, so none is held
+    open across the hours-long compute."""
+    registry = registry or SchemaReleaseRegistry()
+    async with pool.connection() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(_RELEASE_EXISTS_SQL, (model_version,))
+            if await cursor.fetchone() is not None:
+                logger.info("⏭️ Similar-artist release already published", model_version=model_version)
+                return SimilarArtistsResult(model_version, 0, 0, skipped=True)
+        artist_ids, vectors = await read_embeddings(conn, model_version)
+    if not artist_ids:
+        raise ValueError(f"no artist_embeddings rows for {model_version!r}")
+
+    guard = guard or MemoryGuard()
+    estimate = estimate_peak_bytes(len(artist_ids), vectors.shape[1], k=k, threads=threads)
+    logger.info(
+        "🔢 Exact top-K starting",
+        model_version=model_version,
+        artists=len(artist_ids),
+        k=k,
+        threads=threads,
+        estimated_peak_gb=round(estimate / 1e9, 2),
+    )
+    spool_dir = spool_root / hashlib.blake2b(model_version.encode(), digest_size=8).hexdigest()
+    spool = await asyncio.to_thread(compute_to_spool, vectors, spool_dir, model_version=model_version, k=k, threads=threads, guard=guard)
+    del vectors
+
+    async with pool.connection() as conn:
+        rows = await write_similar_artists(conn, spool, model_version=model_version, artist_ids=artist_ids)
+    async with pool.connection() as conn:
+        rotation = await publish_and_rotate(
+            conn,
+            registry,
+            model_version=model_version,
+            source_dump_id=source_dump_id,
+            source_dump_date=source_dump_date,
+            k=k,
+            artists=len(artist_ids),
+        )
+    shutil.rmtree(spool_dir, ignore_errors=True)
+    return SimilarArtistsResult(model_version, len(artist_ids), rows, skipped=False, rotation=rotation)
