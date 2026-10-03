@@ -94,6 +94,52 @@ def test_zero_vector_scores_zero_against_everything() -> None:
     np.testing.assert_array_equal(positions[5], [0, 1, 2, 3, 4, 6, 7, 8, 9, 10])  # all tied at 0: lowest positions win
 
 
+@pytest.mark.parametrize("threads", [1, 3, 8])
+def test_column_segments_preserve_boundary_ties_and_ragged_rows(threads: int) -> None:
+    # Each score is exactly -1, 0 or 1, including ties that cross every column
+    # segment boundary. Independent normalization keeps this oracle separate.
+    vectors = np.zeros((329, 4), dtype=np.float16)
+    vectors[:80, 0] = 1
+    vectors[80:160, 0] = -1
+    vectors[160:240, 1] = 1
+    vectors[240:300, 1] = -1
+    vectors[300::2] = np.float16(-0.0)
+    normalized = vectors.astype(np.float32)
+    norms = np.sqrt(np.sum(normalized * normalized, axis=1))
+    np.divide(normalized, norms[:, None], out=normalized, where=norms[:, None] != 0)
+    oracle = normalized @ normalized.T
+    np.fill_diagonal(oracle, -np.inf)
+    catalog_positions = np.broadcast_to(np.arange(len(vectors)), oracle.shape)
+    order = np.lexsort((catalog_positions, -oracle), axis=1)[:, :50]
+
+    scores, positions = _collect(vectors, 50, block_rows=128, threads=threads)
+
+    np.testing.assert_array_equal(positions, order)
+    np.testing.assert_array_equal(scores, np.take_along_axis(oracle, order, axis=1))
+
+
+def test_resumed_tied_column_segments_match_independent_oracle() -> None:
+    vectors = _integer_vectors(389, 8, seed=41)
+    vectors[::7] = 0
+    saved: dict[str, TopKState] = {}
+    first: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    def checkpoint(next_block: int, state: TopKState) -> None:
+        if next_block == 2:
+            saved["state"] = TopKState(state.scores.copy(), state.positions.copy(), state.thresholds.copy())
+
+    exact_top_k(vectors, 50, block_rows=128, threads=3, on_block=lambda lo, s, p: first.__setitem__(lo, (s, p)), after_block=checkpoint)
+    resumed: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    exact_top_k(
+        vectors, 50, block_rows=128, threads=8, state=saved["state"], start_block=2, on_block=lambda lo, s, p: resumed.__setitem__(lo, (s, p))
+    )
+    combined = {**{lo: first[lo] for lo in first if lo < 256}, **resumed}
+    expected_scores, expected_positions = _brute_force(vectors, 50)
+
+    np.testing.assert_array_equal(np.concatenate([combined[lo][1] for lo in sorted(combined)]), expected_positions)
+    np.testing.assert_array_equal(np.concatenate([combined[lo][0] for lo in sorted(combined)]), expected_scores)
+
+
 def test_resumes_from_a_checkpoint_to_the_same_answer() -> None:
     vectors = np.random.default_rng(2).standard_normal((700, 16)).astype(np.float16)
     expected = _collect(vectors, 10, block_rows=128, threads=2)

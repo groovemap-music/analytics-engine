@@ -54,6 +54,9 @@ DEFAULT_K: Final = 50
 DEFAULT_BLOCK_ROWS: Final = 4096
 EMPTY_POSITION: Final = -1
 SEGMENT: Final = 64
+# Column views stride across rows. Smaller groups reduce gathered values and keep
+# their reductions cheaper; real-block profiling verifies the same candidates.
+_COLUMN_SEGMENT: Final = 16
 _PAD_POSITION: Final = np.iinfo(np.int32).max
 # The threshold floor: below every real cosine score but above the ``-inf`` that marks
 # self and unfilled slots, so ``scores >= threshold`` never admits either.
@@ -150,8 +153,8 @@ def _update(
     ``r < valid_rows`` (candidates are columns ``col_start + c``).
 
     ``scores`` may be a transposed view. ``segments`` is the same block viewed as
-    ``(row, segment, SEGMENT)`` -- possibly with the last two axes swapped in memory --
-    so that ``segments[r, s]`` is row ``r``'s ``s``-th run of SEGMENT scores.
+    ``(row, segment, segment_width)`` -- possibly with the last two axes swapped in
+    memory -- so each segment belongs to exactly one row and uses its own threshold.
     """
     n_rows, n_cols = scores.shape
     k = state.scores.shape[1]
@@ -177,7 +180,7 @@ def _update(
     if hit_rows.size:
         vals = segments[hit_rows, hit_segs]
         sel_r, sel_c = np.nonzero(vals >= thresholds[hit_rows, None])
-        parts.append((hit_rows[sel_r], hit_segs[sel_r] * SEGMENT + sel_c, vals[sel_r, sel_c]))
+        parts.append((hit_rows[sel_r], hit_segs[sel_r] * segments.shape[2] + sel_c, vals[sel_r, sel_c]))
 
     rows = np.concatenate([p[0] for p in parts]) if parts else np.empty(0, dtype=np.intp)
     if not rows.size:
@@ -243,7 +246,7 @@ def exact_top_k(
         if j != i:
             # (column, row group, row in group): reducing over the last axis walks
             # contiguous rows, the cheap direction.
-            by_column = scores.reshape(-1, SEGMENT, scores.shape[1]).transpose(2, 0, 1)
+            by_column = scores.reshape(-1, _COLUMN_SEGMENT, scores.shape[1]).transpose(2, 0, 1)
             _update(state, locks[j], j * block_rows, i * block_rows, scores.T, valid_j, by_column)
 
     with ThreadPoolExecutor(max_workers=threads) as pool:

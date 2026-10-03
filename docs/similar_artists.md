@@ -258,7 +258,7 @@ Algorithm v2 and edge-set version are separate concepts.
 On 2026-10-03 the committed sizing script read only the first 500,000 September
 vectors and ran exact K50 with 4,096-row blocks. The Intel Core Ultra 5 235HX host
 had sufficient free disk and RAM. Python 3.14.7 / NumPy 2.5.3 used OpenBLAS
-0.3.34.106.0, eight kernel workers and one BLAS thread per worker. An exclusive
+0.3.34.106.0, eight kernel workers and a one-thread BLAS setting. An exclusive
 validation lock and coordinated resource window serialized the trial. Container
 limits were eight CPUs, 10.5 GiB memory with no additional swap, 256 PIDs,
 read-only inputs/source, no network, and a 1,800-second deadline. The isolated PG
@@ -290,3 +290,36 @@ exactness, but require fresh measured admission. Approximate candidate reranking
 or a minimum-degree subset changes the acceptance and requires an explicit
 maintainer decision. No approximation, subset, time-budget relaxation or full-run
 result has been substituted.
+
+### Exact column-selection optimization
+
+Further same-cap 500k trials with kernel workers / actual loaded BLAS threads
+2/4, 4/2 and 1/8 took 212.9424, 189.5864 and 383.9823 kernel seconds,
+respectively. All failed time admission; the original 8/1 remains the baseline.
+The BLAS setting describes the shared runtime pool, not independent pools per
+outer worker. Each new trial recorded pre-removal cgroup counters: no OOM events;
+1/8 recorded CPU throttling, while 2/4 and 4/2 recorded none.
+
+Operator-only phase profiles of the same real slice found approximately 47.6%
+of aggregate worker time in block multiplication/upcasting, 24.0% in segment
+maxima, 10.4% in segment gathering, and less than 1% in update-lock waits.
+These overlapping worker timings identify costs; profiled wall times are not
+admission measurements. Direct full-score masking and contiguous column copies
+were measured slower and rejected.
+
+A subsequent sampled comparison rotated trial order and required exactly equal
+candidate row/column positions and scores for widths 16, 32, 64, 128 and 256.
+Across 56 column-view samples with identical 717,400 selected candidates, width
+16 took 0.8717 s versus 1.2205 s for width 64, approximately 28.6% less selector
+time. Row-contiguous samples retained width 64 as the best tested choice.
+The kernel therefore uses 64-score row segments and 16-score column segments.
+Both views share the existing score buffer. A segment is skipped only when its
+maximum is strictly below that individual row's threshold; every admitted score
+still receives the same comparison and merge. Segment width changes no score,
+tie policy, candidate coverage, checkpoint format, block size or memory guard.
+
+Synthetic regressions cover duplicated vectors, negative scores, zero/signed-zero
+rows, boundary ties, a ragged final block, differing worker counts, and checkpoint
+resume. Sampled selector speed is not whole-kernel speed or full-catalog admission:
+the changed source needs a rebuilt image and fresh unprofiled 500k calibration.
+No full batch, real stored-list recall or month-to-month Jaccard is implied.
