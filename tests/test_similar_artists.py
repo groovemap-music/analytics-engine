@@ -174,6 +174,9 @@ class _FakeCopy:
     async def write(self, data: bytes) -> None:
         self._sink.append(data)
 
+    async def write_row(self, row: tuple[Any, ...]) -> None:
+        self._sink.append(row)
+
 
 class _FakeCursor:
     def __init__(self, conn: _FakeConnection, name: str | None) -> None:
@@ -193,6 +196,10 @@ class _FakeCursor:
         self._last_sql = sql
 
     async def fetchone(self) -> tuple[Any, ...] | None:
+        if self._last_sql == sa._RELEASE_WRITE_GUARD_SQL:
+            return self.conn.fetchone_by_sql.get(self._last_sql, (0,))
+        if self._last_sql == sa._CURRENT_RELEASE_SQL:
+            return self.conn.fetchone_by_sql.get(self._last_sql, (self.conn.fetchall_rows[1][0],) if len(self.conn.fetchall_rows) > 1 else None)
         return self.conn.fetchone_by_sql.get(self._last_sql)
 
     async def fetchall(self) -> list[tuple[Any, ...]]:
@@ -229,7 +236,7 @@ class _FakeConnection:
         streamed_rows: list[tuple[Any, ...]] | None = None,
     ) -> None:
         self.log: list[tuple[str, Any]] = []
-        self.copied: list[bytes] = []
+        self.copied: list[Any] = []
         self.fetchall_rows = fetchall_rows or []
         self.fetchone_by_sql = fetchone_by_sql or {}
         self.streamed_rows = streamed_rows or []
@@ -260,30 +267,58 @@ class TestWriteSimilarArtists:
         ids = [f"a{i}" for i in range(120)]
         conn = _FakeConnection()
 
-        rows = await sa.write_similar_artists(conn, spool, model_version="m1", artist_ids=ids)
+        rows = await sa.write_similar_artists(
+            conn, spool, model_version="m1", artist_ids=ids, registry=_FakeRegistry(), source_dump_id="dump", source_dump_date=date(2026, 9, 1)
+        )
 
-        assert rows == 120 * 4
-        assert [entry[0] for entry in conn.log] == ["BEGIN", sa._DELETE_VERSION_SQL, sa._COPY_SQL, "COMMIT"]
-        assert conn.log[1][1] == ("m1",)
-        lines = b"".join(conn.copied).decode().splitlines()
+        assert rows == 120
+        assert [entry[0] for entry in conn.log] == [
+            "BEGIN",
+            sa._RELEASE_LOCK_SQL,
+            sa._RELEASE_WRITE_GUARD_SQL,
+            sa._DELETE_VERSION_SQL,
+            sa._COPY_SQL,
+            "COMMIT",
+        ]
+        assert conn.log[3][1] == (17,)
         expected_positions, expected_scores = _expected(vectors, 4)
-        first = lines[0].split("\t")
-        assert first[:4] == ["a0", "m1", "1", f"a{expected_positions[0, 0]}"]
-        assert np.float32(first[4]) == expected_scores[0, 0]  # round-trips exactly
-        assert [line.split("\t")[2] for line in lines[:4]] == ["1", "2", "3", "4"]
-        assert all(line.split("\t")[0] != line.split("\t")[3] for line in lines)
+        first = conn.copied[0]
+        assert first[:2] == (17, "a0")
+        assert first[2] == [ids[pos] for pos in expected_positions[0]]
+        np.testing.assert_array_equal(np.asarray(first[3], dtype=np.float32), expected_scores[0])
+        assert all(row[1] not in row[2] for row in conn.copied)
+        assert all(len(row[2]) == len(row[3]) == 4 for row in conn.copied)
 
     @pytest.mark.asyncio
     async def test_skips_unfilled_slots(self, tmp_path: Path) -> None:
         spool = sa.compute_to_spool(_vectors(3), tmp_path, model_version="m1", k=5, block_rows=64, threads=1, guard=_quiet_guard())
         conn = _FakeConnection()
-        assert await sa.write_similar_artists(conn, spool, model_version="m1", artist_ids=["x", "y", "z"]) == 3 * 2
+        assert (
+            await sa.write_similar_artists(
+                conn,
+                spool,
+                model_version="m1",
+                artist_ids=["x", "y", "z"],
+                registry=_FakeRegistry(),
+                source_dump_id="dump",
+                source_dump_date=date(2026, 9, 1),
+            )
+            == 3
+        )
 
     @pytest.mark.asyncio
     async def test_rejects_a_mismatched_id_list(self, tmp_path: Path) -> None:
         spool = sa.compute_to_spool(_vectors(10), tmp_path, model_version="m1", k=2, block_rows=64, threads=1, guard=_quiet_guard())
         with pytest.raises(ValueError, match="9 artist ids"):
-            await sa.write_similar_artists(_FakeConnection(), spool, model_version="m1", artist_ids=["x"] * 9)
+            await sa.write_similar_artists(
+                _FakeConnection(),
+                spool,
+                model_version="m1",
+                artist_ids=["x"] * 9,
+                registry=_FakeRegistry(),
+                source_dump_id="dump",
+                source_dump_date=date(2026, 9, 1),
+            )
 
 
 # ── Publish and rotate ───────────────────────────────────────────────────────────────────────
@@ -295,6 +330,10 @@ class _FakeRegistry:
         self.failing_retires = failing_retires
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
 
+    async def create(self, cursor: Any, model_version: str, **kwargs: Any) -> int:
+        self.calls.append(("create", model_version, kwargs))
+        return 17
+
     async def publish(self, cursor: Any, model_version: str, **kwargs: Any) -> int:
         self.calls.append(("publish", model_version, kwargs))
         return self.publish_failures
@@ -304,7 +343,8 @@ class _FakeRegistry:
         return 1 if model_version in self.failing_retires else 0
 
 
-_PUBLISH_ARGS: dict[str, Any] = {"source_dump_id": "dump-9", "source_dump_date": date(2026, 9, 1), "k": 50, "artists": 1000}
+_LINEAGE_ARGS: dict[str, Any] = {"source_dump_id": "dump-9", "source_dump_date": date(2026, 9, 1), "k": 50}
+_PUBLISH_ARGS: dict[str, Any] = {"artists": 1000}
 
 
 class TestPublishAndRotate:
@@ -315,10 +355,19 @@ class TestPublishAndRotate:
 
         result = await sa.publish_and_rotate(conn, registry, model_version="v9", **_PUBLISH_ARGS)
 
-        assert registry.calls[0] == ("publish", "v9", _PUBLISH_ARGS)
+        assert registry.calls[0] == ("publish", "v9", {"artists": 1000})
         assert [(c[0], c[1]) for c in registry.calls[1:]] == [("retire", "v7"), ("retire", "v6")]
         assert all(c[2] == {"delete_release": False} for c in registry.calls[1:])  # lineage kept
         assert result == sa.RotateResult("v9", "v8", ("v7", "v6"), ())
+
+    @pytest.mark.asyncio
+    async def test_retains_actual_displaced_current_when_recency_order_differs(self) -> None:
+        conn = _FakeConnection(fetchall_rows=[("v9",), ("v7",), ("v8",)], fetchone_by_sql={sa._CURRENT_RELEASE_SQL: ("v8",)})
+        result = await sa.publish_and_rotate(conn, _FakeRegistry(), model_version="v9", **_PUBLISH_ARGS)
+        assert result.kept_previous == "v8"
+        assert result.retired == ("v7",)
+        assert conn.log[0] == ("BEGIN", None)
+        assert conn.log[-1] == ("COMMIT", None)
 
     @pytest.mark.asyncio
     async def test_first_release_retires_nothing(self) -> None:
@@ -346,7 +395,7 @@ class TestPublishAndRotate:
 class TestSchemaReleaseRegistry:
     @pytest.mark.asyncio
     async def test_delegates_to_the_schema_helpers(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import groovemap_schema.postgres as schema
+        from insights import schema_release_contract as schema
 
         seen: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
 
@@ -358,13 +407,19 @@ class TestSchemaReleaseRegistry:
             seen.append(("retire", args, kwargs))
             return 1
 
-        monkeypatch.setattr(schema, "publish_artist_embedding_release", publish, raising=False)
+        monkeypatch.setattr(schema, "create_artist_embedding_release", publish)
+        monkeypatch.setattr(schema, "publish_artist_embedding_release", publish)
         monkeypatch.setattr(schema, "retire_artist_similar_artists_version", retire, raising=False)
         registry = sa.SchemaReleaseRegistry()
 
-        assert await registry.publish("cur", "v1", **_PUBLISH_ARGS) == 0
+        assert await registry.create("cur", "v1", source_dump_id="dump-9", source_dump_date=date(2026, 9, 1), k=50) == 0
+        assert await registry.publish("cur", "v1", artists=1000) == 0
         assert await registry.retire("cur", "v0", delete_release=True) == 1
-        assert seen == [("publish", ("cur", "v1"), _PUBLISH_ARGS), ("retire", ("cur", "v0"), {"delete_release": True})]
+        assert seen == [
+            ("publish", ("cur", "v1"), _LINEAGE_ARGS),
+            ("publish", ("cur", "v1"), {"artists": 1000}),
+            ("retire", ("cur", "v0"), {"delete_release": True}),
+        ]
 
 
 # ── Reading vectors back and the monthly stage ─────────────────────────────────────────────────
@@ -420,14 +475,15 @@ class TestRunSimilarArtists:
             guard=_quiet_guard(),
         )
 
-        assert (result.artists, result.rows_written, result.skipped) == (150, 150 * 5, False)
-        assert registry.calls[0] == ("publish", "m2", {"source_dump_id": "d2", "source_dump_date": date(2026, 9, 1), "k": 5, "artists": 150})
+        assert (result.artists, result.rows_written, result.skipped) == (150, 150, False)
+        assert registry.calls[0] == ("create", "m2", {"source_dump_id": "d2", "source_dump_date": date(2026, 9, 1), "k": 5})
+        assert registry.calls[1] == ("publish", "m2", {"artists": 150})
         assert result.rotation == sa.RotateResult("m2", "m1", (), ())
         assert pool.acquired == 3  # read, write, publish: nothing held across the compute
         assert list(tmp_path.iterdir()) == []
-        first = b"".join(conn.copied).decode().splitlines()[0].split("\t")
-        assert first[:3] == ["a0000", "m2", "1"]
-        assert first[3] == f"a{_expected(vectors, 5)[0][0, 0]:04d}"
+        first = conn.copied[0]
+        assert first[:2] == (17, "a0000")
+        assert first[2][0] == f"a{_expected(vectors, 5)[0][0, 0]:04d}"
 
     @pytest.mark.asyncio
     async def test_an_already_published_release_is_skipped(self, tmp_path: Path) -> None:

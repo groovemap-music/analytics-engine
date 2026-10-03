@@ -23,16 +23,15 @@ are in `docs/similar_artists.md`. In order:
    retired: the current and previous lists stay, so a bad month can be rolled back by
    republishing the previous one.
 
-The publish and retire helpers belong to database-schema (`groovemap_schema.postgres`). They
-are reached through `ReleaseRegistry`, so this module can be tested with a fake and does not
-import the schema package until a real run needs it.
+The create, publish and retire helpers are an immutable promotion of database-schema
+(`insights.schema_release_contract`), with producer provenance and an AST compatibility
+gate. `ReleaseRegistry` keeps the flow testable without a database or dev schema package.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib
 import json
 import os
 import resource
@@ -46,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 import numpy as np
 import structlog
 
+from insights import schema_release_contract as release_contract
 from insights.embeddings.exact_top_k import DEFAULT_BLOCK_ROWS, DEFAULT_K, EMPTY_POSITION, TopKState, exact_top_k, reciprocal_norms
 
 
@@ -72,11 +72,14 @@ DEFAULT_CHECKPOINT_EVERY_S: Final = 1800.0
 # 1M-artist sizing run in docs/similar_artists.md: 2.1 GB of transients across 8 threads.
 _TASK_BYTES_PER_BLOCK_CELL: Final = 16
 
-_DELETE_VERSION_SQL: Final = f"DELETE FROM {SIMILAR_ARTISTS_TABLE} WHERE model_version = %s"  # noqa: S608
-_COPY_SQL: Final = f"COPY {SIMILAR_ARTISTS_TABLE} (artist_id, model_version, rank, similar_artist_id, score) FROM STDIN"
-_RELEASES_BY_RECENCY_SQL: Final = f"SELECT model_version FROM {RELEASES_TABLE} ORDER BY published_at DESC, model_version DESC"  # noqa: S608
+_DELETE_VERSION_SQL: Final = f"DELETE FROM {SIMILAR_ARTISTS_TABLE} WHERE release_id = %s"  # noqa: S608
+_COPY_SQL: Final = f"COPY {SIMILAR_ARTISTS_TABLE} (release_id, artist_id, similar_artist_ids, scores) FROM STDIN"
+_RELEASE_LOCK_SQL: Final = release_contract._ARTIST_EMBEDDING_RELEASES_LOCK_SQL
+_RELEASE_WRITE_GUARD_SQL: Final = f"SELECT artists FROM {RELEASES_TABLE} WHERE release_id = %s FOR UPDATE"  # noqa: S608
+_CURRENT_RELEASE_SQL: Final = f"SELECT model_version FROM {RELEASES_TABLE} WHERE is_current"  # noqa: S608
+_RELEASES_BY_RECENCY_SQL: Final = f"SELECT model_version FROM {RELEASES_TABLE} WHERE artists > 0 ORDER BY published_at DESC, model_version DESC"  # noqa: S608
 _COPY_CHUNK_ARTISTS: Final = 20_000
-_RELEASE_EXISTS_SQL: Final = f"SELECT 1 FROM {RELEASES_TABLE} WHERE model_version = %s"  # noqa: S608
+_RELEASE_EXISTS_SQL: Final = f"SELECT 1 FROM {RELEASES_TABLE} WHERE model_version = %s AND artists > 0"  # noqa: S608
 # Artist order fixes catalog positions, and so the tie order: equal scores rank by artist_id.
 _COUNT_EMBEDDINGS_SQL: Final = "SELECT count(*) FROM public.artist_embeddings WHERE model_version = %s"
 _READ_EMBEDDINGS_SQL: Final = "SELECT artist_id, embedding::text FROM public.artist_embeddings WHERE model_version = %s ORDER BY artist_id"
@@ -282,62 +285,85 @@ def _save_checkpoint(spool: Spool, state: TopKState, next_block: int) -> None:
 # ── Write, publish, retire ───────────────────────────────────────────────────────────────────
 
 
-def _copy_chunks(spool: Spool, artist_ids: Sequence[str], model_version: str) -> Iterator[bytes]:
-    """COPY text-format lines for every list entry, ``_COPY_CHUNK_ARTISTS`` artists at a
-    time. Ranks start at 1; unfilled slots (a catalog smaller than ``k + 1``) are skipped."""
+def _copy_rows(spool: Spool, artist_ids: Sequence[str], release_id: int) -> Iterator[tuple[int, str, list[str], list[float]]]:
+    """One compact COPY row per artist, with ordered, paired neighbour arrays.
+
+    `write_row` delegates quoting/escaping of arbitrary text ids to psycopg, including
+    commas, braces, backslashes, tabs, and newlines. Unfilled slots are omitted together.
+    """
     for start in range(0, spool.n_artists, _COPY_CHUNK_ARTISTS):
         stop = min(start + _COPY_CHUNK_ARTISTS, spool.n_artists)
         positions, scores = spool.read(start, stop)
-        score_text = scores.astype(str)
-        lines = [
-            f"{artist_ids[start + r]}\t{model_version}\t{rank + 1}\t{artist_ids[position]}\t{score_text[r, rank]}\n"
-            for r in range(stop - start)
-            for rank, position in enumerate(positions[r].tolist())
-            if position != EMPTY_POSITION
-        ]
-        yield "".join(lines).encode()
+        for row in range(stop - start):
+            valid = positions[row] != EMPTY_POSITION
+            yield (
+                release_id,
+                artist_ids[start + row],
+                [artist_ids[int(position)] for position in positions[row, valid]],
+                scores[row, valid].tolist(),
+            )
 
 
-async def write_similar_artists(conn: Any, spool: Spool, *, model_version: str, artist_ids: Sequence[str]) -> int:
-    """Replace every `artist_similar_artists` row for ``model_version`` with the spool's
-    lists, in one transaction. Returns the number of rows written."""
+async def write_similar_artists(
+    conn: Any,
+    spool: Spool,
+    *,
+    model_version: str,
+    artist_ids: Sequence[str],
+    source_dump_id: str,
+    source_dump_date: date,
+    registry: ReleaseRegistry | None = None,
+) -> int:
+    """Create/reuse an unpublished release and replace its artist arrays atomically.
+
+    Creation, lineage/K validation, deletion and COPY share one transaction. A failed
+    COPY rolls all of them back. Previously published lists are never overwritten.
+    """
     if len(artist_ids) != spool.n_artists:
         raise ValueError(f"{len(artist_ids)} artist ids for a spool of {spool.n_artists} artists")
+    registry = registry or SchemaReleaseRegistry()
     rows = 0
     async with conn.transaction(), conn.cursor() as cursor:
-        await cursor.execute(_DELETE_VERSION_SQL, (model_version,))
+        await cursor.execute(_RELEASE_LOCK_SQL)
+        release_id = await registry.create(cursor, model_version, source_dump_id=source_dump_id, source_dump_date=source_dump_date, k=spool.k)
+        if release_id is None:
+            raise PublishError(f"creating {model_version!r} failed; see the schema helper's log")
+        await cursor.execute(_RELEASE_WRITE_GUARD_SQL, (release_id,))
+        existing = await cursor.fetchone()
+        if existing is None or existing[0] > 0:
+            raise PublishError(f"refusing to overwrite published or missing release {model_version!r}")
+        await cursor.execute(_DELETE_VERSION_SQL, (release_id,))
         async with cursor.copy(_COPY_SQL) as copy:
-            for chunk in _copy_chunks(spool, artist_ids, model_version):
-                await copy.write(chunk)
-                rows += chunk.count(b"\n")
+            for row in _copy_rows(spool, artist_ids, release_id):
+                await copy.write_row(row)
+                rows += 1
     logger.info("💾 Similar-artist lists written", model_version=model_version, rows=rows)
     return rows
 
 
 class ReleaseRegistry(Protocol):
-    """database-schema's release helpers; both return a failure count and never raise."""
+    """The promoted producer helpers; creation returns an id, others failure counts."""
 
-    async def publish(self, cursor: Any, model_version: str, *, source_dump_id: str, source_dump_date: date, k: int, artists: int) -> int: ...
+    async def create(self, cursor: Any, model_version: str, *, source_dump_id: str, source_dump_date: date, k: int) -> int | None: ...
+
+    async def publish(self, cursor: Any, model_version: str, *, artists: int) -> int: ...
 
     async def retire(self, cursor: Any, model_version: str, *, delete_release: bool = False) -> int: ...
 
 
-def _schema_helper(name: str) -> Any:
-    # Looked up by name: the helpers landed in database-schema after the revision this
-    # repository pins (gm-database-schema-2xe0), and the package is only a dev dependency.
-    return getattr(importlib.import_module("groovemap_schema.postgres"), name)
-
-
 class SchemaReleaseRegistry:
-    """`ReleaseRegistry` over `groovemap_schema.postgres`, imported on first use."""
+    """Runtime-safe adapter over the immutable promoted producer binding."""
 
-    async def publish(self, cursor: Any, model_version: str, *, source_dump_id: str, source_dump_date: date, k: int, artists: int) -> int:
-        publish = _schema_helper("publish_artist_embedding_release")
-        return int(await publish(cursor, model_version, source_dump_id=source_dump_id, source_dump_date=source_dump_date, k=k, artists=artists))
+    async def create(self, cursor: Any, model_version: str, *, source_dump_id: str, source_dump_date: date, k: int) -> int | None:
+        return await release_contract.create_artist_embedding_release(
+            cursor, model_version, source_dump_id=source_dump_id, source_dump_date=source_dump_date, k=k
+        )
+
+    async def publish(self, cursor: Any, model_version: str, *, artists: int) -> int:
+        return await release_contract.publish_artist_embedding_release(cursor, model_version, artists=artists)
 
     async def retire(self, cursor: Any, model_version: str, *, delete_release: bool = False) -> int:
-        retire = _schema_helper("retire_artist_similar_artists_version")
-        return int(await retire(cursor, model_version, delete_release=delete_release))
+        return await release_contract.retire_artist_similar_artists_version(cursor, model_version, delete_release=delete_release)
 
 
 class PublishError(RuntimeError):
@@ -357,20 +383,24 @@ async def publish_and_rotate(
     registry: ReleaseRegistry,
     *,
     model_version: str,
-    source_dump_id: str,
-    source_dump_date: date,
-    k: int,
     artists: int,
 ) -> RotateResult:
     """Publish ``model_version`` as current, then retire the rows of every release older
     than the one it replaced. Release rows are kept as lineage. A failed retire is logged
     and reported, not raised: the new release is already live and correct."""
-    async with conn.cursor() as cursor:
-        if await registry.publish(cursor, model_version, source_dump_id=source_dump_id, source_dump_date=source_dump_date, k=k, artists=artists):
+    async with conn.transaction(), conn.cursor() as cursor:
+        await cursor.execute(_RELEASE_LOCK_SQL)
+        await cursor.execute(_CURRENT_RELEASE_SQL)
+        current = await cursor.fetchone()
+        previous = current[0] if current and current[0] != model_version else None
+        if await registry.publish(cursor, model_version, artists=artists):
             raise PublishError(f"publishing {model_version!r} failed; see the schema helper's log")
         await cursor.execute(_RELEASES_BY_RECENCY_SQL)
         older = [row[0] for row in await cursor.fetchall() if row[0] != model_version]
-        previous, to_retire = (older[0], older[1:]) if older else (None, [])
+        if current and current[0] == model_version and older:
+            previous = older[0]
+        # Retain the actual displaced current release, not a newer pending target.
+        to_retire = [version for version in older if version != previous]
         retired: list[str] = []
         failures: list[str] = []
         for version in to_retire:
@@ -430,7 +460,7 @@ async def run_similar_artists(
     guard: MemoryGuard | None = None,
 ) -> SimilarArtistsResult:
     """Compute, write, and publish ``model_version``'s similar-artist lists, or no-op if that
-    release already exists. Each database step takes its own connection, so none is held
+    release has already been published. Pending targets remain retryable. Each database step takes its own connection, so none is held
     open across the hours-long compute."""
     registry = registry or SchemaReleaseRegistry()
     async with pool.connection() as conn:
@@ -458,15 +488,20 @@ async def run_similar_artists(
     del vectors
 
     async with pool.connection() as conn:
-        rows = await write_similar_artists(conn, spool, model_version=model_version, artist_ids=artist_ids)
+        rows = await write_similar_artists(
+            conn,
+            spool,
+            model_version=model_version,
+            artist_ids=artist_ids,
+            source_dump_id=source_dump_id,
+            source_dump_date=source_dump_date,
+            registry=registry,
+        )
     async with pool.connection() as conn:
         rotation = await publish_and_rotate(
             conn,
             registry,
             model_version=model_version,
-            source_dump_id=source_dump_id,
-            source_dump_date=source_dump_date,
-            k=k,
             artists=len(artist_ids),
         )
     shutil.rmtree(spool_dir, ignore_errors=True)
