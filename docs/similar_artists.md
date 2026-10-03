@@ -225,12 +225,68 @@ violations. Eight synthetic regressions cover the independent full-matrix oracle
 last candidate chunk, zeros/ties, forged scores, self/duplicate/out-of-range IDs,
 nonfinite scores, cardinality and lexical ordering.
 
-This is preparation, not real acceptance evidence. An isolated remote host audit
-found adequate disk/RAM for the planned resource-limited validation, and exact
-source/wheel preparation completed. Automatic approval review rejected the planned
-real snapshot transfer pending explicit payload-transfer authority and destination
-trust evidence. No snapshots were transferred, no remote calibration or full batch
-started, and no stored-list recall or August→September Jaccard result was produced.
-The local sizing projection must not be reused as remote calibration. Resume only
-after that transfer review is resolved, then perform fresh bounded remote sizing
-and report its six-hour/12 GiB admission comparison before any full job.
+This comparator is preparation, not stored-list acceptance evidence. The initial
+automatic approval rejection of the snapshot transfer was resolved with concrete
+operator authorization, destination ownership and public-catalog provenance.
+The coordinator transferred both exact snapshots, and destination checksums were
+verified before the fresh bounded remote calibration below. No full batch or
+stored-list recall / August→September Jaccard result has been produced.
+
+### Fresh remote calibration: time admission failed
+
+The isolated x86_64 validation image was built from clean source
+`c0625f217f9e637420a389afda08f7a36ccb99a7`, with the immutable runtime/schema pins
+above. Its image ID was
+`sha256:82ba788fae6cafac06ce54a4aefcddf3fc556a9e85a4425b584e5a26c41ef5f1`.
+The source archive SHA-256 was
+`0eeeb88fa95aac223ce811af79dd32818da57181d6f9d846465d076d0c59982d`;
+the source/wheel bundle hashes were verified at the destination. This was a
+validation-only local image, not a production release or published artifact.
+
+The actual inputs were `aug_v3.w0-0.self-0.05.npz` (SHA-256
+`47c85fed6d6a1dc5f93cfccac5d254aedb24180bc8184e2846dd2a41e5747cb6`)
+and `sept_v3.w0-0.self-0.05.npz` (SHA-256
+`de5290fcf2dab3e701a9e16b86ebc4befc2793a57cbf28446c8e975967b033a4`).
+The NPZ scalar metadata independently verifies algorithm v2, 128 dimensions,
+weights `(0,1,1,1,1)`, self weight `0.05`, and the respective dump IDs. The declared
+edges-v3 lineage comes from prior 8ts provenance; it is not independently verified
+by the NPZ metadata or inferred from filenames/current `_EDGE_SET_VERSION`.
+These are distinct inputs from the old `sept.npz` whose edges-v2 labelling pitfall
+is documented in [recall and churn](recall_and_churn.md#model-version-labelling-pitfall).
+Algorithm v2 and edge-set version are separate concepts.
+
+On 2026-10-03 the committed sizing script read only the first 500,000 September
+vectors and ran exact K50 with 4,096-row blocks. The Intel Core Ultra 5 235HX host
+had sufficient free disk and RAM. Python 3.14.7 / NumPy 2.5.3 used OpenBLAS
+0.3.34.106.0, eight kernel workers and one BLAS thread per worker. An exclusive
+validation lock and coordinated resource window serialized the trial. Container
+limits were eight CPUs, 10.5 GiB memory with no additional swap, 256 PIDs,
+read-only inputs/source, no network, and a 1,800-second deadline. The isolated PG
+allocation was reserved at 1.5 GiB but no database was started; combined planned
+limits remained 12 GiB.
+
+| Measurement | Actual / projection |
+| --- | --- |
+| Kernel / whole process wall time | 112.5901 / 113.8003 s |
+| `getrusage` peak RSS | 1,938,362,368 bytes (1.94 GB) |
+| Cgroup memory peak / hard limit | 1,936,039,936 / 11,274,289,152 bytes |
+| Conservative full September time | 39,509.9920 s (10.975 h) |
+| Estimated full kernel / pipeline peak | 8.367 / 8.966 GB |
+| Free disk after trial | approximately 1.114 TB |
+
+The process exited normally, its temporary sizing scratch/container were removed,
+and release of the exclusive lock was verified. No matching Docker OOM event was
+observed in the retained trial interval. Cgroup `memory.events` and pressure
+counters were not captured before container removal; no zero-counter claim is
+made. The aggregate log SHA-256 is
+`90755bd8d1f1c5789b33f69f2933011544b0d7c65c2586206d9de746824b4665`.
+
+**Do not start the full batch on this result:** memory and disk fit, but the
+projected monthly compute exceeds the approximately six-hour limit. COPY and
+publication are not included in that time projection. Stored September top-10
+recall, August→September Jaccard and real publication/retention remain unmeasured.
+Bounded CPU/BLAS tuning or a faster host/exact sharding may preserve whole-catalog
+exactness, but require fresh measured admission. Approximate candidate reranking
+or a minimum-degree subset changes the acceptance and requires an explicit
+maintainer decision. No approximation, subset, time-budget relaxation or full-run
+result has been substituted.
