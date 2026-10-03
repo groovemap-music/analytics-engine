@@ -8,7 +8,9 @@ No provider-derived data (ids, names, vectors, lists) is committed anywhere in t
 
 For every artist in a `model_version` of `public.artist_embeddings`, the job finds the `K = 50` other artists with the highest cosine similarity over the whole catalog. It is exact: no index and no approximation. Self is excluded. A duplicate vector still appears, at score 1.
 
-The job writes these lists to `public.artist_similar_artists` under the same `model_version`, one row per `(artist_id, rank)`, with ranks starting at 1. Then `publish_artist_embedding_release` makes that version current.
+The job writes these lists to `public.artist_similar_artists` under the same `model_version`, one row per `(release_id, artist_id)`, with ordered `similar_artist_ids TEXT[]` and
+`scores REAL[]`. The generated integer `release_id` refers to the unique `model_version`
+in `artist_embedding_releases`; the version label is not repeated per neighbour. Then `publish_artist_embedding_release` makes that version current.
 
 Rank order is score descending, then catalog position ascending. The stage reads vectors in `artist_id` order, so position order is `artist_id` text order, and exactly equal scores always rank the lower `artist_id` first. The order does not depend on block size, thread count, or the order in which blocks reach a row. `tests/test_exact_top_k.py` checks this against brute force on vectors whose dot products are exact in `float32`, so the ties are real rather than rounding accidents.
 
@@ -31,19 +33,30 @@ The 9.37M × 9.37M score matrix is never materialized, so the job computes it in
 
 `run_embedding_pipeline` calls `insights.similar_artists.run_similar_artists` after each load, whether the load wrote vectors or found them already loaded:
 
-1. **Skip if published.** If `artist_embedding_releases` already has this `model_version`, the stage does nothing.
+1. **Skip if published.** If `artist_embedding_releases` has this `model_version` with `artists > 0` (a published
+   release), the stage does nothing. A pending target (`artists = 0`) is retried.
 2. **Read back.** The stage reads the stored vectors back from `artist_embeddings` in `artist_id` order, through a named cursor, into a preallocated `float16` array. It does not reuse the load's in-memory array, so FastRP's peak (about 10 GB, `docs/embeddings.md`) and this stage's peak never overlap.
 3. **Compute to a spool** (`compute_to_spool`). Finished lists go to two raw files under `SIMILAR_ARTISTS_SPOOL_DIR`, `positions.i32` and `scores.f32` (3.75 GB for the catalog at K=50). They are written with plain file writes rather than a memory map, so they never count toward this process's RSS.
    - Every 30 minutes, the running state and the next block index are saved to `checkpoint.npz`. Every checkpoint and metadata write goes to a temporary name first and is then renamed into place.
    - A run with the same `model_version`, catalog size, and `K` resumes from its last checkpoint. A different one starts over.
-4. **Write** (`write_similar_artists`). One transaction deletes any rows a failed attempt left under this `model_version` and streams every list in with `COPY`. `catalog-api` sees nothing until the next step, and a failure rolls the whole version back.
+4. **Write** (`write_similar_artists`). One transaction takes the producer release lock, creates or reuses the non-current
+   target with matching lineage and K, deletes pending rows by its generated id, and
+   streams one paired-array row per artist with `COPY.write_row`. Psycopg handles text
+   quoting. Previously published lists cannot be overwritten. `catalog-api` sees nothing until the next step, and a failure rolls the whole version back.
 5. **Publish and rotate** (`publish_and_rotate`).
    - `publish_artist_embedding_release` makes this version current.
-   - Every release older than the one it replaced then has its rows retired with `retire_artist_similar_artists_version`. The previous release stays, so a bad month can be rolled back by republishing it.
+   - Every other previously published release then has its rows retired with `retire_artist_similar_artists_version`. The release that was actually current before the flip stays, so a bad month can be rolled back by republishing it.
    - Release rows are kept as lineage.
    - A failed retire is logged and reported but does not fail the run, because the new release is already live and correct.
 
-Each database step takes its own pool connection, so none is held open across the multi-hour compute. The publish and retire helpers belong to database-schema. They are reached through the `ReleaseRegistry` protocol, so the flow is unit-tested with a fake. `SchemaReleaseRegistry` resolves the helpers by name at call time, because the pinned `groovemap-database-schema` revision predates them.
+Each database step takes its own pool connection, so none is held open across the multi-hour compute. The create, publish and retire helpers are promoted verbatim from approved
+database-schema commit `4e9720d838c7da8a6bde139c64a69d781c0f67f0` into
+`insights/schema_release_contract.py`. `contracts/database-schema/artist-similarity/v1/source.json`
+records source/binding hashes and the exact producer pin. `scripts/check-contracts.py`
+compares every promoted helper/constant AST against the dev-only producer package;
+future drift fails the gate. Production imports the binding without installing the schema
+initializer or its clients. The restricted-role PG19 tier verifies real COPY, rollback,
+publication, current/previous retention, and retirement.
 
 ## Memory guard
 
@@ -89,7 +102,8 @@ The spool (3.75 GB) and a checkpoint (3.8 GB) are on disk, not in RSS.
 
 ## Storage
 
-Measured on a throwaway PG19 container with database-schema's `fecb0a4` DDL: 2,000,000 synthetic rows with a real-length stored `model_version` (148 characters).
+Historical rank-row measurement, superseded by the compact contract above. Measured on a
+throwaway PG19 container with database-schema's `fecb0a4` DDL: 2,000,000 synthetic rows with a real-length stored `model_version` (148 characters).
 
 | Relation | Bytes per row |
 | --- | ---: |
@@ -98,11 +112,91 @@ Measured on a throwaway PG19 container with database-schema's `fecb0a4` DDL: 2,0
 | `(model_version, artist_id)` index | 16.2 |
 | **Total** | **559** |
 
-At K=50 the catalog is 468.3M rows, about **262 GB per release**, or about 520 GB with the previous release retained. At K=10 it is about 52 GB per release. Most of the cost is the 148-byte `model_version`, repeated on every row in both the heap and the primary key. The same lists stored one row per artist (id, a small release id, a `text[]` of ids, a `real[]` of scores) measured 943 bytes per artist, about 8.8 GB per release at K=50. This is open with the dispatcher and database-schema. The write path above follows the landed DDL and will follow it if the DDL changes.
+At K=50 the catalog is 468.3M rows, about **262 GB per release**, or about 520 GB with the previous release retained. At K=10 it is about 52 GB per release. Most of the cost is the 148-byte `model_version`, repeated on every row in both the heap and the primary key. The same lists stored one row per artist (id, a small release id, a `text[]` of ids, a `real[]` of scores) measured 943 bytes per artist, about 8.8 GB per release at K=50. The approved compact producer measurement is 942.08 bytes per artist (1M synthetic artists,
+K=50, PG19), approximately 8.8 GB per release. The adapter now follows that compact
+contract. This projection excludes WAL, embeddings, replicas, spare disk and dead tuples;
+actual identifiers/compression can change it.
 
 ## Operations
 
-- **Disk.** The spool directory needs about 7.5 GB free for the full catalog at K=50: the spool plus one checkpoint, written to a temporary name before the old one is replaced. It must survive a process restart for a stopped run to resume. The directory for a published `model_version` is removed after publishing.
+- **Disk.** The spool directory needs about 11.3 GB free for the full catalog at K=50: the 3.75 GB spool plus both the
+  previous and temporary replacement checkpoints (about 3.78 GB each). Atomic replacement
+  temporarily retains both checkpoint files. Add database capacity separately: about
+  17.6 GB for current/previous compact releases, before WAL/temp-file headroom. On an
+  ongoing monthly rotation, the next target coexists with both retained releases until
+  publication/retirement, so peak lists alone can be about 26.4 GB (three releases). It must survive a process restart for a stopped run to resume. The directory for a published `model_version` is removed after publishing.
 - **Stopping and resuming.** Killing the process loses at most one checkpoint interval (30 minutes). Rerunning the pipeline for the same dump skips the already-loaded embeddings, reads them back, and resumes the spool from its checkpoint.
 - **Rolling back.** Republishing the previous `model_version` with `publish_artist_embedding_release` switches `catalog-api` back. Its rows are still present, because only releases older than the previous one are retired.
-- **Validation.** For the real-dump check, independently recompute exact top-10 for a 2,000-artist sample (tie-tolerant recall 1.0, ties within 1e-4) and measure Aug → Sept top-10 Jaccard. These runs are local-only. Results are recorded here once the full-catalog run is approved.
+- **Validation.** For the real-dump check, independently recompute exact top-10 for a 2,000-artist sample (tie-tolerant recall 1.0, ties within 1e-4) and measure Aug → Sept top-10 Jaccard. These runs are local-only. The earlier 8ts churn result is context; it does not validate this batch
+  writer. Full-catalog stored-list recall/churn results are still required before acceptance.
+
+## Current continuation status (2026-10-02)
+
+The same developer actor preserved all five existing implementation commits. Lightweight
+archive-header inspection confirmed local August and September `w0=0, self=0.05` snapshots:
+9,330,617 and 9,366,416 artists respectively, 128-dimensional `float16` vectors. Scalar
+metadata confirms algorithm v2, weights `0,1,1,1,1`, and `self_weight=0.05`. The NPZ
+method-version metadata omits the edge-set suffix; `edges-v3` provenance is the prior
+8ts documented build and the local filenames, not an independently verified NPZ field. No artist
+ids or vectors were exported or committed. The previous sizing measurements above remain historical evidence. The fresh bounded
+measurement is reported below.
+
+Only 12–13 GiB was free on the shared APFS volume during continuation. A full compute
+with atomic checkpoint replacement plus two compact releases needs approximately 29 GB
+before WAL, embedding storage and operational slack for a fresh August/September pair.
+An ongoing monthly rotation can temporarily need about 37.7 GB with three releases
+plus spool/checkpoints. The full run and real September
+stored-list recall / August→September churn validation were therefore **not run**.
+This bead is not ready for acceptance until those checks can be completed on adequately
+provisioned storage with an isolated host resource window. No Docker settings or existing
+data were changed, and no prune was performed.
+
+`scripts/measure-exact-top-k-sizing.py` provides a bounded 500k–1M sizing pass. For a local
+NPZ, it reads only the requested prefix of `vectors.npy` (128 MB for 500k artists), never
+artist ids, and removes only its own temporary spool. It reports wall time, getrusage peak
+RSS, quadratic full-catalog extrapolation and the 12 GB / six-hour comparisons. A 500k
+run at the production 4096-row blocks and eight threads estimates about 2.48 GB kernel
+RSS and at most about 0.61 GB spool/checkpoint disk, plus a conservative free-space margin.
+It must be serialized with other host work.
+
+### Fresh bounded September sizing
+
+The 2026-10-02 continuation ran only the first 500,000 September vectors. A temporary
+wrapper used the installed Beadhive admission API with actual configuration (`capacity=2`),
+held both distinct permits `[0, 1]` through `ExitStack`, and waited 17.09 seconds for existing
+validation to finish. It changed no admission configuration or environment overrides. Only
+one child ran while permits were held; the child timeout was 900 seconds. Both permits and
+the wrapper-owned temporary spool directory were released normally.
+
+Command inside that admitted window (local snapshot, never committed):
+
+```sh
+.venv/bin/python scripts/measure-exact-top-k-sizing.py \
+  --snapshot ~/.cache/groovemap-spikes/embeddings-scratch/sept_v3.w0-0.self-0.05.npz \
+  --rows 500000 --threads 8 --block-rows 4096 --scratch-root /private/tmp/<owned-directory>
+```
+
+| Measurement | Result |
+| --- | ---: |
+| Artists / dimensions / K | 500,000 / 128 / 50 |
+| Kernel wall time | 58.3203 s |
+| Child elapsed, including input read | 59.1190 s |
+| Total elapsed, including admission wait | 76.2099 s |
+| `getrusage` peak RSS | 2,517,483,520 bytes (2.52 GB) |
+| Temporary spool | 200,000,000 bytes; no checkpoint was due |
+| Free disk before / after | 13,394,345,984 / 13,369,331,712 bytes |
+| Conservative quadratic full-catalog wall time | 20,465.69 s (5.685 h) |
+| Estimated full kernel / pipeline peak (including held ids) | 8.367 / 8.966 GB |
+
+The elapsed projection is `58.3203 × (9,366,416 / 500,000)²`; it includes startup selection
+cost and remains an estimate, not a full-catalog measurement. Runtime and memory fit the
+six-hour / 12 GiB envelope on this isolated host window. Disk does not: the full compute,
+COPY/publication, 2,000-sample stored-list recall and monthly Jaccard checks remain **not run**.
+No full job was started after the sizing result. The benchmark was an aggregate sizing
+experiment, not a production release publication or real acceptance substitute.
+
+If the fresh extrapolation exceeds about six hours or the RSS budget, stop before the
+full job. Options for an explicit maintainer decision are an approximate candidate pass
+with exact reranking, sharding on suitable hosts, or a documented minimum-degree subset.
+These change the current whole-catalog exact acceptance and must not be substituted silently.
+Adequate scratch/database storage and an isolated run preserve the current acceptance.
