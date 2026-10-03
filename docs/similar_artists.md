@@ -200,3 +200,37 @@ full job. Options for an explicit maintainer decision are an approximate candida
 with exact reranking, sharding on suitable hosts, or a documented minimum-degree subset.
 These change the current whole-catalog exact acceptance and must not be substituted silently.
 Adequate scratch/database storage and an isolated run preserve the current acceptance.
+
+### Independent acceptance-comparator preparation (2026-10-03)
+
+`scripts/independent_exact_top_k.py` provides a comparator that does not import the
+production exact kernel. It streams the whole candidate catalog separately for each
+bounded query batch: defaults are 32 queries × 65,536 candidates (an 8 MiB float32
+score matrix), with independently normalized float32 vectors. It never materializes
+2,000 × 9.37M scores or holds both months' vectors. Input positions must correspond
+to lexically sorted artist IDs; snapshot replay must establish that order before
+both production computation and independent comparison. Exact score ties sort by
+position, including ties across candidate chunks.
+
+`compare_stored_top10` accepts actual persisted scores separately from independently
+computed top-10 reference lists. It independently rescores each stored neighbour
+from the same vectors/query positions. It requires ten unique, in-range neighbours
+per query, rejects self and nonfinite data, checks canonical persisted ordering,
+and reports persisted-score maximum absolute error and violation counts even when
+every stored ID belongs to the reference set. Boundary-tolerant recall uses actual
+recomputed cosine scores, never the database score. Exact set recall, per-query
+minimum tie-tolerant recall, `1e-4` tolerance, score errors and order violations remain
+separate aggregates; passing requires full tie-tolerant recall and zero score/order
+violations. Eight synthetic regressions cover the independent full-matrix oracle,
+last candidate chunk, zeros/ties, forged scores, self/duplicate/out-of-range IDs,
+nonfinite scores, cardinality and lexical ordering.
+
+This is preparation, not real acceptance evidence. An isolated remote host audit
+found adequate disk/RAM for the planned resource-limited validation, and exact
+source/wheel preparation completed. Automatic approval review rejected the planned
+real snapshot transfer pending explicit payload-transfer authority and destination
+trust evidence. No snapshots were transferred, no remote calibration or full batch
+started, and no stored-list recall or August→September Jaccard result was produced.
+The local sizing projection must not be reused as remote calibration. Resume only
+after that transfer review is resolved, then perform fresh bounded remote sizing
+and report its six-hour/12 GiB admission comparison before any full job.
