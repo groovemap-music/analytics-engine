@@ -15,4 +15,4 @@ uv pip install \
   --no-deps \
   .build/runtime/*.whl \
   dist/*.whl
-"${install_tmp}/venv/bin/python" -c 'import insights.insights; import insights.config'
+"${install_tmp}/venv/bin/python" -c 'import importlib.util; import insights.insights; import insights.config; from insights.schema_release_contract import create_artist_embedding_release, publish_artist_embedding_release, retire_artist_similar_artists_version; assert importlib.util.find_spec("groovemap_schema") is None'
