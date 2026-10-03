@@ -323,3 +323,51 @@ rows, boundary ties, a ragged final block, differing worker counts, and checkpoi
 resume. Sampled selector speed is not whole-kernel speed or full-catalog admission:
 the changed source needs a rebuilt image and fresh unprofiled 500k calibration.
 No full batch, real stored-list recall or month-to-month Jaccard is implied.
+
+That fresh unprofiled calibration subsequently ran from committed source
+`2db397a232428d094578b908bc8ee994cff24b24`. The validation image ID was
+`sha256:d9bf16dd1a4e392d68a950ed4869ea407aed9f0c7ed859066a15613f0cecfc1a`;
+its installed kernel SHA-256 matched the committed file
+`0592c951036e26271a8c5f2a3e8afc70858fb5f9a2e33f5b5e9a7f3a9498a6df`.
+Input hashes, actual BLAS setting, 4,096-row blocks and container caps were
+unchanged. Kernel / process times were 104.6499 / 105.3410 s, a measured 7.05%
+kernel improvement over the 112.5901 s baseline. Peak RSS / cgroup memory were
+1,850,753,024 / 1,831,280,640 bytes; estimated full pipeline memory remained
+8,966,234,496 bytes. Pre-removal `memory.events` counters were all zero; CPU
+throttling recorded 129 periods and 2,255,825 microseconds. The aggregate log
+SHA-256 is `a0df4390da75b64c2745a0ec304d34fea104837f0ea3725f6017410fe849e1e1`.
+
+**Time admission still fails:** conservative full September compute projects
+36,723.6382 seconds (10.201 hours), before COPY/publication. No full batch or
+isolated PG acceptance job was started. Owned containers and temporary spools
+were removed and the exclusive resource lock was released.
+
+A separate, non-admission multiply/upcast profile measured only 6.250 aggregate
+worker seconds in normalization/upcasting. Rotated comparisons over 60 real
+score blocks (991,166,464 cells) took 2.8829 s for allocated `matmul`, 2.8796 s
+for preallocated output, and 2.9663 s for `dot`. The 0.11% preallocation difference
+does not establish an improvement. Reversing/transposing the multiply took
+2.8766 s but changed 41,482,002 scores, with maximum absolute difference
+`4.76837158203125e-7`; it was rejected. No precision or tie-policy change was
+applied. A faster suitable host or a separately designed exact sharding strategy
+needs fresh measured admission; approximations and relaxed budgets remain outside
+the current acceptance. Actual stored recall, Jaccard and publication remain
+unverified, so this bead is not ready for submission.
+
+Linux's hybrid PMU topology reports performance cores `0-5` and efficiency cores
+`6-13`, with no SMT. A data-free container audit confirmed the default eight-CPU
+quota still permits affinity across `0-13`; past per-thread CPU history was not
+captured. One coordinated container-only trial used `--cpuset-cpus=0-6,10`,
+selecting all six performance cores and two efficiency cores from different
+L2-cache groups, while retaining the same eight-CPU quota and all other limits.
+The process asserted its actual affinity and effective cgroup cpuset; the loaded
+BLAS runtime still reported one thread. An instantaneous thread-placement sample
+stayed inside the set, but is not cumulative utilization evidence.
+
+The actual kernel / process times were 105.3521 / 106.0405 s, projecting
+36,970.0688 seconds (10.269 hours). This did not improve the unconstrained
+104.6499 s result and still failed admission. Peak RSS / cgroup memory were
+1,833,906,176 / 1,815,781,376 bytes, all memory event counters were zero, and CPU
+throttling recorded 44 periods / 83,118 microseconds. The aggregate log SHA-256
+is `12889bacd4ee5aadab5ae12f88d539e9aa42230fbbaec5d3487484d47c6d3f21`.
+No host CPU settings changed, and the owned container/spool and lock were released.
