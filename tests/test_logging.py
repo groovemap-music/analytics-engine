@@ -12,7 +12,10 @@ service's own log-file path shape end to end, so a future regression that stops 
 through the rotating handler fails here even if the mocked lifespan tests still pass.
 """
 
+import io
+import json
 import logging
+from contextlib import redirect_stdout
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,6 +23,7 @@ from typing import TYPE_CHECKING
 import pytest
 import structlog
 from common.config import setup_logging
+from common.health_server import HealthServer
 from common.log_rotation import DEFAULT_LOG_FILE_BACKUP_COUNT, DEFAULT_LOG_FILE_MAX_BYTES
 
 
@@ -69,3 +73,36 @@ def test_service_log_file_sink_honors_deployment_overrides(tmp_path: Path, monke
     (handler,) = [h for h in logging.getLogger().handlers if isinstance(h, RotatingFileHandler)]
     assert handler.maxBytes == 2048
     assert handler.backupCount == 3
+
+
+@pytest.mark.parametrize(("environment", "expected"), [("production", "production"), (None, "development")])
+def test_health_server_background_log_keeps_deployment_context_and_event_fields(
+    environment: str | None,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real health-server thread emits complete JSON with stable process context."""
+    if environment is None:
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+    else:
+        monkeypatch.setenv("ENVIRONMENT", environment)
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        setup_logging("analytics-engine")
+
+    server = HealthServer(0, lambda: {"status": "healthy"})
+    try:
+        server.start_background()
+        assert server.thread is not None
+        server.thread.join(timeout=0.05)
+    finally:
+        server.stop()
+
+    record = next(json.loads(line) for line in output.getvalue().splitlines() if "Health server listening" in json.loads(line)["event"])
+    assert record["service"] == "analytics-engine"
+    assert record["environment"] == expected
+    assert record["logger"] == "common.health_server"
+    assert record["level"] == "info"
+    assert isinstance(record["timestamp"], str)
+    assert isinstance(record["lineno"], int)
