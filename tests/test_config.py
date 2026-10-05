@@ -1,11 +1,17 @@
 """The consumer uses the reviewed Valkey URL builder and real client URL parser."""
 
-from pathlib import Path
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import pytest
 from valkey.asyncio import Valkey
 
 from insights.config import InsightsConfig
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture

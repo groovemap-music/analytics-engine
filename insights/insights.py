@@ -16,9 +16,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
-import valkey.asyncio as aiovalkey
 import structlog
 import uvicorn
+import valkey.asyncio as aiovalkey
 from common import (
     AsyncPostgreSQLPool,
     HealthServer,

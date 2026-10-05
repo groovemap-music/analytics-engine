@@ -3,8 +3,8 @@
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
-from fakeredis import FakeAsyncValkey
 import pytest
+from fakeredis import FakeAsyncValkey
 
 from insights.cache import GENERATION_KEY, InsightsCache
 
