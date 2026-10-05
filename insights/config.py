@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from os import getenv
 from typing import cast
 
-from common.config import _build_postgres_connstr, _build_redis_url, get_secret, resolve_postgres_pool_sizes
+from common.config import _build_postgres_connstr, _build_valkey_url, get_secret, resolve_postgres_pool_sizes
 
 
 @dataclass(frozen=True)
@@ -18,7 +18,7 @@ class InsightsConfig:
     postgres_database: str
     postgres_pool_min_size: int = 1
     postgres_pool_max_size: int = 4
-    redis_host: str = "redis://localhost:6379/0"
+    valkey_url: str = "valkey://localhost:6379/0"
     schedule_hours: int = 24
     milestone_years: tuple[int, ...] = (25, 30, 40, 50, 75, 100)
     internal_secret: str | None = field(default=None, repr=False)
@@ -61,7 +61,7 @@ class InsightsConfig:
             postgres_database=cast("str", postgres_database),
             postgres_pool_min_size=pool_min,
             postgres_pool_max_size=pool_max,
-            redis_host=_build_redis_url(),
+            valkey_url=_build_valkey_url(),
             schedule_hours=schedule_hours,
             milestone_years=milestone_years,
             internal_secret=get_secret("INSIGHTS_INTERNAL_SECRET") or None,

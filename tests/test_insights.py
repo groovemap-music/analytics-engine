@@ -541,9 +541,9 @@ class TestLifespan:
         mock_pool.initialize = AsyncMock()
         mock_pool.close = AsyncMock()
 
-        mock_redis = AsyncMock()
-        mock_redis.ping = AsyncMock()
-        mock_redis.aclose = AsyncMock()
+        mock_valkey = AsyncMock()
+        mock_valkey.ping = AsyncMock()
+        mock_valkey.aclose = AsyncMock()
 
         mock_http_client = AsyncMock()
         mock_http_client.aclose = AsyncMock()
@@ -560,7 +560,7 @@ class TestLifespan:
         mock_config.postgres_username = "user"
         mock_config.postgres_password = "pass"
         mock_config.api_base_url = "http://localhost:8004"
-        mock_config.redis_host = "redis://localhost"
+        mock_config.valkey_url = "valkey://localhost"
         mock_config.schedule_hours = 24
         mock_config.milestone_years = [25, 50]
 
@@ -576,7 +576,7 @@ class TestLifespan:
             patch.object(_module, "HealthServer", return_value=mock_health_srv),
             patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
             patch("httpx.AsyncClient", return_value=mock_http_client),
-            patch("redis.asyncio.from_url", new_callable=AsyncMock, return_value=mock_redis),
+            patch("valkey.asyncio.from_url", new_callable=AsyncMock, return_value=mock_valkey),
             patch.object(_module, "InsightsCache", return_value=mock_cache),
             patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
         ):
@@ -602,9 +602,9 @@ class TestLifespan:
         mock_pool.initialize = AsyncMock()
         mock_pool.close = AsyncMock()
 
-        mock_redis = AsyncMock()
-        mock_redis.ping = AsyncMock()
-        mock_redis.aclose = AsyncMock()
+        mock_valkey = AsyncMock()
+        mock_valkey.ping = AsyncMock()
+        mock_valkey.aclose = AsyncMock()
 
         mock_http_client = AsyncMock()
         mock_http_client.aclose = AsyncMock()
@@ -617,7 +617,7 @@ class TestLifespan:
         mock_config.postgres_username = "user"
         mock_config.postgres_password = "pass"
         mock_config.api_base_url = "http://localhost:8004"
-        mock_config.redis_host = "redis://localhost"
+        mock_config.valkey_url = "valkey://localhost"
         mock_config.schedule_hours = 24
         mock_config.milestone_years = [25, 50]
 
@@ -642,7 +642,7 @@ class TestLifespan:
             patch.object(_module, "HealthServer", return_value=mock_health_srv),
             patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
             patch("httpx.AsyncClient", return_value=mock_http_client),
-            patch("redis.asyncio.from_url", new_callable=AsyncMock, return_value=mock_redis),
+            patch("valkey.asyncio.from_url", new_callable=AsyncMock, return_value=mock_valkey),
             patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
         ):
             async with _module.lifespan(fake_app):
@@ -677,9 +677,9 @@ class TestLifespan:
         mock_pool.initialize = AsyncMock()
         mock_pool.close = AsyncMock()
 
-        mock_redis = AsyncMock()
-        mock_redis.ping = AsyncMock()
-        mock_redis.aclose = AsyncMock()
+        mock_valkey = AsyncMock()
+        mock_valkey.ping = AsyncMock()
+        mock_valkey.aclose = AsyncMock()
 
         mock_http_client = AsyncMock()
         mock_http_client.aclose = AsyncMock()
@@ -692,7 +692,7 @@ class TestLifespan:
         mock_config.postgres_username = "user"
         mock_config.postgres_password = "pass"
         mock_config.api_base_url = "http://localhost:8004"
-        mock_config.redis_host = "redis://localhost"
+        mock_config.valkey_url = "valkey://localhost"
         mock_config.schedule_hours = 24
         mock_config.milestone_years = [25, 50]
 
@@ -721,7 +721,7 @@ class TestLifespan:
             patch.object(_module, "HealthServer", return_value=mock_health_srv),
             patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
             patch("httpx.AsyncClient", return_value=mock_http_client),
-            patch("redis.asyncio.from_url", new_callable=AsyncMock, return_value=mock_redis),
+            patch("valkey.asyncio.from_url", new_callable=AsyncMock, return_value=mock_valkey),
             patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
         ):
             async with _module.lifespan(fake_app):
@@ -751,9 +751,9 @@ class TestLifespan:
         mock_pool.initialize = AsyncMock()
         mock_pool.close = AsyncMock()
 
-        mock_redis = AsyncMock()
-        mock_redis.ping = AsyncMock()
-        mock_redis.aclose = AsyncMock()
+        mock_valkey = AsyncMock()
+        mock_valkey.ping = AsyncMock()
+        mock_valkey.aclose = AsyncMock()
 
         mock_http_client = AsyncMock()
         mock_http_client.aclose = AsyncMock()
@@ -766,7 +766,7 @@ class TestLifespan:
         mock_config.postgres_username = "user"
         mock_config.postgres_password = "pass"
         mock_config.api_base_url = "http://localhost:8004"
-        mock_config.redis_host = "redis://localhost"
+        mock_config.valkey_url = "valkey://localhost"
         mock_config.schedule_hours = 24
         mock_config.milestone_years = [25, 50]
 
@@ -781,7 +781,7 @@ class TestLifespan:
             patch.object(_module, "HealthServer", return_value=mock_health_srv),
             patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
             patch("httpx.AsyncClient", return_value=mock_http_client),
-            patch("redis.asyncio.from_url", new_callable=AsyncMock, return_value=mock_redis),
+            patch("valkey.asyncio.from_url", new_callable=AsyncMock, return_value=mock_valkey),
             patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
         ):
             async with _module.lifespan(fake_app):
@@ -817,7 +817,7 @@ class TestLifespan:
         mock_config.postgres_username = "user"
         mock_config.postgres_password = "pass"
         mock_config.api_base_url = "http://localhost:8004"
-        mock_config.redis_host = "redis://localhost"
+        mock_config.valkey_url = "valkey://localhost"
         mock_config.schedule_hours = 24
         mock_config.milestone_years = [25, 50]
 
@@ -832,7 +832,7 @@ class TestLifespan:
             patch.object(_module, "HealthServer", return_value=mock_health_srv),
             patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool) as mock_pool_cls,
             patch("httpx.AsyncClient", return_value=mock_http_client),
-            patch("redis.asyncio.from_url", new_callable=AsyncMock, return_value=MagicMock()),
+            patch("valkey.asyncio.from_url", new_callable=AsyncMock, return_value=MagicMock()),
             patch.object(_module, "InsightsCache", return_value=mock_cache),
             patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
         ):
@@ -869,7 +869,7 @@ class TestLifespan:
         mock_config.postgres_username = "user"
         mock_config.postgres_password = "pass"
         mock_config.api_base_url = "http://localhost:8004"
-        mock_config.redis_host = "redis://localhost"
+        mock_config.valkey_url = "valkey://localhost"
         mock_config.schedule_hours = 24
         mock_config.milestone_years = [25, 50]
         mock_config.internal_secret = None  # secret unset → else branch
@@ -885,7 +885,7 @@ class TestLifespan:
             patch.object(_module, "HealthServer", return_value=mock_health_srv),
             patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
             patch("httpx.AsyncClient", return_value=mock_http_client) as mock_client_cls,
-            patch("redis.asyncio.from_url", new_callable=AsyncMock, return_value=MagicMock()),
+            patch("valkey.asyncio.from_url", new_callable=AsyncMock, return_value=MagicMock()),
             patch.object(_module, "InsightsCache", return_value=MagicMock()),
             patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
             patch.object(_module.logger, "warning") as mock_warning,
@@ -899,8 +899,8 @@ class TestLifespan:
             assert any("INSIGHTS_INTERNAL_SECRET is not set" in str(c.args[0]) for c in mock_warning.call_args_list)
 
     @pytest.mark.asyncio
-    async def test_lifespan_redis_unavailable_fallback(self) -> None:
-        """When Redis is unavailable, caching should be disabled gracefully."""
+    async def test_lifespan_valkey_unavailable_fallback(self) -> None:
+        """When Valkey is unavailable, caching should be disabled gracefully."""
         from fastapi import FastAPI
 
         import insights.insights as _module
@@ -922,7 +922,7 @@ class TestLifespan:
         mock_config.postgres_username = "user"
         mock_config.postgres_password = "pass"
         mock_config.api_base_url = "http://localhost:8004"
-        mock_config.redis_host = "redis://localhost"
+        mock_config.valkey_url = "valkey://localhost"
         mock_config.schedule_hours = 24
         mock_config.milestone_years = [25, 50]
 
@@ -937,21 +937,21 @@ class TestLifespan:
             patch.object(_module, "HealthServer", return_value=mock_health_srv),
             patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
             patch("httpx.AsyncClient", return_value=mock_http_client),
-            patch("redis.asyncio.from_url", side_effect=ConnectionError("Redis down")),
+            patch("valkey.asyncio.from_url", side_effect=ConnectionError("Valkey down")),
             patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
         ):
             async with _module.lifespan(fake_app):
-                # Redis failure should result in None cache
-                assert _module._redis is None
+                # Valkey failure should result in None cache
+                assert _module._valkey is None
                 assert _module._cache is None
 
             mock_health_srv.stop.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_lifespan_closes_redis_client_when_ping_fails(self) -> None:
+    async def test_lifespan_closes_valkey_client_when_ping_fails(self) -> None:
         """from_url() is lazy — ping() is what actually
         opens the socket. If ping() raises (e.g. requirepass with a missing/
-        wrong REDIS_PASSWORD), the client built by from_url() must still be
+        wrong VALKEY_PASSWORD), the client built by from_url() must still be
         closed before the reference is dropped — otherwise the connection
         pool and the socket ping() opened are never released."""
         from fastapi import FastAPI
@@ -975,15 +975,15 @@ class TestLifespan:
         mock_config.postgres_username = "user"
         mock_config.postgres_password = "pass"
         mock_config.api_base_url = "http://localhost:8004"
-        mock_config.redis_host = "redis://localhost"
+        mock_config.valkey_url = "valkey://localhost"
         mock_config.schedule_hours = 24
         mock_config.milestone_years = [25, 50]
 
         # from_url() succeeds (lazy) but the socket-opening ping() fails —
         # the exact AUTH-failure-under-requirepass scenario.
-        mock_redis = AsyncMock()
-        mock_redis.ping = AsyncMock(side_effect=ConnectionError("NOAUTH Authentication required"))
-        mock_redis.aclose = AsyncMock()
+        mock_valkey = AsyncMock()
+        mock_valkey.ping = AsyncMock(side_effect=ConnectionError("NOAUTH Authentication required"))
+        mock_valkey.aclose = AsyncMock()
 
         async def fake_scheduler(*_args: object, **_kwargs: object) -> None:
             await asyncio.sleep(100)
@@ -996,22 +996,22 @@ class TestLifespan:
             patch.object(_module, "HealthServer", return_value=mock_health_srv),
             patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
             patch("httpx.AsyncClient", return_value=mock_http_client),
-            patch("redis.asyncio.from_url", new_callable=AsyncMock, return_value=mock_redis),
+            patch("valkey.asyncio.from_url", new_callable=AsyncMock, return_value=mock_valkey),
             patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
         ):
             async with _module.lifespan(fake_app):
                 # Falls back to no caching, exactly like the from_url()-raises case.
-                assert _module._redis is None
+                assert _module._valkey is None
                 assert _module._cache is None
 
             mock_health_srv.stop.assert_called_once()
 
         # The orphaned client (from the successful from_url()) must have
-        # been closed before _redis was set to None.
-        mock_redis.aclose.assert_awaited_once()
+        # been closed before _valkey was set to None.
+        mock_valkey.aclose.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_lifespan_redis_close_failure_on_ping_error_is_swallowed(self) -> None:
+    async def test_lifespan_valkey_close_failure_on_ping_error_is_swallowed(self) -> None:
         """A failure while cleaning up the orphaned client (aclose() itself
         raising) must not prevent the graceful PostgreSQL-fallback path."""
         from fastapi import FastAPI
@@ -1035,13 +1035,13 @@ class TestLifespan:
         mock_config.postgres_username = "user"
         mock_config.postgres_password = "pass"
         mock_config.api_base_url = "http://localhost:8004"
-        mock_config.redis_host = "redis://localhost"
+        mock_config.valkey_url = "valkey://localhost"
         mock_config.schedule_hours = 24
         mock_config.milestone_years = [25, 50]
 
-        mock_redis = AsyncMock()
-        mock_redis.ping = AsyncMock(side_effect=ConnectionError("Redis down"))
-        mock_redis.aclose = AsyncMock(side_effect=RuntimeError("close also failed"))
+        mock_valkey = AsyncMock()
+        mock_valkey.ping = AsyncMock(side_effect=ConnectionError("Valkey down"))
+        mock_valkey.aclose = AsyncMock(side_effect=RuntimeError("close also failed"))
 
         async def fake_scheduler(*_args: object, **_kwargs: object) -> None:
             await asyncio.sleep(100)
@@ -1054,12 +1054,12 @@ class TestLifespan:
             patch.object(_module, "HealthServer", return_value=mock_health_srv),
             patch.object(_module, "AsyncPostgreSQLPool", return_value=mock_pool),
             patch("httpx.AsyncClient", return_value=mock_http_client),
-            patch("redis.asyncio.from_url", new_callable=AsyncMock, return_value=mock_redis),
+            patch("valkey.asyncio.from_url", new_callable=AsyncMock, return_value=mock_valkey),
             patch.object(_module, "_scheduler_loop", side_effect=fake_scheduler),
         ):
             async with _module.lifespan(fake_app):
                 # Must not raise — the service still falls back cleanly.
-                assert _module._redis is None
+                assert _module._valkey is None
                 assert _module._cache is None
 
 

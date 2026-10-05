@@ -6,7 +6,7 @@
 
 ## Ownership after extraction
 
-- This repository owns scheduled computation, PostgreSQL result persistence, Redis cache behavior, and read-only analytics endpoints.
+- This repository owns scheduled computation, PostgreSQL result persistence, Valkey cache behavior, and read-only analytics endpoints.
 - `catalog-api` owns raw graph and catalog queries. This service consumes its promoted internal HTTP contract from `contracts/catalog-api/internal-insights/v1/`.
 - `database-schema` owns PostgreSQL schema initialization.
 - `python-libraries` owns shared runtime, resilience, configuration, and health-server helpers.

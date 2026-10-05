@@ -11,7 +11,7 @@ flowchart LR
     Compute -->|transactional snapshot writes| Postgres[(PostgreSQL insights schema)]
     Clients[internal consumers] -->|HTTP :8008| API
     API[analytics-engine FastAPI] -->|read precomputed results| Postgres
-    API <-->|generation-keyed cache| Redis[(Redis)]
+    API <-->|generation-keyed cache| Valkey[(Valkey)]
     API --> Runtime[shared runtime status]
     Health[HealthServer GET /health :8009] --> Runtime
 ```
@@ -55,9 +55,9 @@ The summary filters on the `product_analytics` purpose. Counting what happened i
 
 ## Cache consistency
 
-Redis is a cache-aside optimization, not the source of truth. Every cached key belongs to a monotonically increasing generation. A request captures the current generation before reading PostgreSQL and writes only to that generation. After `run_all_computations` returns—even when it isolated one or more per-computation failures—the scheduler advances the generation and reclaims superseded generation keys. A request that straddles a recomputation therefore cannot make stale data visible in the new generation.
+Valkey is a cache-aside optimization, not the source of truth. Every cached key belongs to a monotonically increasing generation. A request captures the current generation before reading PostgreSQL and writes only to that generation. After `run_all_computations` returns—even when it isolated one or more per-computation failures—the scheduler advances the generation and reclaims superseded generation keys. A request that straddles a recomputation therefore cannot make stale data visible in the new generation.
 
-If Redis is unavailable, endpoints continue reading PostgreSQL. The failed Redis client is closed before its reference is discarded so startup degradation does not leak a connection pool.
+If Valkey is unavailable, endpoints continue reading PostgreSQL. The failed Valkey client is closed before its reference is discarded so startup degradation does not leak a connection pool.
 
 ## Release-rarity computation
 
