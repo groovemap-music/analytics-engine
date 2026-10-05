@@ -1,14 +1,14 @@
-"""Redis cache for precomputed insight results.
+"""Valkey cache for precomputed insight results.
 
 Uses cache-aside (lazy loading) with a **generation-versioned key namespace**.
-All operations are safe — Redis failures fall through silently so the service
+All operations are safe — Valkey failures fall through silently so the service
 can always fall back to PostgreSQL.
 
 Why a generation, not a plain DELETE
 ------------------------------------
 Cache-aside is a read-then-populate pair with an unbounded gap between the two
 (the endpoint reads Postgres, exits the connection context — a real cooperative
-scheduling yield — then serialises and writes to Redis). The scheduler
+scheduling yield — then serialises and writes to Valkey). The scheduler
 concurrently does DELETE+INSERT in a transaction and then invalidates.
 
 With a plain SCAN+DELETE invalidation the two can interleave as:
@@ -50,15 +50,15 @@ GENERATION_KEY = "insights-generation"
 
 # Only generation-scoped keys belong to this cache. Scanning "insights:*" would
 # also sweep the API service's own "insights:data-completeness" entry (a 6h
-# cache) when both services share a Redis.
+# cache) when both services share a Valkey.
 _VERSIONED_KEY_PATTERN = "insights:g*"
 
 
 class InsightsCache:
-    """Redis cache for precomputed insight results, keyed by generation."""
+    """Valkey cache for precomputed insight results, keyed by generation."""
 
-    def __init__(self, redis: Any, ttl_seconds: int) -> None:
-        self._redis = redis
+    def __init__(self, valkey: Any, ttl_seconds: int) -> None:
+        self._valkey = valkey
         self._ttl = ttl_seconds
 
     @staticmethod
@@ -78,10 +78,10 @@ class InsightsCache:
         value to both :meth:`get` and :meth:`set`, so a request that straddles a
         recompute writes to the generation it actually read from.
 
-        Returns ``0`` when the counter is unset or Redis is unavailable.
+        Returns ``0`` when the counter is unset or Valkey is unavailable.
         """
         try:
-            raw = await self._redis.get(GENERATION_KEY)
+            raw = await self._valkey.get(GENERATION_KEY)
             if raw is None:
                 return 0
             return int(raw)
@@ -90,13 +90,13 @@ class InsightsCache:
             return 0
 
     async def get(self, key: str, generation: int) -> dict[str, Any] | None:
-        """Get a cached value from ``generation``. Returns None on miss or Redis error.
+        """Get a cached value from ``generation``. Returns None on miss or Valkey error.
 
-        Records ``groovemap.api.cache`` for every read; a Redis error counts as a miss,
+        Records ``groovemap.api.cache`` for every read; a Valkey error counts as a miss,
         matching this method's own fall-through-to-database behavior.
         """
         try:
-            raw = await self._redis.get(self.versioned_key(key, generation))
+            raw = await self._valkey.get(self.versioned_key(key, generation))
             if raw is None:
                 record_cache_read(hit=False)
                 return None
@@ -109,13 +109,13 @@ class InsightsCache:
             return None
 
     async def set(self, key: str, value: dict[str, Any], generation: int) -> None:
-        """Cache a value in ``generation`` with TTL. Silently fails if Redis is down.
+        """Cache a value in ``generation`` with TTL. Silently fails if Valkey is down.
 
         Writing into a superseded generation is harmless by construction: those
         keys are unreachable and expire on their own.
         """
         try:
-            await self._redis.set(
+            await self._valkey.set(
                 self.versioned_key(key, generation),
                 json.dumps(value, default=str),
                 ex=self._ttl,
@@ -134,7 +134,7 @@ class InsightsCache:
         them from freshly committed data.
         """
         try:
-            generation = int(await self._redis.incr(GENERATION_KEY))
+            generation = int(await self._valkey.incr(GENERATION_KEY))
         except Exception:
             logger.warning("⚠️ Cache generation bump failed — cache may serve stale data until TTL")
             return
@@ -146,10 +146,10 @@ class InsightsCache:
             cursor: str | int = "0"
             deleted = 0
             while True:
-                cursor, keys = await self._redis.scan(cursor=int(cursor), match=_VERSIONED_KEY_PATTERN, count=100)
+                cursor, keys = await self._valkey.scan(cursor=int(cursor), match=_VERSIONED_KEY_PATTERN, count=100)
                 stale = [k for k in keys if not _as_str(k).startswith(current_prefix)]
                 if stale:
-                    await self._redis.delete(*stale)
+                    await self._valkey.delete(*stale)
                     deleted += len(stale)
                 if int(cursor) == 0:
                     break
@@ -161,5 +161,5 @@ class InsightsCache:
 
 
 def _as_str(key: Any) -> str:
-    """Normalise a Redis key to str (clients may return bytes)."""
+    """Normalise a Valkey key to str (clients may return bytes)."""
     return key.decode() if isinstance(key, bytes) else str(key)

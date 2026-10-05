@@ -31,7 +31,7 @@ dependencies = [
     "httpx>=0.28.1",
     "numpy>=2.3",
     "pydantic>=2.13.5",
-    "redis[hiredis]>=8.1.0",
+    "valkey[libvalkey]>=6.1.0",
     "scipy>=1.16",
     "structlog>=26.1.0",
     "uvicorn[standard]>=0.52.4",
@@ -69,10 +69,10 @@ packages = ["insights"]
 
 [tool.uv]
 exclude-newer = "2 days"
-override-dependencies = ["groovemap-runtime[neo4j,otel,otel-http,postgres] @ git+https://github.com/groovemap-music/python-libraries.git@77e5b53f469ddcf0b96fc559306aeefa4a4e7008"]
+override-dependencies = ["groovemap-runtime[neo4j,otel,otel-http,postgres] @ git+https://github.com/groovemap-music/python-libraries.git@6c3802035e9c973c6598dadbd3e4377daee613d4"]
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "77e5b53f469ddcf0b96fc559306aeefa4a4e7008" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "6c3802035e9c973c6598dadbd3e4377daee613d4" }
 groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "4e9720d838c7da8a6bde139c64a69d781c0f67f0" }
 
 [tool.ruff]
@@ -109,7 +109,7 @@ strict_equality = true
 packages = ["insights"]
 
 [[tool.mypy.overrides]]
-module = ["psycopg.*", "redis.*", "scipy.*"]
+module = ["psycopg.*", "valkey.*", "scipy.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

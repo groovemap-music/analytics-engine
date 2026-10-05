@@ -3,39 +3,39 @@
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
-import fakeredis.aioredis as aioredis_fake
+from fakeredis import FakeAsyncValkey
 import pytest
 
 from insights.cache import GENERATION_KEY, InsightsCache
 
 
 @pytest.fixture
-def mock_redis() -> AsyncMock:
-    """Create a mock Redis client (for error-path tests)."""
-    redis = AsyncMock()
-    redis.get = AsyncMock(return_value=None)
-    redis.set = AsyncMock()
-    redis.incr = AsyncMock(return_value=1)
-    redis.scan = AsyncMock(return_value=(0, []))
-    redis.delete = AsyncMock()
-    return redis
+def mock_valkey() -> AsyncMock:
+    """Create a mock Valkey client (for error-path tests)."""
+    valkey = AsyncMock()
+    valkey.get = AsyncMock(return_value=None)
+    valkey.set = AsyncMock()
+    valkey.incr = AsyncMock(return_value=1)
+    valkey.scan = AsyncMock(return_value=(0, []))
+    valkey.delete = AsyncMock()
+    return valkey
 
 
 @pytest.fixture
-def cache(mock_redis: AsyncMock) -> InsightsCache:
-    """Create an InsightsCache with mock Redis."""
-    return InsightsCache(mock_redis, ttl_seconds=3600)
+def cache(mock_valkey: AsyncMock) -> InsightsCache:
+    """Create an InsightsCache with mock Valkey."""
+    return InsightsCache(mock_valkey, ttl_seconds=3600)
 
 
 @pytest.fixture
-def real_redis() -> Any:
-    """A real (in-memory) Redis, so generation semantics are exercised for real."""
-    return aioredis_fake.FakeRedis(decode_responses=True)
+def real_valkey() -> Any:
+    """A real (in-memory) Valkey, so generation semantics are exercised for real."""
+    return FakeAsyncValkey(decode_responses=True)
 
 
 @pytest.fixture
-def real_cache(real_redis: Any) -> InsightsCache:
-    return InsightsCache(real_redis, ttl_seconds=3600)
+def real_cache(real_valkey: Any) -> InsightsCache:
+    return InsightsCache(real_valkey, ttl_seconds=3600)
 
 
 class TestVersionedKey:
@@ -56,18 +56,18 @@ class TestCacheGet:
         assert await cache.get("insights:top-artists:10", 0) is None
 
     @pytest.mark.asyncio
-    async def test_returns_cached_value_on_hit(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
-        mock_redis.get.return_value = '{"items": [1, 2, 3], "count": 3}'
+    async def test_returns_cached_value_on_hit(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
+        mock_valkey.get.return_value = '{"items": [1, 2, 3], "count": 3}'
         assert await cache.get("insights:top-artists:10", 0) == {"items": [1, 2, 3], "count": 3}
 
     @pytest.mark.asyncio
-    async def test_reads_from_the_requested_generation(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
+    async def test_reads_from_the_requested_generation(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
         await cache.get("insights:top-artists:10", 7)
-        mock_redis.get.assert_awaited_once_with("insights:g7:top-artists:10")
+        mock_valkey.get.assert_awaited_once_with("insights:g7:top-artists:10")
 
     @pytest.mark.asyncio
-    async def test_returns_none_on_redis_error(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
-        mock_redis.get.side_effect = ConnectionError("Redis down")
+    async def test_returns_none_on_valkey_error(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
+        mock_valkey.get.side_effect = ConnectionError("Valkey down")
         assert await cache.get("insights:top-artists:10", 0) is None
 
 
@@ -75,8 +75,8 @@ class TestCacheGetTelemetry:
     """`groovemap.api.cache` must record one outcome per read call, never more or fewer."""
 
     @pytest.mark.asyncio
-    async def test_records_a_hit(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
-        mock_redis.get.return_value = '{"items": [], "count": 0}'
+    async def test_records_a_hit(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
+        mock_valkey.get.return_value = '{"items": [], "count": 0}'
         with patch("insights.cache.record_cache_read") as mock_record:
             await cache.get("insights:top-artists:10", 0)
         mock_record.assert_called_once_with(hit=True)
@@ -88,8 +88,8 @@ class TestCacheGetTelemetry:
         mock_record.assert_called_once_with(hit=False)
 
     @pytest.mark.asyncio
-    async def test_records_a_miss_on_redis_error(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
-        mock_redis.get.side_effect = ConnectionError("Redis down")
+    async def test_records_a_miss_on_valkey_error(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
+        mock_valkey.get.side_effect = ConnectionError("Valkey down")
         with patch("insights.cache.record_cache_read") as mock_record:
             await cache.get("insights:top-artists:10", 0)
         mock_record.assert_called_once_with(hit=False)
@@ -97,16 +97,16 @@ class TestCacheGetTelemetry:
 
 class TestCacheSet:
     @pytest.mark.asyncio
-    async def test_stores_value_with_ttl_in_the_generation_namespace(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
+    async def test_stores_value_with_ttl_in_the_generation_namespace(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
         await cache.set("insights:top-artists:10", {"items": [], "count": 0}, 2)
-        mock_redis.set.assert_called_once()
-        call_args = mock_redis.set.call_args
+        mock_valkey.set.assert_called_once()
+        call_args = mock_valkey.set.call_args
         assert call_args[0][0] == "insights:g2:top-artists:10"
         assert call_args[1]["ex"] == 3600
 
     @pytest.mark.asyncio
-    async def test_silently_fails_on_redis_error(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
-        mock_redis.set.side_effect = ConnectionError("Redis down")
+    async def test_silently_fails_on_valkey_error(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
+        mock_valkey.set.side_effect = ConnectionError("Valkey down")
         await cache.set("insights:top-artists:10", {"items": []}, 0)  # must not raise
 
 
@@ -123,8 +123,8 @@ class TestCacheGeneration:
         assert await real_cache.generation() == 2
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_zero_on_redis_error(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
-        mock_redis.get.side_effect = ConnectionError("Redis down")
+    async def test_falls_back_to_zero_on_valkey_error(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
+        mock_valkey.get.side_effect = ConnectionError("Valkey down")
         assert await cache.generation() == 0
 
 
@@ -183,60 +183,60 @@ class TestCacheAsideRace:
 
 class TestCacheInvalidateAll:
     @pytest.mark.asyncio
-    async def test_reclaims_superseded_generation_keys(self, real_cache: InsightsCache, real_redis: Any) -> None:
+    async def test_reclaims_superseded_generation_keys(self, real_cache: InsightsCache, real_valkey: Any) -> None:
         generation = await real_cache.generation()
         await real_cache.set("insights:top-artists:10", {"a": 1}, generation)
         await real_cache.set("insights:genre-trends:Rock", {"b": 2}, generation)
 
         await real_cache.invalidate_all()
 
-        assert await real_redis.get(f"insights:g{generation}:top-artists:10") is None
-        assert await real_redis.get(f"insights:g{generation}:genre-trends:Rock") is None
+        assert await real_valkey.get(f"insights:g{generation}:top-artists:10") is None
+        assert await real_valkey.get(f"insights:g{generation}:genre-trends:Rock") is None
 
     @pytest.mark.asyncio
-    async def test_does_not_touch_unversioned_insights_keys(self, real_cache: InsightsCache, real_redis: Any) -> None:
-        """The API service caches insights:data-completeness on a possibly-shared Redis."""
-        await real_redis.set("insights:data-completeness", "api-owned")
+    async def test_does_not_touch_unversioned_insights_keys(self, real_cache: InsightsCache, real_valkey: Any) -> None:
+        """The API service caches insights:data-completeness on a possibly-shared Valkey."""
+        await real_valkey.set("insights:data-completeness", "api-owned")
 
         await real_cache.invalidate_all()
 
-        assert await real_redis.get("insights:data-completeness") == "api-owned"
+        assert await real_valkey.get("insights:data-completeness") == "api-owned"
 
     @pytest.mark.asyncio
-    async def test_preserves_the_generation_counter(self, real_cache: InsightsCache, real_redis: Any) -> None:
+    async def test_preserves_the_generation_counter(self, real_cache: InsightsCache, real_valkey: Any) -> None:
         await real_cache.invalidate_all()
         await real_cache.invalidate_all()
-        assert await real_redis.get(GENERATION_KEY) == "2"
+        assert await real_valkey.get(GENERATION_KEY) == "2"
 
     @pytest.mark.asyncio
-    async def test_handles_no_keys(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
-        mock_redis.scan.return_value = (0, [])
+    async def test_handles_no_keys(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
+        mock_valkey.scan.return_value = (0, [])
         await cache.invalidate_all()
-        mock_redis.delete.assert_not_called()
+        mock_valkey.delete.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_handles_multiple_scan_pages(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
+    async def test_handles_multiple_scan_pages(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
         # incr returns 1, so "insights:g1:" is the live generation and is skipped.
-        mock_redis.scan.side_effect = [
+        mock_valkey.scan.side_effect = [
             ("42", ["insights:g0:key1"]),
             ("0", ["insights:g0:key2"]),
         ]
         await cache.invalidate_all()
-        assert mock_redis.delete.call_count == 2
+        assert mock_valkey.delete.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_handles_bytes_keys_from_the_client(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
-        mock_redis.scan.side_effect = [(0, [b"insights:g0:key1"])]
+    async def test_handles_bytes_keys_from_the_client(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
+        mock_valkey.scan.side_effect = [(0, [b"insights:g0:key1"])]
         await cache.invalidate_all()
-        mock_redis.delete.assert_called_once_with(b"insights:g0:key1")
+        mock_valkey.delete.assert_called_once_with(b"insights:g0:key1")
 
     @pytest.mark.asyncio
-    async def test_scan_failure_does_not_raise(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
-        mock_redis.scan.side_effect = ConnectionError("Redis down")
+    async def test_scan_failure_does_not_raise(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
+        mock_valkey.scan.side_effect = ConnectionError("Valkey down")
         await cache.invalidate_all()  # must not raise
 
     @pytest.mark.asyncio
-    async def test_incr_failure_does_not_raise(self, cache: InsightsCache, mock_redis: AsyncMock) -> None:
-        mock_redis.incr.side_effect = ConnectionError("Redis down")
+    async def test_incr_failure_does_not_raise(self, cache: InsightsCache, mock_valkey: AsyncMock) -> None:
+        mock_valkey.incr.side_effect = ConnectionError("Valkey down")
         await cache.invalidate_all()  # must not raise
-        mock_redis.delete.assert_not_called()
+        mock_valkey.delete.assert_not_called()

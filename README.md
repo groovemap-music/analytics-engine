@@ -1,6 +1,6 @@
 # GrooveMap analytics engine
 
-Independently versioned service for scheduled music analytics. It obtains raw graph and catalog inputs from `catalog-api`, stores precomputed results in PostgreSQL, uses Redis for cache-aside reads, and exposes a FastAPI service on port 8008 with a separate health listener on port 8009.
+Independently versioned service for scheduled music analytics. It obtains raw graph and catalog inputs from `catalog-api`, stores precomputed results in PostgreSQL, uses Valkey for cache-aside reads, and exposes a FastAPI service on port 8008 with a separate health listener on port 8009.
 
 This project is licensed under the [GNU Affero General Public License v3.0 only](LICENSE). Commercial use is permitted under the AGPL when its terms are followed; [alternative commercial terms may be negotiated](COMMERCIAL-LICENSING.md).
 
@@ -39,7 +39,7 @@ Run locally after setup:
 uv run analytics-engine
 ```
 
-Required configuration includes `POSTGRES_HOST`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DATABASE`. Username, password, Redis password, and the internal API secret support the shared `_FILE` secret convention. The complete runtime and telemetry variable table, including defaults and validation behavior, is in [the operations guide](docs/operations.md#configuration). Supply real secrets through the deployment layer; never commit them here.
+Required configuration includes `POSTGRES_HOST`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DATABASE`. Username, password, Valkey password, and the internal API secret support the shared `_FILE` secret convention. The complete runtime and telemetry variable table, including defaults and validation behavior, is in [the operations guide](docs/operations.md#configuration). Supply real secrets through the deployment layer; never commit them here.
 
 OpenTelemetry metrics and traces export to a collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Alongside the HTTP, database, and computation metrics, the service reports the process view and its event-loop lag, and opens one `insights {computation}` root span per scheduled computation so a slow insight is attributable to the calls it made. See [docs/operations.md](docs/operations.md#telemetry) for the full variable list, the metrics, and the spans this service emits. Each signal can be turned off on its own, and with no endpoint configured telemetry is a no-op and the service behaves exactly as it does today.
 
@@ -58,3 +58,5 @@ script uses a matching adjacent checkout or creates a temporary checkout from th
 The project is independently versioned from PEP 621 metadata with Commitizen and approved `v$version` annotated tags. Migration and release-readiness verification are deliberately non-publishing; the hosted workflow only responds to an explicitly created version tag.
 
 See the [documentation index](docs/README.md) for architecture, operations, extraction provenance, and release-compliance guidance.
+
+Use `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD` and `VALKEY_PASSWORD_FILE`. Unset settings fall back to deprecated `REDIS_*` counterparts with a warning once per legacy variable per process; explicit Valkey settings take precedence, including an empty password. Password `_FILE` takes precedence within its namespace and unreadable files fail closed. Cache key strings remain unchanged.
