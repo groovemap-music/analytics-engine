@@ -142,7 +142,7 @@ def record_embedding_pipeline_failure() -> None:
 
 
 def record_cache_read(*, hit: bool) -> None:
-    """Record one insights cache read. A Redis error counts as a miss (see InsightsCache)."""
+    """Record one insights cache read. A Valkey error counts as a miss (see InsightsCache)."""
     outcome = "hit" if hit else "miss"
     try:
         _instrument(CACHE).add(1, {"outcome": outcome, "cache": CACHE_NAME})

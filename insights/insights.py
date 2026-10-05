@@ -16,9 +16,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
-import redis.asyncio as aioredis
 import structlog
 import uvicorn
+import valkey.asyncio as aiovalkey
 from common import (
     AsyncPostgreSQLPool,
     HealthServer,
@@ -71,7 +71,7 @@ INSIGHTS_HEALTH_PORT = 8009
 _config: InsightsConfig | None = None
 _pool: AsyncPostgreSQLPool | None = None
 _http_client: httpx.AsyncClient | None = None
-_redis: aioredis.Redis | None = None
+_valkey: aiovalkey.Valkey | None = None
 _cache: InsightsCache | None = None
 _scheduler_task: asyncio.Task[None] | None = None
 _last_computation: datetime | None = None
@@ -153,27 +153,27 @@ def _initialize_http_client(config: InsightsConfig) -> httpx.AsyncClient:
     return client
 
 
-async def _initialize_cache(config: InsightsConfig) -> tuple[aioredis.Redis | None, InsightsCache | None]:
-    """Connect Redis, closing a partially connected client on degradation."""
-    redis_client: aioredis.Redis | None = None
+async def _initialize_cache(config: InsightsConfig) -> tuple[aiovalkey.Valkey | None, InsightsCache | None]:
+    """Connect Valkey, closing a partially connected client on degradation."""
+    valkey_client: aiovalkey.Valkey | None = None
     try:
-        redis_client = await aioredis.from_url(config.redis_host, decode_responses=True)
-        await redis_client.ping()
-        cache = InsightsCache(redis_client, ttl_seconds=config.schedule_hours * 3600)
-        logger.info("✅ Redis cache initialized", ttl_hours=config.schedule_hours)
-        return redis_client, cache
+        valkey_client = await aiovalkey.from_url(config.valkey_url, decode_responses=True)
+        await valkey_client.ping()
+        cache = InsightsCache(valkey_client, ttl_seconds=config.schedule_hours * 3600)
+        logger.info("✅ Valkey cache initialized", ttl_hours=config.schedule_hours)
+        return valkey_client, cache
     except Exception:
-        logger.warning("⚠️ Redis unavailable — caching disabled, falling back to PostgreSQL")
+        logger.warning("⚠️ Valkey unavailable — caching disabled, falling back to PostgreSQL")
         # from_url() is lazy, so a failed ping may still leave a live connection pool.
-        if redis_client is not None:
+        if valkey_client is not None:
             with contextlib.suppress(Exception):
-                await redis_client.aclose()
+                await valkey_client.aclose()
         return None, None
 
 
 async def _shutdown_runtime(
     scheduler_task: asyncio.Task[None] | None,
-    redis_client: aioredis.Redis | None,
+    valkey_client: aiovalkey.Valkey | None,
     http_client: httpx.AsyncClient | None,
     pool: AsyncPostgreSQLPool | None,
     health_server: HealthServer,
@@ -183,8 +183,8 @@ async def _shutdown_runtime(
         scheduler_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await scheduler_task
-    if redis_client:
-        await redis_client.aclose()
+    if valkey_client:
+        await valkey_client.aclose()
     if http_client:
         await http_client.aclose()
     if pool:
@@ -196,7 +196,7 @@ async def _shutdown_runtime(
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     """Manage service lifecycle — connect to databases and start scheduler."""
-    global _config, _pool, _http_client, _redis, _cache, _scheduler_task
+    global _config, _pool, _http_client, _valkey, _cache, _scheduler_task
 
     setup_logging(SERVICE_NAME, log_file=Path(f"/logs/{SERVICE_NAME}.log"))
     setup_telemetry(SERVICE_NAME)
@@ -214,7 +214,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
 
     _pool = await _initialize_pool(_config)
     _http_client = _initialize_http_client(_config)
-    _redis, _cache = await _initialize_cache(_config)
+    _valkey, _cache = await _initialize_cache(_config)
 
     _scheduler_task = asyncio.create_task(
         _scheduler_loop(
@@ -231,7 +231,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     yield
 
     logger.info("🔧 Analytics engine shutting down...")
-    await _shutdown_runtime(_scheduler_task, _redis, _http_client, _pool, health_srv)
+    await _shutdown_runtime(_scheduler_task, _valkey, _http_client, _pool, health_srv)
     logger.info("✅ Analytics engine stopped")
 
 

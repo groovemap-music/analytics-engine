@@ -82,3 +82,22 @@ def test_actual_checker_rejects_stale_or_foreign_workflow_pins(monkeypatch: pyte
     monkeypatch.setattr(Path, "read_text", read_fixture)
     with pytest.raises(AssertionError):
         _checker_functions()
+
+
+@pytest.mark.parametrize("replacement", ["77e5b53f469ddcf0b96fc559306aeefa4a4e7008", "a" * 40])
+def test_actual_checker_rejects_stale_or_foreign_runtime_wheel_pin(monkeypatch: pytest.MonkeyPatch, replacement: str) -> None:
+    fixture_path = ROOT / "scripts/prepare-runtime-wheel.sh"
+    original_read = Path.read_text
+    original = original_read(fixture_path)
+    expected = "6c3802035e9c973c6598dadbd3e4377daee613d4"
+    assert expected in original
+    fixture = original.replace(expected, replacement)
+
+    def read_fixture(path: Path, *args: object, **kwargs: object) -> str:
+        if path == fixture_path:
+            return fixture
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_fixture)
+    with pytest.raises(AssertionError):
+        _checker_functions()

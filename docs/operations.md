@@ -16,9 +16,9 @@ The outbound client identifies itself as `analytics-engine/<version>` with the c
 | `POSTGRES_PASSWORD` / `POSTGRES_PASSWORD_FILE` | yes | PostgreSQL password; the `_FILE` value takes precedence |
 | `POSTGRES_DATABASE` | yes | Database containing the `insights` schema |
 | `API_BASE_URL` | no | `catalog-api` base URL; defaults to `http://api:8004` |
-| `REDIS_HOST` | no | Redis hostname, not a URL; defaults to `localhost` |
-| `REDIS_PORT` | no | Redis port; defaults to `6379` |
-| `REDIS_PASSWORD` / `REDIS_PASSWORD_FILE` | no | Redis password; the `_FILE` value takes precedence and the password is URL-escaped |
+| `VALKEY_HOST` | no | Valkey hostname, not a URL; defaults to `localhost` |
+| `VALKEY_PORT` | no | Valkey port; defaults to `6379` |
+| `VALKEY_PASSWORD` / `VALKEY_PASSWORD_FILE` | no | Valkey password; the `_FILE` value takes precedence and the password is URL-escaped |
 | `INSIGHTS_INTERNAL_SECRET` / `INSIGHTS_INTERNAL_SECRET_FILE` | no | Shared secret for internal catalog endpoints; the `_FILE` value takes precedence |
 | `INSIGHTS_SCHEDULE_HOURS` | no | Positive integer cycle interval; missing, invalid, zero, and negative values use `24` |
 | `INSIGHTS_MILESTONE_YEARS` | no | Comma-separated integer anniversary milestones; values are deduplicated and sorted, and an empty or invalid list uses `25,30,40,50,75,100` |
@@ -110,8 +110,8 @@ Attribute values are a closed, low-cardinality set — never ids, hosts, or free
 ```mermaid
 stateDiagram-v2
     [*] --> Starting
-    Starting --> ReadyWithoutCache: PostgreSQL and catalog ready; Redis unavailable
-    Starting --> ReadyWithCache: PostgreSQL, catalog, and Redis ready
+    Starting --> ReadyWithoutCache: PostgreSQL and catalog ready; Valkey unavailable
+    Starting --> ReadyWithCache: PostgreSQL, catalog, and Valkey ready
     ReadyWithoutCache --> Computing: first 30-second delay or interval elapsed
     ReadyWithCache --> Computing: first 30-second delay or interval elapsed
     Computing --> ReadyWithoutCache: cycle returns; results and statuses recorded
@@ -124,7 +124,7 @@ stateDiagram-v2
     Stopping --> [*]: scheduler cancelled and clients closed
 ```
 
-`ReadyWithCache` and `ReadyWithoutCache` are explanatory states in this diagram, not health payload values: both report `status=healthy` because PostgreSQL and the catalog client are ready. Redis failure disables caching without preventing service startup. Within a cycle, each failed computation records failure and the remaining computations continue; the scheduler's cycle-level error path is reserved for an exception that escapes that coordinator. Shutdown cancels the scheduler, closes Redis, HTTP, and PostgreSQL resources, stops the health listener, and flushes telemetry.
+`ReadyWithCache` and `ReadyWithoutCache` are explanatory states in this diagram, not health payload values: both report `status=healthy` because PostgreSQL and the catalog client are ready. Valkey failure disables caching without preventing service startup. Within a cycle, each failed computation records failure and the remaining computations continue; the scheduler's cycle-level error path is reserved for an exception that escapes that coordinator. Shutdown cancels the scheduler, closes Valkey, HTTP, and PostgreSQL resources, stops the health listener, and flushes telemetry.
 
 ## Operator checks
 
@@ -143,3 +143,9 @@ The recipes below are the maintained repository interface. `just --summary` list
 | `just release-dry-run` | Run `just check` and assemble release artifacts without tagging, uploading, or publishing. |
 
 `just build`, `just install-check`, `just license-check`, `just release-artifacts`, and `just bump-preview` remain directly invocable focused checks and are also dependencies of `just check`. `just prepare-runtime-wheel` accepts `GROOVEMAP_RUNTIME_REPO` only as an optional build-time override: it must name a clean `python-libraries` checkout at the pinned revision. Without the override, the recipe uses a matching adjacent checkout or creates a temporary one.
+
+## Staged Valkey compatibility
+
+Unset `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD` and `VALKEY_PASSWORD_FILE` settings fall back to their deprecated `REDIS_*` counterparts with one warning per legacy variable per process. Valkey settings take precedence, including an explicitly empty password; a nonempty password `_FILE` path wins within either namespace and unreadable files fail closed. Existing cache keys and PostgreSQL fallback behavior are unchanged. The approved follow-on removes these compatibility aliases before migration completion.
+
+The consumer overrides the dev-only database-schema package's older runtime source with immutable python-libraries revision `6c3802035e9c973c6598dadbd3e4377daee613d4`, retaining the existing `neo4j,otel,otel-http,postgres` extras. This selects the reviewed Valkey URL helper without changing the schema producer commit, promoted binding, source record or hashes. The normal AST/hash contract gate still verifies those immutable artifacts.

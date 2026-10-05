@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
 CI_AUTOMATION_REVISION = "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26"
-PYTHON_LIBRARIES_REVISION = "77e5b53f469ddcf0b96fc559306aeefa4a4e7008"
+PYTHON_LIBRARIES_REVISION = "6c3802035e9c973c6598dadbd3e4377daee613d4"
 GIT = shutil.which("git")
 if GIT is None:
     raise RuntimeError("git is required to establish the tracked first-party source boundary")
@@ -84,6 +84,8 @@ assert not any(marker in release for marker in private_library_markers)
 pyproject = (ROOT / "pyproject.toml").read_text()
 assert 'git = "https://github.com/groovemap-music/python-libraries.git"' in pyproject
 assert f'rev = "{PYTHON_LIBRARIES_REVISION}"' in pyproject
+runtime_wheel_script = (ROOT / "scripts/prepare-runtime-wheel.sh").read_text()
+assert f'expected="{PYTHON_LIBRARIES_REVISION}"' in runtime_wheel_script
 
 release_script = (ROOT / "scripts/release-dry-run.sh").read_text()
 assert "--require-hashes" in release_script
