@@ -1,0 +1,22 @@
+{
+  "producer_repository": "https://github.com/groovemap-music/database-schema",
+  "producer_commit": "4e9720d838c7da8a6bde139c64a69d781c0f67f0",
+  "producer_source": "src/groovemap_schema/postgres.py",
+  "producer_source_sha256": "223e1877120ccef4c0244490ac73e7709eca37b7632647392172f5d5b23a7cb1",
+  "binding": "insights/schema_release_contract.py",
+  "binding_sha256": "27b75cce7c40a9b78480494e98c71c89895daad5394c552565ad3c09fc0e8c2e",
+  "version": "1.0.0",
+  "symbols": [
+    "_valid_model_version",
+    "_ARTIST_EMBEDDING_RELEASES_LOCK_SQL",
+    "_ARTIST_EMBEDDING_RELEASES_CLEAR_CURRENT_SQL",
+    "_ARTIST_EMBEDDING_RELEASES_CREATE_SQL",
+    "create_artist_embedding_release",
+    "_valid_artist_release_reference",
+    "publish_artist_embedding_release",
+    "_ARTIST_EMBEDDING_RELEASES_IS_CURRENT_QUERY",
+    "_ARTIST_SIMILAR_ARTISTS_VERSION_DELETE_SQL",
+    "_ARTIST_EMBEDDING_RELEASES_VERSION_DELETE_SQL",
+    "retire_artist_similar_artists_version"
+  ]
+}

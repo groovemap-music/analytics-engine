@@ -19,10 +19,12 @@ DDL, no ownership, nothing on any other schema. Three consequences shape this mo
   forward-looking, `model_version`-filtered shape rather than something database-schema
   documents today. Retiring a superseded `model_version`'s rows and index is that follow-on's
   business, never this job's.
-- **No writes outside `artist_embeddings`.** Every read below is a `SELECT` against `graph`;
-  the one write statement targets `public.artist_embeddings` and nothing else. A connection
-  authenticated as this role gets a permission error on anything else — see
-  `tests/integration/test_embedding_pipeline_integration.py`.
+- **No writes outside its own tables.** Every read below is a `SELECT` against `graph`; the
+  load's one write statement targets `public.artist_embeddings`, and the similar-artist stage
+  that follows it (`insights.similar_artists`, gm-analytics-engine-d4d) writes only
+  `public.artist_similar_artists` and `public.artist_embedding_releases`, which
+  gm-database-schema-2xe0 grants this role. A connection authenticated as this role gets a
+  permission error on anything else — see `tests/integration/test_embedding_pipeline_integration.py`.
 - **No log table.** Other scheduled computations in `insights/computations.py` write their
   outcome to `insights.computation_log`; this role holds nothing on the `insights` schema, so
   this job cannot do that. `public.artist_embeddings` itself — `source_dump_id`,
@@ -118,6 +120,7 @@ from common import (
 from common.config import _build_postgres_connstr, get_secret
 
 from insights.embeddings import AdjacencyBuilder, FastRPConfig, NodeIndex, fastrp, node_keys
+from insights.similar_artists import run_similar_artists
 from insights.telemetry import computation_span, record_computation, record_embedding_pipeline_failure, record_embedding_rows_written
 
 
@@ -337,6 +340,17 @@ _STORED_VERSION_SEPARATOR: Final = "@"
 # artist and track-performer relations as "edges-v3".
 _EDGE_SET_VERSION: Final = "edges-v3"
 
+# The monthly job's FastRP configuration: ADR 0013's defaults (w0 = 0) plus the self term at
+# 0.05 (gm-analytics-engine-8ts, docs/embedding_tie_break.md), which took edges-v3's
+# byte-duplicate vectors from 42.22% to 0.0% and exact top-10 churn from 0.8886 to 0.9519.
+# `FastRPConfig()`'s own default stays 0.0 so the pre-8ts sum remains reproducible bit for bit;
+# this is the one place production opts in. Its `model_version` names `self=0.05` and
+# `fastrp-v2`, so the stored `model_version` changes with it and a dump already loaded under
+# the old configuration is recomputed rather than skipped.
+PRODUCTION_FASTRP_CONFIG: Final = FastRPConfig(self_weight=0.05)
+
+DEFAULT_SIMILAR_ARTISTS_SPOOL_DIR: Final = Path("/tmp/analytics-engine-similar-artists")  # noqa: S108 -- local scratch, see EmbeddingPipelineConfig.
+
 
 @dataclass(frozen=True)
 class EmbeddingPipelineConfig:
@@ -355,6 +369,9 @@ class EmbeddingPipelineConfig:
     postgres_database: str
     source_dump_id: str
     source_dump_date: date
+    # Local scratch for the exact top-K spool (about 3.75 GB for the full catalog at K=50,
+    # plus a same-sized checkpoint); see docs/similar_artists.md.
+    similar_artists_spool_dir: Path = DEFAULT_SIMILAR_ARTISTS_SPOOL_DIR
 
     @classmethod
     def from_env(cls) -> EmbeddingPipelineConfig:
@@ -393,6 +410,7 @@ class EmbeddingPipelineConfig:
             postgres_database=cast("str", postgres_database),
             source_dump_id=cast("str", source_dump_id),
             source_dump_date=source_dump_date,
+            similar_artists_spool_dir=Path(getenv("SIMILAR_ARTISTS_SPOOL_DIR") or DEFAULT_SIMILAR_ARTISTS_SPOOL_DIR),
         )
 
 
@@ -722,18 +740,33 @@ async def run_embedding_pipeline(
     dump_id: str,
     dump_date: date,
     config: FastRPConfig | None = None,
+    similar_artists_spool_dir: Path | None = None,
 ) -> LoadResult:
     """Run one embedding load, recording duration, rows written, and failure metrics.
 
     Mirrors `insights.computations.run_all_computations`'s span-and-metric shape, without the
     `insights.computation_log` write that function's `_record_lifecycle` also does — this role
     cannot make it (see the module docstring).
+
+    With `similar_artists_spool_dir`, then computes and publishes that `model_version`'s exact
+    similar-artist lists (`insights.similar_artists.run_similar_artists`, docs/similar_artists.md).
+    That stage reads the vectors back from `artist_embeddings` rather than reusing the in-memory
+    array, so FastRP's peak and the top-K peak never overlap, and it runs whether this load wrote
+    the vectors or found them already loaded, since it has its own idempotency check.
     """
-    config = config or FastRPConfig()
+    config = config or PRODUCTION_FASTRP_CONFIG
     started = time.perf_counter()
     try:
         with computation_span(COMPUTATION_NAME):
             result = await load_embeddings(pool, config, dump_id, dump_date)
+            if similar_artists_spool_dir is not None:
+                await run_similar_artists(
+                    pool,
+                    model_version=result.model_version,
+                    source_dump_id=dump_id,
+                    source_dump_date=dump_date,
+                    spool_root=similar_artists_spool_dir,
+                )
     except Exception as error:
         record_computation(COMPUTATION_NAME, time.perf_counter() - started, success=False)
         record_embedding_pipeline_failure()
@@ -770,7 +803,9 @@ async def _initialize_pool(config: EmbeddingPipelineConfig) -> AsyncPostgreSQLPo
 async def _run(config: EmbeddingPipelineConfig) -> LoadResult:
     pool = await _initialize_pool(config)
     try:
-        return await run_embedding_pipeline(pool, config.source_dump_id, config.source_dump_date)
+        return await run_embedding_pipeline(
+            pool, config.source_dump_id, config.source_dump_date, similar_artists_spool_dir=config.similar_artists_spool_dir
+        )
     finally:
         await pool.close()
 
