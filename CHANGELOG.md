@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented here by Commitizen.
 
+## v0.3.0 (2026-10-05)
+
+### Feat
+
+- **cache**: migrate analytics client and naming to Valkey
+- **embeddings**: run the similar-artist stage after each monthly load
+- **embeddings**: spool, COPY and publish exact similar-artist lists
+- **embeddings**: default the monthly pipeline to the 0.05 self term
+- **embeddings**: add an exact all-pairs top-K cosine kernel
+
+### Fix
+
+- **build**: align analytics image runtime wheel with Valkey helper pin
+- **embeddings**: keep unaccepted similar artist publishing off by default
+- **embeddings**: write compact release arrays and retain displaced current
+
+### Perf
+
+- **embeddings**: narrow exact column candidate segments
+
 ## v0.2.0 (2026-10-03)
 
 ### Feat
