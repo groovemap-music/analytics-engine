@@ -7,6 +7,7 @@ appear in this repository (ADR 0013, data rights).
 from __future__ import annotations
 
 import hashlib
+import platform
 import subprocess
 import sys
 import textwrap
@@ -328,7 +329,14 @@ class TestSelfTerm:
         # `if config.self_weight:`, so nothing new runs at all when it is 0.
         adjacency = build(catalog_edges).build()
         embedding = fastrp(adjacency)
-        assert hashlib.sha256(embedding.tobytes()).hexdigest() == "2340fe5fd2cc53014c3e551491506ee396f3c8541cea84e74f0233195595a6cc"
+        platform_key = (sys.platform, platform.machine())
+        expected_by_platform = {
+            ("darwin", "arm64"): "2340fe5fd2cc53014c3e551491506ee396f3c8541cea84e74f0233195595a6cc",
+            ("linux", "x86_64"): "beefd7eb8fc187b7258f4f8bb1159cd36497a2bb2b7617aa6e301abdeb1c61e5",
+        }
+        if platform_key not in expected_by_platform:
+            pytest.fail(f"no FastRP pre-self digest is registered for {platform_key!r}")
+        assert hashlib.sha256(embedding.tobytes()).hexdigest() == expected_by_platform[platform_key]
         assert fastrp(adjacency, FastRPConfig(self_weight=0.0)).tobytes() == embedding.tobytes()
 
     @pytest.mark.parametrize("block_columns", [1, 3, 16, 128])
