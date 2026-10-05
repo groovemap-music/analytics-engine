@@ -31,7 +31,7 @@ The 9.37M × 9.37M score matrix is never materialized, so the job computes it in
 
 ## Pipeline stage
 
-`run_embedding_pipeline` calls `insights.similar_artists.run_similar_artists` after each load, whether the load wrote vectors or found them already loaded:
+`run_embedding_pipeline` calls `insights.similar_artists.run_similar_artists` only when an explicit spool argument is supplied. The monthly entry point supplies that argument only with strict `ENABLE_SIMILAR_ARTISTS=true`; absent or `false` retains embedding-only behavior and self-weight zero. When explicitly enabled, the optional stage follows a load whether it wrote vectors or found them already loaded. The flow below describes that optional stage, not the default monthly invocation. Production publication must stay disabled until the unchanged six-hour admission and real stored acceptance pass:
 
 1. **Skip if published.** If `artist_embedding_releases` has this `model_version` with `artists > 0` (a published
    release), the stage does nothing. A pending target (`artists = 0`) is retried.
