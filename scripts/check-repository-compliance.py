@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
+CI_AUTOMATION_REVISION = "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26"
 PYTHON_LIBRARIES_REVISION = "77e5b53f469ddcf0b96fc559306aeefa4a4e7008"
 GIT = shutil.which("git")
 if GIT is None:
@@ -59,7 +60,7 @@ assert "dependabot" not in ci.lower()
 assert "fallback-command" not in ci
 assert workflow_jobs(ci) == {"required"}
 ci_target = re.search(r"groovemap-music/automation/\.github/workflows/reusable-ci\.yml@([^\s]+)", ci)
-assert ci_target is not None and ci_target.group(1) == AUTOMATION_REVISION
+assert ci_target is not None and ci_target.group(1) == CI_AUTOMATION_REVISION
 assert "CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}" in ci
 assert "secrets: inherit" not in ci
 
