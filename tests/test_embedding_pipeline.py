@@ -1102,7 +1102,7 @@ async def test_monthly_entrypoint_keeps_unaccepted_publication_off_by_default(mo
     config = pipeline.EmbeddingPipelineConfig(
         postgres_host="fixture:5432",
         postgres_username="fixture",
-        postgres_password="fixture",
+        postgres_password=str(tmp_path),
         postgres_database="fixture",
         source_dump_id="dump-1",
         source_dump_date=date(2026, 9, 1),
