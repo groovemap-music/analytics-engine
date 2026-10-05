@@ -9,10 +9,13 @@
 | Dimensions | 128 |
 | Iteration weights | `0,1,1,1,1`: five propagation steps, with the first one unweighted |
 | Degree normalization β | 0 |
+| Self term | 0 when `ENABLE_SIMILAR_ARTISTS` is absent or `false`; only exact `true` uses 0.05 × the vertex's own normalized projection row |
 | Projection | Very sparse (Achlioptas, s = 3): ±√3 with probability 1/6 each, otherwise 0 |
 | Projection row of a vertex | SplitMix64 over `blake2b64(kind, key)` XOR a per-column salt, derived from the pinned seed `20260924` |
 
-`FastRPConfig().model_version` names all of this. The current value is `fastrp-v1:dim=128:weights=0,1,1,1,1:beta=0:proj=achlioptas-s3:rows=splitmix64(blake2b64(kind,key)):seed=20260924`. `FASTRP_ALGORITHM_VERSION` is bumped whenever a code change alters any output bit, so vectors from two versions of the code never share a `model_version`.
+`FastRPConfig.model_version` names all of this. The monthly pipeline retains `FastRPConfig()` by default. Only explicit `ENABLE_SIMILAR_ARTISTS=true` uses `insights.embedding_pipeline.PRODUCTION_FASTRP_CONFIG`, which is `FastRPConfig(self_weight=0.05)`, and enables the exact-list publication stage; current measured time admission still fails, so production opt-in remains pending. The explicitly enabled self-term configuration has value `fastrp-v2:dim=128:weights=0,1,1,1,1:beta=0:self=0.05:proj=achlioptas-s3:rows=splitmix64(blake2b64(kind,key)):seed=20260924`, and the stored `model_version` appends `:edges-v3@<dump id>`. The self term (gm-analytics-engine-8ts, `docs/embedding_tie_break.md`) removed the byte-duplicate vectors that tied 42.22% of edges-v3 artists and raised exact top-10 month-over-month churn from 0.8886 to 0.9519. `FastRPConfig()` itself keeps `self_weight=0`, which reproduces the pre-8ts sum bit for bit. `FASTRP_ALGORITHM_VERSION` is bumped whenever a code change alters any output bit, so vectors from two versions of the code never share a `model_version`.
+
+The default embedding-only invocation does not compute or publish exact top-K lists. The optional stage computes them only with strict `ENABLE_SIMILAR_ARTISTS=true`; absent or `false` leaves it off and any other value is rejected. Production enablement remains pending the unchanged six-hour admission and actual stored recall, monthly Jaccard and publication acceptance; see `docs/similar_artists.md`.
 
 ## Interfaces
 
@@ -119,10 +122,11 @@ edge relations that connect them (`graph.by_artist`, `graph.on_label`, `graph.de
 `graph.master_in_style`, the release-level credited-artist relation ieu.6 added, and — since
 this bead — the track-credited-artist and track-performer relations below) — each via a named
 (server-side) PostgreSQL cursor, fetched in 50,000-row blocks, so the full vertex and edge sets
-are never materialized as Python lists in one piece. `fastrp` is then called with the defaults
-documented above: `out_dtype=np.float16`, `block_columns=4` (the default), and `threads=6` —
-the configuration the scaling table above was measured against, which stays within the 12 GB
-full-catalog budget.
+are never materialized as Python lists in one piece. `fastrp` is then called with
+`FastRPConfig()` by default, or `PRODUCTION_FASTRP_CONFIG` only with explicit similar-artist opt-in (the self term at 0.05, above), and the defaults documented above: `out_dtype=np.float16`, `block_columns=4` (the default), and `threads=6`.
+The scaling table above records historical memory measurements of the stated configuration;
+it does not make the optional self-term or exact-list stage the default, and it does not establish
+the still-failing six-hour exact-list time admission.
 
 **Release-level credited-artist edges (ieu.6).** The chw.2 spike's adopted FastRP
 configuration includes credit and track edges — "removing credit and track edges costs 10

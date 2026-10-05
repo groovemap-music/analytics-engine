@@ -53,6 +53,8 @@ A separate, one-shot entry point (`insights.embedding_pipeline:main`), not the F
 | `EMBEDDING_PIPELINE_POSTGRES_PASSWORD` / `_FILE` | yes | That login's password; the `_FILE` value takes precedence |
 | `SOURCE_DUMP_ID` | yes | The current dump's identifier, recorded as `artist_embeddings.source_dump_id` lineage and as this run's idempotency key alongside the FastRP `model_version` |
 | `SOURCE_DUMP_DATE` | yes | The current dump's date (`YYYY-MM-DD`), recorded as `artist_embeddings.source_dump_date` |
+| `ENABLE_SIMILAR_ARTISTS` | no | Default `false`; only exact `true` opts into self-weight 0.05 and exact-list computation, COPY, publication and rotation. Absent or `false` retains embedding-only behavior with self-weight zero; other values fail closed. Keep production disabled until the unchanged six-hour admission and real stored recall/Jaccard/publication acceptance pass. |
+| `SIMILAR_ARTISTS_SPOOL_DIR` | no | Does not enable the stage. Local scratch for the exact top-K similar-artist spool and its checkpoint (default `/tmp/analytics-engine-similar-artists`). Needs about 7.5 GB free for the full catalog at K=50; must survive a restart for a stopped run to resume. See docs/similar_artists.md |
 
 ## Telemetry
 

@@ -6,7 +6,7 @@ environment variable `_required_env` below reads. See that script and `docs/embe
 
 The schema applied here is the real one: `groovemap_schema.postgres.create_postgres_schema`,
 from a pinned `groovemap-database-schema` dev dependency (rev
-`26d03e66c0b815d15870768a92b7d49521658838`, version 0.4.1), the same way `catalog-api` applies
+`4e9720d838c7da8a6bde139c64a69d781c0f67f0`, version 0.4.1), the same way `catalog-api` applies
 it in its own `postgres_pool` fixture. That revision carries `gm-database-schema-lhp2` (the
 vector extension, `public.artist_embeddings`, the `embedding_pipeline` role and its grants),
 `gm-database-schema-19g5` (the per-`model_version` partial HNSW index procedure this repository
@@ -235,4 +235,4 @@ async def _reset_artist_embeddings(schema_owner_pool: AsyncPostgreSQLPool) -> No
     owner, keeping each test's `load_embeddings` call independent of the others' writes.
     """
     async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
-        await cursor.execute("TRUNCATE public.artist_embeddings")
+        await cursor.execute("TRUNCATE public.artist_embeddings, public.artist_similar_artists, public.artist_embedding_releases RESTART IDENTITY")
