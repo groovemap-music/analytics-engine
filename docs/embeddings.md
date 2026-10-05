@@ -123,7 +123,7 @@ edge relations that connect them (`graph.by_artist`, `graph.on_label`, `graph.de
 this bead — the track-credited-artist and track-performer relations below) — each via a named
 (server-side) PostgreSQL cursor, fetched in 50,000-row blocks, so the full vertex and edge sets
 are never materialized as Python lists in one piece. `fastrp` is then called with
-`FastRPConfig()` by default, or `PRODUCTION_FASTRP_CONFIG` only with explicit similar-artist opt-in (the self term at 0.05, above), and the defaults documented above: `out_dtype=np.float16`, `block_columns=4` (the default), and `threads=6` —
+`FastRPConfig()` by default, or `PRODUCTION_FASTRP_CONFIG` only with explicit similar-artist opt-in (the self term at 0.05, above), and the defaults documented above: `out_dtype=np.float16`, `block_columns=4` (the default), and `threads=6`.
 The scaling table above records historical memory measurements of the stated configuration;
 it does not make the optional self-term or exact-list stage the default, and it does not establish
 the still-failing six-hour exact-list time admission.
