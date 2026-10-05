@@ -214,6 +214,22 @@ class TestEmbeddingPipelineConfig:
 
         assert pipeline.EmbeddingPipelineConfig.from_env().similar_artists_spool_dir == tmp_path
 
+    @pytest.mark.parametrize("value", [None, "false", "true"])
+    def test_similar_artists_requires_explicit_opt_in(self, monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
+        self._set_valid_env(monkeypatch)
+        if value is None:
+            monkeypatch.delenv("ENABLE_SIMILAR_ARTISTS", raising=False)
+        else:
+            monkeypatch.setenv("ENABLE_SIMILAR_ARTISTS", value)
+        assert pipeline.EmbeddingPipelineConfig.from_env().enable_similar_artists is (value == "true")
+
+    @pytest.mark.parametrize("value", ["", "1", "TRUE", "yes"])
+    def test_rejects_ambiguous_publication_enablement(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        self._set_valid_env(monkeypatch)
+        monkeypatch.setenv("ENABLE_SIMILAR_ARTISTS", value)
+        with pytest.raises(ValueError, match="ENABLE_SIMILAR_ARTISTS"):
+            pipeline.EmbeddingPipelineConfig.from_env()
+
     def test_reads_the_password_from_the_file_secret_convention(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         self._set_valid_env(monkeypatch)
         secret_file = tmp_path / "password"
@@ -998,7 +1014,7 @@ class TestLoadEmbeddings:
 
 class TestRunEmbeddingPipeline:
     @pytest.mark.asyncio
-    async def test_defaults_to_the_production_self_term_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_defaults_to_legacy_config_without_publication(self, monkeypatch: pytest.MonkeyPatch) -> None:
         result = pipeline.LoadResult(method_version="m", model_version="m@dump-1", rows_written=0, skipped=True)
         load = AsyncMock(return_value=result)
         monkeypatch.setattr(pipeline, "load_embeddings", load)
@@ -1008,9 +1024,8 @@ class TestRunEmbeddingPipeline:
         await pipeline.run_embedding_pipeline(pool=object(), dump_id="dump-1", dump_date=date(2026, 9, 1))
 
         config = load.call_args.args[1]
-        assert config == FastRPConfig(weights=(0.0, 1.0, 1.0, 1.0, 1.0), self_weight=0.05)
-        assert config.model_version.startswith("fastrp-v2:")
-        assert ":self=0.05:" in config.model_version
+        assert config == FastRPConfig()
+        assert config.self_weight == 0.0
 
     @pytest.mark.asyncio
     async def test_runs_the_similar_artists_stage_on_the_stored_model_version(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
@@ -1079,3 +1094,34 @@ class TestRunEmbeddingPipeline:
         assert record_computation.call_args.kwargs == {"success": False}
         record_failure.assert_called_once_with()
         record_rows.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_monthly_entrypoint_keeps_unaccepted_publication_off_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Any, enabled: bool) -> None:
+    config = pipeline.EmbeddingPipelineConfig(
+        postgres_host="fixture:5432",
+        postgres_username="fixture",
+        postgres_password="fixture",
+        postgres_database="fixture",
+        source_dump_id="dump-1",
+        source_dump_date=date(2026, 9, 1),
+        similar_artists_spool_dir=tmp_path,
+        enable_similar_artists=enabled,
+    )
+    result = pipeline.LoadResult(method_version="m", model_version="m@dump-1", rows_written=0, skipped=True)
+    pool = Mock(close=AsyncMock())
+    load = AsyncMock(return_value=result)
+    stage = AsyncMock()
+    monkeypatch.setattr(pipeline, "_initialize_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(pipeline, "load_embeddings", load)
+    monkeypatch.setattr(pipeline, "run_similar_artists", stage)
+    assert await pipeline._run(config) is result
+    assert load.call_args.args[1] == (pipeline.PRODUCTION_FASTRP_CONFIG if enabled else FastRPConfig())
+    if enabled:
+        stage.assert_awaited_once_with(
+            pool, model_version="m@dump-1", source_dump_id="dump-1", source_dump_date=date(2026, 9, 1), spool_root=tmp_path
+        )
+    else:
+        stage.assert_not_awaited()
+    pool.close.assert_awaited_once()

@@ -344,7 +344,7 @@ _EDGE_SET_VERSION: Final = "edges-v3"
 # 0.05 (gm-analytics-engine-8ts, docs/embedding_tie_break.md), which took edges-v3's
 # byte-duplicate vectors from 42.22% to 0.0% and exact top-10 churn from 0.8886 to 0.9519.
 # `FastRPConfig()`'s own default stays 0.0 so the pre-8ts sum remains reproducible bit for bit;
-# this is the one place production opts in. Its `model_version` names `self=0.05` and
+# this is used only when the invoker explicitly opts into the similar-artist stage. Its `model_version` names `self=0.05` and
 # `fastrp-v2`, so the stored `model_version` changes with it and a dump already loaded under
 # the old configuration is recomputed rather than skipped.
 PRODUCTION_FASTRP_CONFIG: Final = FastRPConfig(self_weight=0.05)
@@ -372,6 +372,7 @@ class EmbeddingPipelineConfig:
     # Local scratch for the exact top-K spool (about 3.75 GB for the full catalog at K=50,
     # plus a same-sized checkpoint); see docs/similar_artists.md.
     similar_artists_spool_dir: Path = DEFAULT_SIMILAR_ARTISTS_SPOOL_DIR
+    enable_similar_artists: bool = False
 
     @classmethod
     def from_env(cls) -> EmbeddingPipelineConfig:
@@ -403,6 +404,9 @@ class EmbeddingPipelineConfig:
             source_dump_date = date.fromisoformat(cast("str", source_dump_date_raw))
         except ValueError as exc:
             raise ValueError(f"SOURCE_DUMP_DATE must be an ISO date (YYYY-MM-DD), got {source_dump_date_raw!r}") from exc
+        enable_similar_artists = getenv("ENABLE_SIMILAR_ARTISTS", "false")
+        if enable_similar_artists not in {"true", "false"}:
+            raise ValueError("ENABLE_SIMILAR_ARTISTS must be exactly true or false")
         return cls(
             postgres_host=_build_postgres_connstr(),
             postgres_username=cast("str", postgres_username),
@@ -411,6 +415,7 @@ class EmbeddingPipelineConfig:
             source_dump_id=cast("str", source_dump_id),
             source_dump_date=source_dump_date,
             similar_artists_spool_dir=Path(getenv("SIMILAR_ARTISTS_SPOOL_DIR") or DEFAULT_SIMILAR_ARTISTS_SPOOL_DIR),
+            enable_similar_artists=enable_similar_artists == "true",
         )
 
 
@@ -754,7 +759,7 @@ async def run_embedding_pipeline(
     array, so FastRP's peak and the top-K peak never overlap, and it runs whether this load wrote
     the vectors or found them already loaded, since it has its own idempotency check.
     """
-    config = config or PRODUCTION_FASTRP_CONFIG
+    config = config or (PRODUCTION_FASTRP_CONFIG if similar_artists_spool_dir is not None else FastRPConfig())
     started = time.perf_counter()
     try:
         with computation_span(COMPUTATION_NAME):
@@ -804,7 +809,10 @@ async def _run(config: EmbeddingPipelineConfig) -> LoadResult:
     pool = await _initialize_pool(config)
     try:
         return await run_embedding_pipeline(
-            pool, config.source_dump_id, config.source_dump_date, similar_artists_spool_dir=config.similar_artists_spool_dir
+            pool,
+            config.source_dump_id,
+            config.source_dump_date,
+            similar_artists_spool_dir=config.similar_artists_spool_dir if config.enable_similar_artists else None,
         )
     finally:
         await pool.close()
