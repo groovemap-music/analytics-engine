@@ -84,6 +84,8 @@ assert not any(marker in release for marker in private_library_markers)
 pyproject = (ROOT / "pyproject.toml").read_text()
 assert 'git = "https://github.com/groovemap-music/python-libraries.git"' in pyproject
 assert f'rev = "{PYTHON_LIBRARIES_REVISION}"' in pyproject
+runtime_wheel_script = (ROOT / "scripts/prepare-runtime-wheel.sh").read_text()
+assert f'expected="{PYTHON_LIBRARIES_REVISION}"' in runtime_wheel_script
 
 release_script = (ROOT / "scripts/release-dry-run.sh").read_text()
 assert "--require-hashes" in release_script
