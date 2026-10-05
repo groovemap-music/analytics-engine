@@ -50,3 +50,35 @@ def test_legacy_scan_rejects_tracked_first_party_branding(tmp_path: Path) -> Non
 def test_tracked_source_boundary_fails_closed_outside_git(tmp_path: Path) -> None:
     with pytest.raises(subprocess.CalledProcessError):
         _checker_functions()["tracked_files"](tmp_path)
+
+
+def test_current_ci_and_existing_release_pass_actual_checker() -> None:
+    _checker_functions()
+
+
+@pytest.mark.parametrize(
+    ("workflow", "old", "replacement"),
+    [
+        ("ci.yml", "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26", "833cb464507678c38ab78bd4718ce697399463e9"),
+        ("ci.yml", "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26", "a" * 40),
+        ("ci.yml", "groovemap-music/automation/", "foreign/automation/"),
+        ("release.yml", "833cb464507678c38ab78bd4718ce697399463e9", "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26"),
+        ("release.yml", "833cb464507678c38ab78bd4718ce697399463e9", "a" * 40),
+        ("release.yml", "groovemap-music/automation/", "foreign/automation/"),
+    ],
+)
+def test_actual_checker_rejects_stale_or_foreign_workflow_pins(monkeypatch: pytest.MonkeyPatch, workflow: str, old: str, replacement: str) -> None:
+    fixture_path = ROOT / ".github/workflows" / workflow
+    original_read = Path.read_text
+    original = original_read(fixture_path)
+    assert old in original
+    fixture = original.replace(old, replacement)
+
+    def read_fixture(path: Path, *args: object, **kwargs: object) -> str:
+        if path == fixture_path:
+            return fixture
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_fixture)
+    with pytest.raises(AssertionError):
+        _checker_functions()
