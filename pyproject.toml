@@ -26,13 +26,13 @@ license-files = [
     "THIRD_PARTY_NOTICES.md",
 ]
 dependencies = [
-    "fastapi>=0.141.1",
+    "fastapi>=0.143.2",
     "groovemap-runtime[postgres,otel,otel-http]==0.1.0",
     "httpx>=0.28.1",
-    "numpy>=2.3",
-    "pydantic>=2.13.5",
-    "valkey[libvalkey]>=6.1.0",
-    "scipy>=1.16",
+    "numpy>=2.5.4",
+    "pydantic>=2.14.1",
+    "valkey[libvalkey]>=6.1.1",
+    "scipy>=1.18.1",
     "structlog>=26.1.0",
     "uvicorn[standard]>=0.52.4",
 ]
@@ -48,12 +48,12 @@ Issues = "https://github.com/groovemap-music/analytics-engine/issues"
 
 [dependency-groups]
 dev = [
-    "build>=1.6.0",
-    "commitizen>=4.18.0",
-    "cyclonedx-bom>=7.3.1",
-    "fakeredis>=2.37.1",
+    "build>=1.6.1",
+    "commitizen>=4.19.2",
+    "cyclonedx-bom>=7.5.0",
+    "fakeredis>=2.40.0",
     "groovemap-database-schema==0.4.1",
-    "mypy>=2.3.1",
+    "mypy>=2.4.0",
     "pip-audit>=2.10.1",
     "pip-licenses>=5.5.5",
     "pytest>=9.1.1",
@@ -61,7 +61,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.8.0",
-    "ruff>=0.16.6",
+    "ruff>=0.17.1",
 ]
 
 [tool.hatch.build.targets.wheel]
