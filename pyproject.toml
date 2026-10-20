@@ -69,10 +69,10 @@ packages = ["insights"]
 
 [tool.uv]
 exclude-newer = "2 days"
-override-dependencies = ["groovemap-runtime[neo4j,otel,otel-http,postgres] @ git+https://github.com/groovemap-music/python-libraries.git@6c3802035e9c973c6598dadbd3e4377daee613d4"]
+override-dependencies = ["groovemap-runtime[neo4j,otel,otel-http,postgres] @ git+https://github.com/groovemap-music/python-libraries.git@771515349b592ff569b1b3e5712f7bef936bab58"]
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "6c3802035e9c973c6598dadbd3e4377daee613d4" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "771515349b592ff569b1b3e5712f7bef936bab58" }
 groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "4e9720d838c7da8a6bde139c64a69d781c0f67f0" }
 
 [tool.ruff]
