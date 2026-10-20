@@ -1,43 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Stages the two first-party git dependencies as wheels (they are not on an index, so they
+# cannot appear in the hash-pinned requirements export): the python-libraries runtime and
+# the database-schema release helpers similar-artist publication imports at runtime.
 expected="771515349b592ff569b1b3e5712f7bef936bab58"
-runtime_repo="${GROOVEMAP_RUNTIME_REPO:-../python-libraries}"
-runtime_checkout=
+schema_expected="ee6f101cdaa7c50ca20b7af824ea0e9a32da7dbf"
+checkouts=()
+resolved=
+trap 'for checkout in ${checkouts[@]+"${checkouts[@]}"}; do rm -rf -- "${checkout}"; done' EXIT
 
-runtime_is_valid() {
-  [[ -d "${runtime_repo}/.git" ]] &&
-    [[ "$(git -C "${runtime_repo}" rev-parse HEAD)" = "${expected}" ]] &&
-    [[ -z "$(git -C "${runtime_repo}" status --short)" ]]
+checkout_is_valid() {
+  local repo="$1" rev="$2"
+  [[ -d "${repo}/.git" ]] &&
+    [[ "$(git -C "${repo}" rev-parse HEAD)" = "${rev}" ]] &&
+    [[ -z "$(git -C "${repo}" status --short)" ]]
 }
 
-if ! runtime_is_valid; then
-  if [[ -n "${GROOVEMAP_RUNTIME_REPO:-}" ]]; then
-    echo "GROOVEMAP_RUNTIME_REPO must be a clean checkout at ${expected}." >&2
+# Sets `resolved` to a clean checkout of `name` at `rev`: the override when set (which must
+# match), else a matching adjacent checkout, else a temporary clone of the public source.
+# Not a command substitution, so the temporary clone is recorded for the EXIT trap.
+resolve_checkout() {
+  local name="$1" rev="$2" override_var="$3"
+  local override="${!override_var:-}"
+  local repo="${override:-../${name}}"
+  if checkout_is_valid "${repo}" "${rev}"; then
+    resolved="${repo}"
+    return
+  fi
+  if [[ -n "${override}" ]]; then
+    echo "${override_var} must be a clean checkout at ${rev}." >&2
     exit 2
   fi
-  runtime_checkout="$(mktemp -d)"
-  case "${runtime_checkout}" in
+  local checkout
+  checkout="$(mktemp -d)"
+  case "${checkout}" in
   /tmp/* | /private/tmp/* | /var/folders/*) ;;
   *)
-    echo "Unexpected temporary checkout path: ${runtime_checkout}" >&2
+    echo "Unexpected temporary checkout path: ${checkout}" >&2
     exit 2
     ;;
   esac
-  trap 'rm -rf -- "${runtime_checkout}"' EXIT
-  runtime_repo="${runtime_checkout}/python-libraries"
-  git clone --quiet --filter=blob:none --no-checkout \
-    https://github.com/groovemap-music/python-libraries.git "${runtime_repo}"
-  git -C "${runtime_repo}" checkout --quiet "${expected}"
-fi
+  checkouts+=("${checkout}")
+  git clone --quiet --filter=blob:none --no-checkout "https://github.com/groovemap-music/${name}.git" "${checkout}/${name}"
+  git -C "${checkout}/${name}" checkout --quiet "${rev}"
+  resolved="${checkout}/${name}"
+}
+
+resolve_checkout python-libraries "${expected}" GROOVEMAP_RUNTIME_REPO
+runtime_repo="${resolved}"
+resolve_checkout database-schema "${schema_expected}" GROOVEMAP_SCHEMA_REPO
+schema_repo="${resolved}"
 
 mkdir -p .build/runtime
 find .build/runtime -type f -name '*.whl' -delete
 uv build --wheel --out-dir .build/runtime "${runtime_repo}"
+uv build --wheel --out-dir .build/runtime "${schema_repo}"
 uv export \
   --frozen \
   --no-dev \
   --no-emit-project \
   --no-emit-package groovemap-runtime \
+  --no-emit-package groovemap-database-schema \
   --output-file .build/requirements.txt \
   >/dev/null

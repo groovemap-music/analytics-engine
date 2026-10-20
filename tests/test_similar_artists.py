@@ -395,7 +395,7 @@ class TestPublishAndRotate:
 class TestSchemaReleaseRegistry:
     @pytest.mark.asyncio
     async def test_delegates_to_the_schema_helpers(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from insights import schema_release_contract as schema
+        from groovemap_schema import postgres as schema
 
         seen: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
 

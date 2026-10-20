@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
 CI_AUTOMATION_REVISION = "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26"
 PYTHON_LIBRARIES_REVISION = "771515349b592ff569b1b3e5712f7bef936bab58"
+DATABASE_SCHEMA_REVISION = "ee6f101cdaa7c50ca20b7af824ea0e9a32da7dbf"
 GIT = shutil.which("git")
 if GIT is None:
     raise RuntimeError("git is required to establish the tracked first-party source boundary")
@@ -86,6 +87,13 @@ assert 'git = "https://github.com/groovemap-music/python-libraries.git"' in pypr
 assert f'rev = "{PYTHON_LIBRARIES_REVISION}"' in pyproject
 runtime_wheel_script = (ROOT / "scripts/prepare-runtime-wheel.sh").read_text()
 assert f'expected="{PYTHON_LIBRARIES_REVISION}"' in runtime_wheel_script
+# database-schema is a first-party runtime dependency: the lock and the staged wheel share one pin.
+assert (
+    f'groovemap-database-schema = {{ git = "https://github.com/groovemap-music/database-schema.git", rev = "{DATABASE_SCHEMA_REVISION}" }}'
+    in pyproject
+)
+assert f'schema_expected="{DATABASE_SCHEMA_REVISION}"' in runtime_wheel_script
+assert "--no-emit-package groovemap-database-schema" in runtime_wheel_script
 
 release_script = (ROOT / "scripts/release-dry-run.sh").read_text()
 assert "--require-hashes" in release_script

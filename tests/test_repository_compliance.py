@@ -101,3 +101,22 @@ def test_actual_checker_rejects_stale_or_foreign_runtime_wheel_pin(monkeypatch: 
     monkeypatch.setattr(Path, "read_text", read_fixture)
     with pytest.raises(AssertionError):
         _checker_functions()
+
+
+@pytest.mark.parametrize("path", ["scripts/prepare-runtime-wheel.sh", "pyproject.toml"])
+def test_actual_checker_rejects_a_schema_pin_that_differs_between_lock_and_staged_wheel(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    fixture_path = ROOT / path
+    original_read = Path.read_text
+    original = original_read(fixture_path)
+    expected = "ee6f101cdaa7c50ca20b7af824ea0e9a32da7dbf"
+    assert expected in original
+    fixture = original.replace(expected, "4e9720d838c7da8a6bde139c64a69d781c0f67f0")
+
+    def read_fixture(path: Path, *args: object, **kwargs: object) -> str:
+        if path == fixture_path:
+            return fixture
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_fixture)
+    with pytest.raises(AssertionError):
+        _checker_functions()
