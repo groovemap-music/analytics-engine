@@ -23,9 +23,9 @@ are in `docs/similar_artists.md`. In order:
    retired: the current and previous lists stay, so a bad month can be rolled back by
    republishing the previous one.
 
-The create, publish and retire helpers are an immutable promotion of database-schema
-(`insights.schema_release_contract`), with producer provenance and an AST compatibility
-gate. `ReleaseRegistry` keeps the flow testable without a database or dev schema package.
+The create, publish and retire helpers are database-schema's own (`groovemap_schema.postgres`,
+a pinned first-party runtime dependency), so the producer's SQL is never copied here.
+`ReleaseRegistry` keeps the flow testable without a database.
 """
 
 from __future__ import annotations
@@ -44,8 +44,8 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 
 import numpy as np
 import structlog
+from groovemap_schema import postgres as schema_postgres
 
-from insights import schema_release_contract as release_contract
 from insights.embeddings.exact_top_k import DEFAULT_BLOCK_ROWS, DEFAULT_K, EMPTY_POSITION, TopKState, exact_top_k, reciprocal_norms
 
 
@@ -74,7 +74,8 @@ _TASK_BYTES_PER_BLOCK_CELL: Final = 16
 
 _DELETE_VERSION_SQL: Final = f"DELETE FROM {SIMILAR_ARTISTS_TABLE} WHERE release_id = %s"  # noqa: S608
 _COPY_SQL: Final = f"COPY {SIMILAR_ARTISTS_TABLE} (release_id, artist_id, similar_artist_ids, scores) FROM STDIN"
-_RELEASE_LOCK_SQL: Final = release_contract._ARTIST_EMBEDDING_RELEASES_LOCK_SQL
+# The producer helpers' own lock, so this stage and their publish/retire checks serialize on one mode.
+_RELEASE_LOCK_SQL: Final = schema_postgres._ARTIST_EMBEDDING_RELEASES_LOCK_SQL
 _RELEASE_WRITE_GUARD_SQL: Final = f"SELECT artists FROM {RELEASES_TABLE} WHERE release_id = %s FOR UPDATE"  # noqa: S608
 _CURRENT_RELEASE_SQL: Final = f"SELECT model_version FROM {RELEASES_TABLE} WHERE is_current"  # noqa: S608
 _RELEASES_BY_RECENCY_SQL: Final = f"SELECT model_version FROM {RELEASES_TABLE} WHERE artists > 0 ORDER BY published_at DESC, model_version DESC"  # noqa: S608
@@ -342,7 +343,7 @@ async def write_similar_artists(
 
 
 class ReleaseRegistry(Protocol):
-    """The promoted producer helpers; creation returns an id, others failure counts."""
+    """The database-schema release helpers; creation returns an id, others failure counts."""
 
     async def create(self, cursor: Any, model_version: str, *, source_dump_id: str, source_dump_date: date, k: int) -> int | None: ...
 
@@ -352,18 +353,18 @@ class ReleaseRegistry(Protocol):
 
 
 class SchemaReleaseRegistry:
-    """Runtime-safe adapter over the immutable promoted producer binding."""
+    """The database-schema producer helpers, as a `ReleaseRegistry`."""
 
     async def create(self, cursor: Any, model_version: str, *, source_dump_id: str, source_dump_date: date, k: int) -> int | None:
-        return await release_contract.create_artist_embedding_release(
+        return await schema_postgres.create_artist_embedding_release(
             cursor, model_version, source_dump_id=source_dump_id, source_dump_date=source_dump_date, k=k
         )
 
     async def publish(self, cursor: Any, model_version: str, *, artists: int) -> int:
-        return await release_contract.publish_artist_embedding_release(cursor, model_version, artists=artists)
+        return await schema_postgres.publish_artist_embedding_release(cursor, model_version, artists=artists)
 
     async def retire(self, cursor: Any, model_version: str, *, delete_release: bool = False) -> int:
-        return await release_contract.retire_artist_similar_artists_version(cursor, model_version, delete_release=delete_release)
+        return await schema_postgres.retire_artist_similar_artists_version(cursor, model_version, delete_release=delete_release)
 
 
 class PublishError(RuntimeError):

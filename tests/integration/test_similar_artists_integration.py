@@ -1,4 +1,7 @@
-"""Synthetic compact-COPY and publication regressions under the real PG19 role."""
+"""Synthetic compact-COPY, publish and retire regressions under the real `embedding_pipeline` role.
+
+Run by `just test-integration-pg18` (and as part of `just test-integration-pg19`).
+"""
 
 from datetime import date
 from typing import Any

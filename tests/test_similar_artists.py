@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import subprocess
+import sys
 from datetime import date
 from typing import TYPE_CHECKING, Any
 
@@ -80,6 +82,35 @@ class TestMemoryGuard:
         assert sa.peak_rss_bytes() == 3 * 1024
         monkeypatch.setattr(sa.sys, "platform", "darwin")
         assert sa.peak_rss_bytes() == 3
+
+    def test_the_real_getrusage_peak_stops_a_run_that_outgrows_its_budget(self, tmp_path: Path) -> None:
+        # A fresh process, so `ru_maxrss` starts from its own imports rather than whatever
+        # earlier tests in this one already peaked at. The budget sits 4 MB above the peak
+        # before the compute; the running lists alone (20,000 x 50 x 8 bytes = 8 MB) pass it,
+        # so the unmocked guard must stop the run at the first block boundary, leaving an
+        # incomplete spool. Synthetic vectors only.
+        script = """
+import json, sys
+from pathlib import Path
+import numpy as np
+from insights import similar_artists as sa
+
+vectors = np.random.default_rng(0).standard_normal((20_000, 128)).astype(np.float16)
+before = sa.peak_rss_bytes()
+guard = sa.MemoryGuard(budget_bytes=before + 4 * 1024**2, memorystatus_level=lambda: None)
+try:
+    sa.compute_to_spool(vectors, Path(sys.argv[1]), model_version="m1", k=50, block_rows=1024, threads=2, guard=guard)
+    stopped = False
+except sa.MemoryBudgetExceededError:
+    stopped = True
+print(json.dumps({"before": before, "after": sa.peak_rss_bytes(), "stopped": stopped}))
+"""
+        result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, check=True, timeout=50)  # noqa: S603 -- our own interpreter and literal script.
+        measured = json.loads(result.stdout.strip().splitlines()[-1])
+
+        assert measured["stopped"] is True
+        assert measured["after"] > measured["before"] + 4 * 1024**2
+        assert json.loads(sa.Spool(tmp_path, 20_000, 50).meta_path.read_text())["complete"] is False
 
     def test_estimate_fits_the_full_catalog_in_the_budget(self) -> None:
         estimate = sa.estimate_peak_bytes(9_366_416, 128)
@@ -395,7 +426,7 @@ class TestPublishAndRotate:
 class TestSchemaReleaseRegistry:
     @pytest.mark.asyncio
     async def test_delegates_to_the_schema_helpers(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from insights import schema_release_contract as schema
+        from groovemap_schema import postgres as schema
 
         seen: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
 

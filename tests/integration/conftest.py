@@ -1,13 +1,18 @@
-"""Shared fixtures for the embedding-pipeline PG19+pgvector integration tier.
+"""Shared fixtures for the PostgreSQL integration tiers.
 
-Run via `just test-integration-pg19` / `scripts/test-integration-pg19.sh`, never directly:
-that script starts the disposable PostgreSQL 19 + pgvector container and supplies every
-environment variable `_required_env` below reads. See that script and `docs/embeddings.md`.
+Run via `just test-integration-pg18` (the similar-artist suite, on the bare official PostgreSQL
+18 image) or `just test-integration-pg19` (everything, on the local PG19 beta + pgvector
+image), never directly: `scripts/test-integration.sh` starts the disposable container and
+supplies every environment variable `_required_env` below reads. See that script,
+`docs/embeddings.md` and `docs/similar_artists.md`.
 
 The schema applied here is the real one: `groovemap_schema.postgres.create_postgres_schema`,
-from a pinned `groovemap-database-schema` dev dependency (rev
-`4e9720d838c7da8a6bde139c64a69d781c0f67f0`, version 0.4.1), the same way `catalog-api` applies
-it in its own `postgres_pool` fixture. That revision carries `gm-database-schema-lhp2` (the
+from the pinned `groovemap-database-schema` runtime dependency (rev
+`ee6f101cdaa7c50ca20b7af824ea0e9a32da7dbf`, version 0.4.1), the same way `catalog-api` applies
+it in its own `postgres_pool` fixture. Without pgvector (the PG18 tier) it skips the vector
+extension and `public.artist_embeddings` without counting a failure, and still creates the
+`embedding_pipeline` role, the compact similarity tables (`gm-database-schema-hqjp`) and their
+grants. That revision carries `gm-database-schema-lhp2` (the
 vector extension, `public.artist_embeddings`, the `embedding_pipeline` role and its grants),
 `gm-database-schema-19g5` (the per-`model_version` partial HNSW index procedure this repository
 does not exercise here — see `docs/embeddings.md`), and `gm-database-schema-ug3v`
@@ -108,7 +113,7 @@ _EDGE_COLUMNS: dict[str, tuple[str, str]] = {
 def _required_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
-        pytest.fail(f"{name} must be supplied by `just test-integration-pg19`")
+        pytest.fail(f"{name} must be supplied by `just test-integration-pg18` or `just test-integration-pg19`")
     return value
 
 
@@ -228,11 +233,17 @@ async def pipeline_pool(schema_owner_pool: AsyncPostgreSQLPool) -> AsyncIterator
 
 @pytest_asyncio.fixture(autouse=True, loop_scope="session")
 async def _reset_artist_embeddings(schema_owner_pool: AsyncPostgreSQLPool) -> None:
-    """Empty `artist_embeddings` before every test — the one state the tests mutate.
+    """Empty the embedding and similarity tables before every test — the state the tests mutate.
 
     The pipeline role itself cannot `TRUNCATE` (see
     `test_pipeline_role_cannot_write_outside_artist_embeddings`), so this runs as the schema
-    owner, keeping each test's `load_embeddings` call independent of the others' writes.
+    owner, keeping each test's writes independent of the others'. `artist_embeddings` exists
+    only where pgvector does (not on the PG18 tier).
     """
     async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
-        await cursor.execute("TRUNCATE public.artist_embeddings, public.artist_similar_artists, public.artist_embedding_releases RESTART IDENTITY")
+        await cursor.execute("SELECT to_regclass('public.artist_embeddings') IS NOT NULL")
+        (has_embeddings,) = await cursor.fetchone()
+        tables = "public.artist_similar_artists, public.artist_embedding_releases"
+        if has_embeddings:
+            tables = f"public.artist_embeddings, {tables}"
+        await cursor.execute(f"TRUNCATE {tables} RESTART IDENTITY")

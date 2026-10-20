@@ -38,16 +38,24 @@ test:
 
 coverage: test
 
-# Advisory tier: applies the real ADR 0013 schema (embedding_pipeline role and grants, the
-# vector extension, public.artist_embeddings, and the graph edges this pipeline reads) via a
-# pinned groovemap-database-schema dev dependency's own create_postgres_schema — see
-# tests/integration/conftest.py — to the existing local PG19+pgvector image, and runs the
-# embedding-pipeline suite that needs a live embedding_pipeline-scoped connection. Never
-# builds the image itself — reuses database-schema's own
+# Similar-artist tier: applies database-schema's own create_postgres_schema (the pinned
+# groovemap-database-schema runtime dependency; see tests/integration/conftest.py) to a
+# disposable official PostgreSQL 18 container -- the same digest database-schema's required
+# tier uses -- and runs the synthetic compact-COPY, publish and retire suite under the real
+# embedding_pipeline role. The similarity tables need no pgvector, so the bare image is enough.
+# There is no PostgreSQL 19 GA image yet; this is the tier that stands in for it.
+test-integration-pg18:
+    POSTGRES_INTEGRATION_IMAGE=postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2 \
+        INTEGRATION_TESTS=tests/integration/test_similar_artists_integration.py \
+        bash scripts/test-integration.sh
+
+# Advisory tier: the same schema, plus the vector extension and public.artist_embeddings, on
+# the existing local PG19 beta + pgvector image, running the whole integration suite including
+# the embedding pipeline's. Never builds the image itself -- reuses database-schema's own
 # `database-schema-postgres19-pgvector:local` tag, built by that repository's
 # `test-integration-pg19` recipe.
 test-integration-pg19:
-    bash scripts/test-integration-pg19.sh
+    POSTGRES_INTEGRATION_IMAGE=database-schema-postgres19-pgvector:local bash scripts/test-integration.sh
 
 build:
     uv build --out-dir dist --clear

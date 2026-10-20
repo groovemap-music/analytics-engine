@@ -344,7 +344,8 @@ _EDGE_SET_VERSION: Final = "edges-v3"
 # 0.05 (gm-analytics-engine-8ts, docs/embedding_tie_break.md), which took edges-v3's
 # byte-duplicate vectors from 42.22% to 0.0% and exact top-10 churn from 0.8886 to 0.9519.
 # `FastRPConfig()`'s own default stays 0.0 so the pre-8ts sum remains reproducible bit for bit;
-# this is used only when the invoker explicitly opts into the similar-artist stage. Its `model_version` names `self=0.05` and
+# this is the monthly default whether or not the similar-artist stage is enabled, so the vectors
+# that stage reads are always the self-term ones. Its `model_version` names `self=0.05` and
 # `fastrp-v2`, so the stored `model_version` changes with it and a dump already loaded under
 # the old configuration is recomputed rather than skipped.
 PRODUCTION_FASTRP_CONFIG: Final = FastRPConfig(self_weight=0.05)
@@ -759,7 +760,7 @@ async def run_embedding_pipeline(
     array, so FastRP's peak and the top-K peak never overlap, and it runs whether this load wrote
     the vectors or found them already loaded, since it has its own idempotency check.
     """
-    config = config or (PRODUCTION_FASTRP_CONFIG if similar_artists_spool_dir is not None else FastRPConfig())
+    config = config or PRODUCTION_FASTRP_CONFIG
     started = time.perf_counter()
     try:
         with computation_span(COMPUTATION_NAME):
