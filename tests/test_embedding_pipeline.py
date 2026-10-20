@@ -16,6 +16,7 @@ import pytest
 import scipy
 
 from insights import embedding_pipeline as pipeline
+from insights import similar_artists
 from insights.embeddings import FastRPConfig
 
 
@@ -222,6 +223,28 @@ class TestEmbeddingPipelineConfig:
         else:
             monkeypatch.setenv("ENABLE_SIMILAR_ARTISTS", value)
         assert pipeline.EmbeddingPipelineConfig.from_env().enable_similar_artists is (value == "true")
+
+    @pytest.mark.asyncio
+    async def test_flag_unset_loads_the_self_term_config_and_never_runs_or_publishes_the_batch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._set_valid_env(monkeypatch)
+        monkeypatch.delenv("ENABLE_SIMILAR_ARTISTS", raising=False)
+        config = pipeline.EmbeddingPipelineConfig.from_env()
+        result = pipeline.LoadResult(method_version="m", model_version="m@discogs-2026-09", rows_written=3, skipped=False)
+        load = AsyncMock(return_value=result)
+        stage = AsyncMock()
+        publish = AsyncMock()
+        monkeypatch.setattr(pipeline, "_initialize_pool", AsyncMock(return_value=Mock(close=AsyncMock())))
+        monkeypatch.setattr(pipeline, "load_embeddings", load)
+        monkeypatch.setattr(pipeline, "run_similar_artists", stage)
+        monkeypatch.setattr(similar_artists, "publish_and_rotate", publish)
+
+        assert await pipeline._run(config) is result
+
+        loaded = load.call_args.args[1]
+        assert loaded == pipeline.PRODUCTION_FASTRP_CONFIG
+        assert (loaded.weights, loaded.self_weight) == ((0.0, 1.0, 1.0, 1.0, 1.0), 0.05)
+        stage.assert_not_awaited()
+        publish.assert_not_awaited()
 
     @pytest.mark.parametrize("value", ["", "1", "TRUE", "yes"])
     def test_rejects_ambiguous_publication_enablement(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
