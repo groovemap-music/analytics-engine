@@ -89,7 +89,7 @@ def test_actual_checker_rejects_stale_or_foreign_runtime_wheel_pin(monkeypatch: 
     fixture_path = ROOT / "scripts/prepare-runtime-wheel.sh"
     original_read = Path.read_text
     original = original_read(fixture_path)
-    expected = "6c3802035e9c973c6598dadbd3e4377daee613d4"
+    expected = "771515349b592ff569b1b3e5712f7bef936bab58"
     assert expected in original
     fixture = original.replace(expected, replacement)
 

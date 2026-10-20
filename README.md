@@ -59,4 +59,4 @@ The project is independently versioned from PEP 621 metadata with Commitizen and
 
 See the [documentation index](docs/README.md) for architecture, operations, extraction provenance, and release-compliance guidance.
 
-Use `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD` and `VALKEY_PASSWORD_FILE`. Unset settings fall back to deprecated `REDIS_*` counterparts with a warning once per legacy variable per process; explicit Valkey settings take precedence, including an empty password. Password `_FILE` takes precedence within its namespace and unreadable files fail closed. Cache key strings remain unchanged.
+Use `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD` and `VALKEY_PASSWORD_FILE`. An explicitly empty password is honored; password `_FILE` takes precedence and unreadable files fail closed. Cache key strings remain unchanged.
