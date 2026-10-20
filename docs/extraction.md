@@ -12,6 +12,6 @@
 - `python-libraries` owns shared runtime, resilience, configuration, and health-server helpers.
 - `deployment` owns service orchestration, secret delivery, and environment-specific configuration.
 
-The service does not import from sibling checkouts or require a monorepo build context. `scripts/prepare-runtime-wheel.sh` verifies the exact `python-libraries` revision before staging its wheel for installation and image builds.
+The service does not import from sibling checkouts or require a monorepo build context. `scripts/prepare-runtime-wheel.sh` verifies the exact `python-libraries` and `database-schema` revisions before staging their wheels for installation and image builds.
 
 Historical licensing is recorded in [NOTICE](../NOTICE). Historical implementation plans are preserved privately; the current architecture decisions that remain operative are documented in [architecture.md](architecture.md).

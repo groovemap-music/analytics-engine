@@ -320,7 +320,7 @@ entries sharing one `track_position` across distinct `track_ordinal`s — a gap 
 bead's own parity fixture, since `track_ordinal`/`sub_track_ordinal`, not `track_position`, are
 the real primary-key columns — plus artist and release discovery for both new relations against
 the real schema. That tier's `conftest.py` applies the real ADR 0013 schema objects via a pinned
-`groovemap-database-schema` dev dependency's own `create_postgres_schema` (gm-analytics-engine-qzl),
+`groovemap-database-schema` runtime dependency's own `create_postgres_schema` (gm-analytics-engine-qzl),
 the same way `catalog-api` applies it; see that `conftest.py`'s module docstring for the pinned
 revision. Neither test tier commits provider-derived data or real embeddings, per ADR 0013's
 data-rights section.

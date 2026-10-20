@@ -47,11 +47,13 @@ OpenTelemetry metrics and traces export to a collector when `OTEL_EXPORTER_OTLP_
 
 `catalog-api` owns the internal HTTP interface and query implementations. This repository consumes the promoted contract in `contracts/catalog-api/internal-insights/v1/`; it does not import API source or rely on a sibling checkout. Database schema ownership belongs to `database-schema`; runtime and resilience helpers belong to `python-libraries`; service orchestration and secret examples belong to `deployment`.
 
-The Docker build only needs this repository plus a locally prepared wheel for the pinned public
-runtime. `scripts/prepare-runtime-wheel.sh` verifies the source checkout is clean and at the
-expected commit before staging that wheel in the ignored `.build/` directory. Its optional
-`GROOVEMAP_RUNTIME_REPO` override accepts an explicit matching checkout; without the override, the
-script uses a matching adjacent checkout or creates a temporary checkout from the public source.
+The Docker build only needs this repository plus locally prepared wheels for the pinned public
+runtime and the pinned `database-schema` release helpers. `scripts/prepare-runtime-wheel.sh`
+verifies each source checkout is clean and at the expected commit before staging its wheel in the
+ignored `.build/` directory. Its optional `GROOVEMAP_RUNTIME_REPO` override (and
+`GROOVEMAP_SCHEMA_REPO` for database-schema) accepts an explicit matching checkout; without the
+override, the script uses a matching adjacent checkout or creates a temporary checkout from the
+public source.
 
 ## Releases
 
