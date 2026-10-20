@@ -1014,18 +1014,26 @@ class TestLoadEmbeddings:
 
 class TestRunEmbeddingPipeline:
     @pytest.mark.asyncio
-    async def test_defaults_to_legacy_config_without_publication(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_defaults_to_the_self_term_config_without_publication(self, monkeypatch: pytest.MonkeyPatch) -> None:
         result = pipeline.LoadResult(method_version="m", model_version="m@dump-1", rows_written=0, skipped=True)
         load = AsyncMock(return_value=result)
+        stage = AsyncMock()
         monkeypatch.setattr(pipeline, "load_embeddings", load)
+        monkeypatch.setattr(pipeline, "run_similar_artists", stage)
         monkeypatch.setattr(pipeline, "record_computation", Mock())
         monkeypatch.setattr(pipeline, "record_embedding_rows_written", Mock())
 
         await pipeline.run_embedding_pipeline(pool=object(), dump_id="dump-1", dump_date=date(2026, 9, 1))
 
         config = load.call_args.args[1]
-        assert config == FastRPConfig()
-        assert config.self_weight == 0.0
+        assert config == pipeline.PRODUCTION_FASTRP_CONFIG
+        assert (config.weights, config.self_weight) == ((0.0, 1.0, 1.0, 1.0, 1.0), 0.05)
+        stage.assert_not_awaited()
+
+    def test_the_default_stored_model_version_names_the_self_term_on_edges_v3(self) -> None:
+        stored = pipeline.stored_model_version(pipeline.PRODUCTION_FASTRP_CONFIG, "discogs-2026-09")
+        assert stored.startswith("fastrp-v2:dim=128:weights=0,1,1,1,1:beta=0:self=0.05:")
+        assert stored.endswith(":edges-v3@discogs-2026-09")
 
     @pytest.mark.asyncio
     async def test_runs_the_similar_artists_stage_on_the_stored_model_version(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
@@ -1117,7 +1125,7 @@ async def test_monthly_entrypoint_keeps_unaccepted_publication_off_by_default(mo
     monkeypatch.setattr(pipeline, "load_embeddings", load)
     monkeypatch.setattr(pipeline, "run_similar_artists", stage)
     assert await pipeline._run(config) is result
-    assert load.call_args.args[1] == (pipeline.PRODUCTION_FASTRP_CONFIG if enabled else FastRPConfig())
+    assert load.call_args.args[1] == pipeline.PRODUCTION_FASTRP_CONFIG
     if enabled:
         stage.assert_awaited_once_with(
             pool, model_version="m@dump-1", source_dump_id="dump-1", source_dump_date=date(2026, 9, 1), spool_root=tmp_path
