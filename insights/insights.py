@@ -561,6 +561,7 @@ async def computation_status() -> JSONResponse:
     insight_types = [
         "artist_centrality",
         "genre_trends",
+        "style_year_counts",
         "label_longevity",
         "anniversaries",
         "data_completeness",

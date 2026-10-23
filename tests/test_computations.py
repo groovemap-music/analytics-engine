@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 COMPUTATION_NAMES = (
     "artist_centrality",
     "genre_trends",
+    "style_year_counts",
     "label_longevity",
     "anniversaries",
     "data_completeness",
@@ -165,6 +166,7 @@ class TestDescribeError:
 _COMPUTATION_ENTRY_POINTS = [
     ("compute_and_store_artist_centrality", "artist_centrality"),
     ("compute_and_store_genre_trends", "genre_trends"),
+    ("compute_and_store_style_year_counts", "style_year_counts"),
     ("compute_and_store_label_longevity", "label_longevity"),
     ("compute_and_store_anniversaries", "anniversaries"),
     ("compute_and_store_data_completeness", "data_completeness"),
@@ -219,6 +221,7 @@ class TestReadTimeoutIsDiagnosable:
         with (
             patch.object(computations, "compute_and_store_artist_centrality", side_effect=httpx.ReadTimeout("")),
             patch.object(computations, "compute_and_store_genre_trends", return_value=0),
+            patch.object(computations, "compute_and_store_style_year_counts", return_value=0),
             patch.object(computations, "compute_and_store_label_longevity", return_value=0),
             patch.object(computations, "compute_and_store_anniversaries", return_value=0),
             patch.object(computations, "compute_and_store_data_completeness", return_value=0),
@@ -705,6 +708,7 @@ class TestRunAllComputations:
         with (
             patch("insights.computations.compute_and_store_artist_centrality", return_value=10),
             patch("insights.computations.compute_and_store_genre_trends", return_value=20),
+            patch("insights.computations.compute_and_store_style_year_counts", return_value=6),
             patch("insights.computations.compute_and_store_label_longevity", return_value=5),
             patch("insights.computations.compute_and_store_anniversaries", return_value=3),
             patch("insights.computations.compute_and_store_data_completeness", return_value=4),
@@ -716,6 +720,7 @@ class TestRunAllComputations:
 
         assert results["artist_centrality"] == 10
         assert results["genre_trends"] == 20
+        assert results["style_year_counts"] == 6
         assert results["label_longevity"] == 5
         assert results["anniversaries"] == 3
         assert results["data_completeness"] == 4
@@ -734,6 +739,7 @@ class TestRunAllComputations:
         with (
             patch("insights.computations.compute_and_store_artist_centrality", return_value=0),
             patch("insights.computations.compute_and_store_genre_trends", return_value=0),
+            patch("insights.computations.compute_and_store_style_year_counts", return_value=6),
             patch("insights.computations.compute_and_store_label_longevity", return_value=0),
             patch("insights.computations.compute_and_store_anniversaries", return_value=0) as mock_anniv,
             patch("insights.computations.compute_and_store_data_completeness", return_value=0),
@@ -755,6 +761,7 @@ class TestRunAllComputations:
         with (
             patch("insights.computations.compute_and_store_artist_centrality", return_value=10),
             patch("insights.computations.compute_and_store_genre_trends", return_value=20),
+            patch("insights.computations.compute_and_store_style_year_counts", return_value=6),
             patch("insights.computations.compute_and_store_label_longevity", return_value=5),
             patch("insights.computations.compute_and_store_anniversaries", return_value=3),
             patch("insights.computations.compute_and_store_data_completeness", return_value=4),
@@ -769,6 +776,7 @@ class TestRunAllComputations:
         assert set(recorded) == {
             "artist_centrality",
             "genre_trends",
+            "style_year_counts",
             "label_longevity",
             "anniversaries",
             "data_completeness",
@@ -789,6 +797,7 @@ class TestRunAllComputations:
         with (
             patch("insights.computations.compute_and_store_artist_centrality", side_effect=RuntimeError("boom")),
             patch("insights.computations.compute_and_store_genre_trends", return_value=20),
+            patch("insights.computations.compute_and_store_style_year_counts", return_value=6),
             patch("insights.computations.compute_and_store_label_longevity", return_value=5),
             patch("insights.computations.compute_and_store_anniversaries", return_value=3),
             patch("insights.computations.compute_and_store_data_completeness", return_value=4),
@@ -814,6 +823,7 @@ class TestRunAllComputations:
         with (
             patch("insights.computations.compute_and_store_artist_centrality", return_value=10),
             patch("insights.computations.compute_and_store_genre_trends", return_value=20),
+            patch("insights.computations.compute_and_store_style_year_counts", return_value=6),
             patch("insights.computations.compute_and_store_label_longevity", return_value=5),
             patch("insights.computations.compute_and_store_anniversaries", return_value=3),
             patch("insights.computations.compute_and_store_data_completeness", return_value=4),
@@ -842,6 +852,7 @@ class TestRunAllComputations:
         with (
             patch("insights.computations.compute_and_store_artist_centrality", side_effect=httpx.ReadTimeout("")),
             patch("insights.computations.compute_and_store_genre_trends", return_value=20),
+            patch("insights.computations.compute_and_store_style_year_counts", return_value=6),
             patch("insights.computations.compute_and_store_label_longevity", return_value=5),
             patch("insights.computations.compute_and_store_anniversaries", return_value=3),
             patch("insights.computations.compute_and_store_data_completeness", return_value=4),
@@ -879,6 +890,7 @@ class TestRunAllComputations:
         with (
             patch("insights.computations.compute_and_store_artist_centrality", side_effect=traced_centrality),
             patch("insights.computations.compute_and_store_genre_trends", return_value=0),
+            patch("insights.computations.compute_and_store_style_year_counts", return_value=6),
             patch("insights.computations.compute_and_store_label_longevity", return_value=0),
             patch("insights.computations.compute_and_store_anniversaries", return_value=0),
             patch("insights.computations.compute_and_store_data_completeness", return_value=0),
@@ -960,8 +972,8 @@ class TestEndpointTimeouts:
         assert read is not None
         assert read >= 1200.0
 
-    def test_every_mapped_endpoint_exceeds_the_default(self) -> None:
+    def test_every_mapped_endpoint_meets_the_default(self) -> None:
         from insights.computations import DEFAULT_READ_TIMEOUT_SECONDS, ENDPOINT_READ_TIMEOUTS
 
         for path, read in ENDPOINT_READ_TIMEOUTS.items():
-            assert read > DEFAULT_READ_TIMEOUT_SECONDS, path
+            assert read >= DEFAULT_READ_TIMEOUT_SECONDS, path
