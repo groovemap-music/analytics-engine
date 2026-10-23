@@ -18,7 +18,7 @@ flowchart LR
 
 ## Repository boundary
 
-The promoted contract at [`contracts/catalog-api/internal-insights/v1/`](../contracts/catalog-api/internal-insights/v1/) fixes contract version `1.1.0`, the `catalog-api` producer repository and commit, the OpenAPI digest, and the generated Python binding digest. [`source.json`](../contracts/catalog-api/internal-insights/v1/source.json) is the provenance record; `just contract-check` verifies its digests and version against [`openapi.yaml`](../contracts/catalog-api/internal-insights/v1/openapi.yaml) and [`insights/catalog_api_contract.py`](../insights/catalog_api_contract.py). Database definitions remain in `database-schema`; shared connection and health primitives remain in `python-libraries`.
+The promoted contract at [`contracts/catalog-api/internal-insights/v1/`](../contracts/catalog-api/internal-insights/v1/) fixes contract version `1.2.0`, the `catalog-api` producer repository and commit, the OpenAPI digest, and the generated Python binding digest. [`source.json`](../contracts/catalog-api/internal-insights/v1/source.json) is the provenance record; `just contract-check` verifies its digests and version against [`openapi.yaml`](../contracts/catalog-api/internal-insights/v1/openapi.yaml) and [`insights/catalog_api_contract.py`](../insights/catalog_api_contract.py). Database definitions remain in `database-schema`; shared connection and health primitives remain in `python-libraries`.
 
 The promoted OpenAPI document is the authority for the producer transport. This table maps that boundary to the engine's stable computation keys and read model without duplicating request or response schemas:
 
@@ -26,6 +26,8 @@ The promoted OpenAPI document is the authority for the producer transport. This 
 | --- | --- | --- | --- |
 | `artist_centrality` | `/api/internal/insights/artist-centrality` | `insights.artist_centrality` | `/api/insights/top-artists` |
 | `genre_trends` | `/api/internal/insights/genre-trends` | `insights.genre_trends` | `/api/insights/genre-trends` |
+| `style_year_counts` | `/api/internal/insights/style-year-counts` | `insights.style_year_counts`, `insights.style_parents` | None — read by `catalog-api` |
+| `style_atlas` | `/api/internal/insights/style-year-counts`, once a month | `insights.genre_atlas_sectors`, `insights.style_atlas_layout` | `/api/insights/style-atlas` |
 | `label_longevity` | `/api/internal/insights/label-longevity` | `insights.label_longevity` | `/api/insights/label-longevity` |
 | `anniversaries` | `/api/internal/insights/anniversaries` | `insights.monthly_anniversaries` | `/api/insights/this-month` |
 | `data_completeness` | `/api/internal/insights/data-completeness` | `insights.data_completeness` | `/api/insights/data-completeness` |
@@ -33,13 +35,55 @@ The promoted OpenAPI document is the authority for the producer transport. This 
 | `release_rarity` | `/api/internal/insights/rarity-scores` | `insights.release_rarity` | `/api/insights/release-rarity` |
 | `activity_summary` | None — reads `activity.events` and `activity.impressions` directly | `insights.activity_summary` | `/api/insights/activity-summary` |
 
-`/api/insights/status` reads the latest `insights.computation_log` row for all eight computation keys. `/health` is also available on the FastAPI port; the independently served readiness probe is `GET /health` on port 8009.
+`/api/insights/status` reads the latest `insights.computation_log` row for all ten computation keys. `/health` is also available on the FastAPI port; the independently served readiness probe is `GET /health` on port 8009.
 
 ## Scheduled precomputation
 
-The scheduler waits 30 seconds after startup, then runs artist centrality, genre trends, label longevity, monthly anniversaries, data completeness, community enrichment, release rarity, and the activity summary sequentially. Each computation has an endpoint-specific HTTP read budget and records `completed` or `failed` in `insights.computation_log`. A failed computation does not prevent later computations from running. Non-empty result sets replace their corresponding rows transactionally; an empty producer result leaves the previous snapshot intact. Community enrichment is a producer-side operation and records its returned `enriched` count rather than writing a result table here. The activity summary is the one exception to the empty-result rule and rewrites its window either way, for the reason given below.
+The scheduler waits 30 seconds after startup, then runs artist centrality, genre trends, style year counts, the style atlas, label longevity, monthly anniversaries, data completeness, community enrichment, release rarity, and the activity summary sequentially. Each computation has an endpoint-specific HTTP read budget and records `completed` or `failed` in `insights.computation_log`. A failed computation does not prevent later computations from running. Non-empty result sets replace their corresponding rows transactionally; an empty producer result leaves the previous snapshot intact. Style year counts write two tables from one producer read, in one transaction: `insights.style_year_counts` (release and master counts per style and release year) and `insights.style_parents`. The producer publishes raw genre shares with no floor; the engine keeps each genre at a share of at least 0.20 and marks exactly one dominant parent per style, the highest share with ties broken by genre name. A style with no genre at 0.20 has no parent row. A producer result missing either half is treated as empty. Community enrichment is a producer-side operation and records its returned `enriched` count rather than writing a result table here. The activity summary is the one exception to the empty-result rule and rewrites its window either way, for the reason given below.
 
 The next cycle begins one configured interval after the preceding cycle started (or immediately if a cycle outlasts the interval). Precomputation is deliberate: expensive graph aggregation occurs on a schedule, while read endpoints perform bounded PostgreSQL queries. This separates computation latency from request latency and gives operators a durable status record for each computation.
+
+## Style lifecycle and the Genre Atlas layout
+
+These compute concept B of Strata, the Genre Atlas. ADR 0016 section 4 in `design` records the decision. Design spike `gm-design-4804` (sections B1 to B5, and its Recommendation for B) holds the evidence. The rule and the layout are ported from that spike's harness.
+
+**Lifecycle stages** ([`insights/style_lifecycle.py`](../insights/style_lifecycle.py)) are computed causally from release-year counts, so the stage in year *y* reads only years up to *y*. There are five stages: absent, emerging, established, reviving and declining. Every threshold is a field of `LifecycleRule`, and `LIFECYCLE_RULE.describe()` returns the rule as data, so the UI can show what a stage means. The defaults are the spike's:
+
+- emergence is the year a style reaches 25 cumulative releases;
+- a style is active at a 3-year trailing mean of at least 0.5 of its running peak;
+- an active style is established 10 years after emergence;
+- an inactive style is reviving at 1.5 times its trough and 0.25 of its peak.
+
+The emergence year is this 25-release year, never graphinator's `first_year`. One mis-dated release sets `first_year`. The same emergence year dates the "emerges after its parent genre" rule.
+
+The timeline ends at the last complete calendar year, and its latest two years are marked provisional, because catalogue entry lags release. The stages are not stored: the pinned schema has no stage table. A reader computes them from `insights.style_year_counts` with the same module, which takes milliseconds for every style and year (spike section B5). Because the stages are derived on read, they always match the stored counts.
+
+**The layout** ([`insights/style_atlas.py`](../insights/style_atlas.py)) is the `style_atlas` computation. It runs right after `style_year_counts` and does real work once per month. A run in a month that already has `insights.genre_atlas_sectors` rows returns 0 before any producer read, so the month's map holds still for every reader. Otherwise it builds the layout as follows:
+
+- **Inputs.** It reads the producer's style-year-counts response itself. The genre overlap and each style's lean need the raw shares under the 0.20 parent threshold, which `insights.style_parents` does not keep. Parents are reduced with the same rule as that table (share >= 0.20, one dominant), so the hulls match it. `graph.part_of` is never an input.
+- **Genre ring.** Genres go on a ring in the exact maximum-weight cycle over their soft overlap. Each sector's width is proportional to the square root of its member count plus one.
+- **Placement.** A style is drawn in its dominant parent's sector, and a ghost copy is drawn in every secondary parent's sector. A ghost counts as a member of its host's hull. Inside a sector, a node's angle is the rank of its lean toward the following ring neighbour, and its radius is the rank of its emergence year.
+- **Measured alternative.** Co-tag MDS inside each sector was measured in the spike. It roughly halves edge crossings but moves p95 1.13 nearest-neighbour distances a month, over the 1.0 bar, so lean × emergence rank (p95 0.69) is used.
+- **Pinning.** The latest earlier month's `insights.genre_atlas_sectors` rows pin the ring order and every sector's frame. A new genre is inserted where it adds the most overlap, and a vanished genre is dropped. The frames are reused unchanged while every square-root width stays within 10% of its pinned width. Otherwise all sectors are resized from the first ring genre's pinned start angle, so the ring does not rotate. That is why sector bounds may pass 2π.
+- **Write.** Sectors go to `insights.genre_atlas_sectors`, and style and ghost nodes go to `insights.style_atlas_layout`. Both are written in one transaction under an advisory lock, with the month re-checked inside it, so a concurrent run cannot interleave a second layout. Every run logs its intrusions, omissions and p95 movement against the previous month.
+
+The epic's bars are regression tests over two synthetic catalogue months (`tests/test_style_atlas_bars.py`):
+
+- lifecycle flips of at most 2% between months;
+- at most 10% flips under any single ±10% threshold change;
+- zero hull intrusions and zero omissions;
+- p95 movement under one nearest-neighbour distance, with at most 5% of styles moving further.
+
+**The read endpoint** (`GET /api/insights/style-atlas`, [`insights/style_atlas_read.py`](../insights/style_atlas_read.py)) serves the latest month in `insights.genre_atlas_sectors` from the generation-keyed cache, falling back to PostgreSQL when Valkey is down. It is bounded by the catalogue, not the request: one month of sectors and nodes, the parents of the drawn styles, and the release-year counts up to the timeline's last year. Stages are derived there, never stored. The response holds:
+
+- `month` and `computed_at`;
+- `rule`, which is `LIFECYCLE_RULE.describe()`: the basis, the stage names, the `rule_version` (`gm-design-4804/1`, bumped when a threshold changes) and every threshold;
+- `timeline`, with `first_year`, `last_year` and `provisional_from`, the first of the latest two provisional years;
+- `genres`, in ring order, each with its sector frame (`sector_start`, `sector_end`, radians) and `x`, `y`;
+- `styles`, each with its host `genre`, `x`, `y`, `emergence_year` (null if it has not reached 25 releases), the `stage` in the last year (provisional), the `settled_stage` in the last non-provisional year (null if that year is before the timeline), `parents` (`genre`, `share`, `dominant`), and `stages`, one index into `rule.stages` per timeline year, so the UI can scrub valid time;
+- `ghosts`: `style`, host `genre`, `x`, `y`.
+
+Before the first monthly run `month`, `computed_at` and `timeline` are null and the lists are empty, with the rule still present. That is a 200, not an error.
 
 ## Activity summary and the consent filter
 

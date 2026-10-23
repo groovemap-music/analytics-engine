@@ -23,7 +23,11 @@ from insights.catalog_api_contract import (
     GENRE_TRENDS_PATH,
     LABEL_LONGEVITY_PATH,
     RARITY_SCORES_PATH,
+    STYLE_YEAR_COUNTS_MAX_PROCESSING_SECONDS,
+    STYLE_YEAR_COUNTS_PATH,
 )
+from insights.style_atlas import Sector, build_layout, hull_check, movement, style_positions
+from insights.style_lifecycle import last_complete_year, style_lifecycles
 from insights.telemetry import computation_span, record_computation
 
 
@@ -57,16 +61,22 @@ P = ParamSpec("P")
 #   rarity-scores         chunked full-graph Neo4j scans                1800s
 #   community-enrichment  API-published bounded processing time plus    1800s
 #                         20% transport/storage headroom
+#   style-year-counts     API-published bounded processing time x 3      900s
+#                         (a scan of every release-style tag)
 #   everything else       full-graph Neo4j aggregations                  900s
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _WRITE_TIMEOUT_SECONDS = 30.0
 _POOL_TIMEOUT_SECONDS = 60.0
 DEFAULT_READ_TIMEOUT_SECONDS = 900.0
 
+# A genre is a style's parent when it covers at least this share of the style's releases.
+STYLE_PARENT_MIN_SHARE: Final = 0.20
+
 ENDPOINT_READ_TIMEOUTS: dict[str, float] = {
     DATA_COMPLETENESS_PATH: 1800.0,
     RARITY_SCORES_PATH: 1800.0,
     COMMUNITY_ENRICHMENT_PATH: COMMUNITY_ENRICHMENT_MAX_PROCESSING_SECONDS * 1.2,
+    STYLE_YEAR_COUNTS_PATH: STYLE_YEAR_COUNTS_MAX_PROCESSING_SECONDS * 3.0,
 }
 
 
@@ -146,13 +156,13 @@ def _record_lifecycle(
     return decorate
 
 
-async def _fetch_from_api(
+async def _get_json(
     client: httpx.AsyncClient,
     path: str,
     params: dict[str, Any] | None = None,
     timeout: httpx.Timeout | float | None = None,
-) -> list[dict[str, Any]]:
-    """Fetch computation data from the API service.
+) -> dict[str, Any]:
+    """GET a computation endpoint and return its JSON body.
 
     Unless ``timeout`` is given explicitly, the per-endpoint budget from
     :func:`endpoint_timeout` is applied — never the client's scalar default.
@@ -164,6 +174,17 @@ async def _fetch_from_api(
     response = await client.get(path, **kwargs)
     response.raise_for_status()
     data: dict[str, Any] = response.json()
+    return data
+
+
+async def _fetch_from_api(
+    client: httpx.AsyncClient,
+    path: str,
+    params: dict[str, Any] | None = None,
+    timeout: httpx.Timeout | float | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch the ``items`` list of a computation endpoint from the API service."""
+    data = await _get_json(client, path, params, timeout)
     items: list[dict[str, Any]] = data.get("items", [])
     return items
 
@@ -220,6 +241,197 @@ async def compute_and_store_genre_trends(client: httpx.AsyncClient, pool: Any) -
                 )
     logger.info("💾 Genre trends stored", count=len(results))
     return len(results)
+
+
+def _style_parent_rows(shares: Iterable[dict[str, Any]]) -> list[tuple[str, str, float, bool]]:
+    """Reduce raw producer shares to the parents worth keeping, one of them dominant.
+
+    The producer publishes every genre that co-occurs with a style and applies no floor; the
+    parent threshold is this consumer's. A style keeps each genre at ``share >=
+    STYLE_PARENT_MIN_SHARE`` and marks exactly one of those dominant: the highest share, with
+    ties broken by genre name so a re-run over the same data picks the same parent. A style
+    whose every share is under the threshold has no parent and writes no row.
+    """
+    by_style: dict[str, list[tuple[str, float]]] = {}
+    for row in shares:
+        share = float(row["share"])
+        if share >= STYLE_PARENT_MIN_SHARE:
+            by_style.setdefault(row["style"], []).append((row["genre"], share))
+
+    rows: list[tuple[str, str, float, bool]] = []
+    for style, parents in sorted(by_style.items()):
+        dominant_genre = min(parents, key=lambda parent: (-parent[1], parent[0]))[0]
+        rows.extend((style, genre, share, genre == dominant_genre) for genre, share in sorted(parents))
+    return rows
+
+
+@_record_lifecycle("style_year_counts", "❌ Style year counts computation failed")
+async def compute_and_store_style_year_counts(client: httpx.AsyncClient, pool: Any) -> int:
+    """Compute per-style release counts by year and each style's parent genres, and store them.
+
+    One producer read feeds both ``insights.style_year_counts`` and ``insights.style_parents``,
+    replaced together in a single transaction so a reader never sees counts from one snapshot
+    beside parents from another.
+
+    A producer result missing either half is treated as empty and leaves the previous snapshot
+    intact: with real catalog data every style that has dated releases also has genre
+    co-occurrences, so a lone half is an incomplete read, and writing it would wipe the other
+    table's good rows.
+
+    Returns:
+        The number of rows written across both tables.
+    """
+    data = await _get_json(client, STYLE_YEAR_COUNTS_PATH)
+    style_years: list[dict[str, Any]] = data.get("style_years", [])
+    style_parents: list[dict[str, Any]] = data.get("style_parents", [])
+    if not style_years or not style_parents:
+        if style_years or style_parents:
+            logger.warning(
+                "⚠️ Style year counts result is missing one half — keeping the previous snapshot",
+                style_years=len(style_years),
+                style_parents=len(style_parents),
+            )
+        return 0
+
+    year_rows = [(row["style"], row["year"], row["release_count"], row["master_count"]) for row in style_years]
+    parent_rows = _style_parent_rows(style_parents)
+
+    async with pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute("DELETE FROM insights.style_year_counts")
+            await cursor.execute("DELETE FROM insights.style_parents")
+            await cursor.executemany(
+                """
+                INSERT INTO insights.style_year_counts (style, year, release_count, master_count)
+                VALUES (%s, %s, %s, %s)
+                """,
+                year_rows,
+            )
+            if parent_rows:
+                await cursor.executemany(
+                    """
+                    INSERT INTO insights.style_parents (style, genre, share, is_dominant)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    parent_rows,
+                )
+    logger.info("💾 Style year counts stored", style_years=len(year_rows), style_parents=len(parent_rows))
+    return len(year_rows) + len(parent_rows)
+
+
+# One writer per month: the lock serialises concurrent runs, and the in-transaction re-check
+# turns the loser into a no-op instead of a second, interleaved layout.
+_STYLE_ATLAS_LOCK_SQL: Final = "SELECT pg_advisory_xact_lock(hashtext('insights.style_atlas'))"
+_STYLE_ATLAS_MONTH_EXISTS_SQL: Final = "SELECT 1 FROM insights.genre_atlas_sectors WHERE month = %s LIMIT 1"
+_STYLE_ATLAS_PINNED_SECTORS_SQL: Final = """
+    SELECT month, genre, ring_order, sector_start, sector_end, x, y
+    FROM insights.genre_atlas_sectors
+    WHERE month = (SELECT max(month) FROM insights.genre_atlas_sectors WHERE month < %s)
+    ORDER BY ring_order
+"""
+_STYLE_ATLAS_PREVIOUS_STYLES_SQL: Final = "SELECT style, x, y FROM insights.style_atlas_layout WHERE month = %s AND node_kind = 'style'"
+
+
+def atlas_month(now: datetime | None = None) -> date:
+    """The first day of the UTC month a run at ``now`` lays out."""
+    moment = (now or datetime.now(UTC)).astimezone(UTC)
+    return moment.date().replace(day=1)
+
+
+@_record_lifecycle("style_atlas", "❌ Style atlas computation failed")
+async def compute_and_store_style_atlas(client: httpx.AsyncClient, pool: Any, now: datetime | None = None) -> int:
+    """Lay out the month's Genre Atlas and store its sectors and nodes, once per month.
+
+    A month that already has ``insights.genre_atlas_sectors`` rows is a no-op, before any
+    producer read: the layout is the month's frame, so a daily run never moves it. Otherwise
+    the ring order and sector frames are pinned to the latest earlier month's rows (see
+    :mod:`insights.style_atlas`), and both tables are written in one transaction.
+
+    The layout reads the producer's style-year-counts response itself, not the stored
+    ``insights.style_parents``. The lean between ring neighbours and the ring's genre overlap
+    need the raw shares under the 0.20 parent threshold, which that table does not keep. The
+    parents are reduced with the same rule as the stored table, so hulls match it. Emergence
+    is the 25-release year from the same response's release-year counts
+    (:mod:`insights.style_lifecycle`).
+
+    Returns:
+        The number of rows written across both tables, 0 for a no-op.
+    """
+    month = atlas_month(now)
+    async with pool.connection() as conn, conn.cursor() as cursor:
+        cursor = cast("Any", cursor)
+        await cursor.execute(_STYLE_ATLAS_MONTH_EXISTS_SQL, (month,))
+        if await cursor.fetchone() is not None:
+            logger.info("📊 Style atlas already laid out for this month", month=month.isoformat())
+            return 0
+        await cursor.execute(_STYLE_ATLAS_PINNED_SECTORS_SQL, (month,))
+        pinned_rows = await cursor.fetchall()
+        previous_positions: dict[str, tuple[float, float]] = {}
+        if pinned_rows:
+            await cursor.execute(_STYLE_ATLAS_PREVIOUS_STYLES_SQL, (pinned_rows[0][0],))
+            previous_positions = {style: (x, y) for style, x, y in await cursor.fetchall()}
+
+    data = await _get_json(client, STYLE_YEAR_COUNTS_PATH)
+    style_years: list[dict[str, Any]] = data.get("style_years", [])
+    style_shares: list[dict[str, Any]] = data.get("style_parents", [])
+    if not style_years or not style_shares:
+        logger.warning(
+            "⚠️ Style atlas input is missing a half — not laying out this month", style_years=len(style_years), style_parents=len(style_shares)
+        )
+        return 0
+
+    pinned = [Sector(genre, ring_order, start, end, x, y) for _month, genre, ring_order, start, end, x, y in pinned_rows]
+    shares: dict[str, dict[str, float]] = {}
+    for row in style_shares:
+        shares.setdefault(row["style"], {})[row["genre"]] = float(row["share"])
+    parents = _style_parent_rows(style_shares)
+    lifecycles = style_lifecycles(((row["style"], row["year"], row["release_count"]) for row in style_years), last_complete_year(month))
+    layout = build_layout(shares, parents, lifecycles.emergence_years(), pinned)
+
+    hulls = hull_check(layout.nodes, parents)
+    moved = movement(previous_positions, style_positions(layout.nodes))
+    log = logger.warning if hulls.intruding_nodes or hulls.omitted_pairs else logger.info
+    log(
+        "📐 Style atlas laid out",
+        month=month.isoformat(),
+        ring_pinned=layout.ring_pinned,
+        frames_pinned=layout.frames_pinned,
+        intruding_nodes=hulls.intruding_nodes,
+        omitted_parent_pairs=hulls.omitted_pairs,
+        p95_movement_nn=None if moved is None else round(moved.p95_nn, 3),
+        share_moving_over_1nn=None if moved is None else round(moved.share_over_1nn, 4),
+    )
+
+    sector_rows = [(month, s.genre, s.ring_order, s.start, s.end, s.x, s.y) for s in layout.sectors]
+    node_rows = [(month, n.kind, n.style, n.genre, n.x, n.y) for n in layout.nodes]
+    async with pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute(_STYLE_ATLAS_LOCK_SQL)
+            await cursor.execute(_STYLE_ATLAS_MONTH_EXISTS_SQL, (month,))
+            if await cursor.fetchone() is not None:
+                logger.info("📊 Style atlas written by a concurrent run — leaving it", month=month.isoformat())
+                return 0
+            await cursor.executemany(
+                """
+                INSERT INTO insights.genre_atlas_sectors (month, genre, ring_order, sector_start, sector_end, x, y)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                sector_rows,
+            )
+            if node_rows:
+                await cursor.executemany(
+                    """
+                    INSERT INTO insights.style_atlas_layout (month, node_kind, style, genre, x, y)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    node_rows,
+                )
+    logger.info("💾 Style atlas stored", month=month.isoformat(), sectors=len(sector_rows), nodes=len(node_rows))
+    return len(sector_rows) + len(node_rows)
 
 
 @_record_lifecycle("label_longevity", "❌ Label longevity computation failed")
@@ -537,7 +749,7 @@ async def compute_and_store_activity_summary(client: httpx.AsyncClient, pool: An
     Args:
         client: Unused. Every other computation fetches from catalog-api; this one reads the
             shared database, and keeps the signature so ``_record_lifecycle`` and
-            ``run_all_computations`` treat all eight computations identically.
+            ``run_all_computations`` treat all ten computations identically.
         pool: The shared PostgreSQL pool. The ``activity`` and ``insights`` schemas live in
             the same database.
         days: Whole UTC days to summarise, including today.
@@ -580,6 +792,8 @@ async def run_all_computations(
     computations: list[tuple[str, Callable[[], Coroutine[Any, Any, int]]]] = [
         ("artist_centrality", lambda: compute_and_store_artist_centrality(client, pool)),
         ("genre_trends", lambda: compute_and_store_genre_trends(client, pool)),
+        ("style_year_counts", lambda: compute_and_store_style_year_counts(client, pool)),
+        ("style_atlas", lambda: compute_and_store_style_atlas(client, pool)),
         ("label_longevity", lambda: compute_and_store_label_longevity(client, pool)),
         (
             "anniversaries",

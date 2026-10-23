@@ -82,7 +82,7 @@ class TestComputationStatusEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "statuses" in data
-        assert len(data["statuses"]) == 8
+        assert len(data["statuses"]) == 10
         for status in data["statuses"]:
             assert status["status"] == "never_run"
 
@@ -1122,6 +1122,7 @@ _CACHED_ENDPOINTS = [
     ("/api/insights/label-longevity?limit=10", "insights:label-longevity:10"),
     ("/api/insights/release-rarity?limit=10", "insights:release-rarity:10"),
     ("/api/insights/data-completeness", "insights:data-completeness"),
+    ("/api/insights/style-atlas", "insights:style-atlas"),
 ]
 
 
