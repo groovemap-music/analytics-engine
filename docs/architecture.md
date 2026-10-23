@@ -27,7 +27,7 @@ The promoted OpenAPI document is the authority for the producer transport. This 
 | `artist_centrality` | `/api/internal/insights/artist-centrality` | `insights.artist_centrality` | `/api/insights/top-artists` |
 | `genre_trends` | `/api/internal/insights/genre-trends` | `insights.genre_trends` | `/api/insights/genre-trends` |
 | `style_year_counts` | `/api/internal/insights/style-year-counts` | `insights.style_year_counts`, `insights.style_parents` | None — read by `catalog-api` |
-| `style_atlas` | `/api/internal/insights/style-year-counts`, once a month | `insights.genre_atlas_sectors`, `insights.style_atlas_layout` | None yet — `/api/insights/style-atlas` is `gm-analytics-engine-21z` |
+| `style_atlas` | `/api/internal/insights/style-year-counts`, once a month | `insights.genre_atlas_sectors`, `insights.style_atlas_layout` | `/api/insights/style-atlas` |
 | `label_longevity` | `/api/internal/insights/label-longevity` | `insights.label_longevity` | `/api/insights/label-longevity` |
 | `anniversaries` | `/api/internal/insights/anniversaries` | `insights.monthly_anniversaries` | `/api/insights/this-month` |
 | `data_completeness` | `/api/internal/insights/data-completeness` | `insights.data_completeness` | `/api/insights/data-completeness` |
@@ -73,6 +73,17 @@ The epic's bars are regression tests over two synthetic catalogue months (`tests
 - at most 10% flips under any single ±10% threshold change;
 - zero hull intrusions and zero omissions;
 - p95 movement under one nearest-neighbour distance, with at most 5% of styles moving further.
+
+**The read endpoint** (`GET /api/insights/style-atlas`, [`insights/style_atlas_read.py`](../insights/style_atlas_read.py)) serves the latest month in `insights.genre_atlas_sectors` from the generation-keyed cache, falling back to PostgreSQL when Valkey is down. It is bounded by the catalogue, not the request: one month of sectors and nodes, the parents of the drawn styles, and the release-year counts up to the timeline's last year. Stages are derived there, never stored. The response holds:
+
+- `month` and `computed_at`;
+- `rule`, which is `LIFECYCLE_RULE.describe()`: the basis, the stage names, the `rule_version` (`gm-design-4804/1`, bumped when a threshold changes) and every threshold;
+- `timeline`, with `first_year`, `last_year` and `provisional_from`, the first of the latest two provisional years;
+- `genres`, in ring order, each with its sector frame (`sector_start`, `sector_end`, radians) and `x`, `y`;
+- `styles`, each with its host `genre`, `x`, `y`, `emergence_year` (null if it has not reached 25 releases), the `stage` in the last year (provisional), the `settled_stage` in the last non-provisional year (null if that year is before the timeline), `parents` (`genre`, `share`, `dominant`), and `stages`, one index into `rule.stages` per timeline year, so the UI can scrub valid time;
+- `ghosts`: `style`, host `genre`, `x`, `y`.
+
+Before the first monthly run `month`, `computed_at` and `timeline` are null and the lists are empty, with the rule still present. That is a 200, not an error.
 
 ## Activity summary and the consent filter
 

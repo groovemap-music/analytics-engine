@@ -3,7 +3,7 @@
 The unit suite fakes the two tables. This one checks the writes against the real DDL: the
 first-of-month CHECK, the primary keys, the ``node_kind`` CHECK, and NOT NULL on every column.
 It also re-reads the rows through PostgreSQL to check the once-a-month no-op and the pinning
-to the previous month.
+to the previous month, and reads the stored month back through the endpoint's query path.
 """
 
 from __future__ import annotations
@@ -15,7 +15,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
-from insights.computations import compute_and_store_style_atlas
+from insights.computations import compute_and_store_style_atlas, compute_and_store_style_year_counts
+from insights.style_atlas_read import read_style_atlas
 from tests.style_atlas_fixtures import next_month, synthetic_month
 
 
@@ -41,7 +42,7 @@ def _client(body: dict[str, Any]) -> AsyncMock:
 @pytest_asyncio.fixture(autouse=True, loop_scope="session")
 async def _empty_atlas(schema_owner_pool: AsyncPostgreSQLPool) -> None:
     async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
-        await cursor.execute("TRUNCATE insights.genre_atlas_sectors, insights.style_atlas_layout")
+        await cursor.execute("TRUNCATE insights.genre_atlas_sectors, insights.style_atlas_layout, insights.style_year_counts, insights.style_parents")
 
 
 async def _rows(pool: AsyncPostgreSQLPool, month: date) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
@@ -75,3 +76,30 @@ async def test_a_month_is_written_once_and_the_next_month_is_pinned_to_it(schema
     assert november_written == len(november[0]) + len(november[1])
     assert [row[:4] for row in november[0]] == [row[:4] for row in october[0]]
     assert {row[0] for row in november[1]} == {"style", "ghost"}
+
+
+async def test_the_stored_month_reads_back_as_an_atlas_with_derived_lifecycles(schema_owner_pool: AsyncPostgreSQLPool) -> None:
+    async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+        assert (await read_style_atlas(cursor)).month is None
+
+    month = synthetic_month()
+    client = _client(month.producer_body())
+    await compute_and_store_style_year_counts(client, schema_owner_pool)
+    await compute_and_store_style_atlas(client, schema_owner_pool, now=OCTOBER)
+
+    async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+        atlas = await read_style_atlas(cursor)
+
+    assert atlas.month == date(2026, 10, 1)
+    assert atlas.timeline is not None
+    assert (atlas.timeline.first_year, atlas.timeline.last_year) == (1950, 2025)
+    assert [genre.ring_order for genre in atlas.genres] == list(range(len(atlas.genres)))
+    assert len(atlas.styles) == len({style.style for style in atlas.styles}) > 100
+    assert atlas.ghosts
+    years = atlas.timeline.last_year - atlas.timeline.first_year + 1
+    for style in atlas.styles:
+        assert len(style.stages) == years
+        assert [parent.genre for parent in style.parents if parent.dominant] == [style.genre]
+    hosted = {(ghost.style, ghost.genre) for ghost in atlas.ghosts}
+    by_style = {style.style: style for style in atlas.styles}
+    assert all(any(parent.genre == genre and not parent.dominant for parent in by_style[name].parents) for name, genre in hosted)
