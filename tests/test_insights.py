@@ -82,7 +82,7 @@ class TestComputationStatusEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "statuses" in data
-        assert len(data["statuses"]) == 9
+        assert len(data["statuses"]) == 10
         for status in data["statuses"]:
             assert status["status"] == "never_run"
 

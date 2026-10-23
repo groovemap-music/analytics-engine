@@ -562,6 +562,7 @@ async def computation_status() -> JSONResponse:
         "artist_centrality",
         "genre_trends",
         "style_year_counts",
+        "style_atlas",
         "label_longevity",
         "anniversaries",
         "data_completeness",
