@@ -4,9 +4,12 @@
 and ``insights.style_parents`` the parents. Lifecycle stages are not stored (see
 :mod:`insights.style_lifecycle`), so they are computed here from ``insights.style_year_counts``
 with the same module and rule that dated each style's emergence when the layout was built.
+Each genre's emergence year is dated from ``insights.genre_year_counts`` with that same rule, and
+a style's emergence edge to a parent is drawn when the style emerged in a later year.
 
 The read is bounded by the catalogue's size, not by the request: one month of sectors and
-nodes, one row per (style, year) up to the timeline's last year, and one row per parent.
+nodes, one row per (style, year) and per (genre, year) up to the timeline's last year, and one row per
+parent.
 """
 
 from __future__ import annotations
@@ -35,12 +38,21 @@ _NODES_SQL: Final = """
     ORDER BY node_kind, style, genre
 """
 _YEAR_COUNTS_SQL: Final = "SELECT style, year, release_count FROM insights.style_year_counts WHERE year <= %s"
+_GENRE_YEAR_COUNTS_SQL: Final = "SELECT genre, year, release_count FROM insights.genre_year_counts WHERE year <= %s"
 _PARENTS_SQL: Final = """
     SELECT style, genre, share, is_dominant
     FROM insights.style_parents
     WHERE style IN (SELECT style FROM insights.style_atlas_layout WHERE month = %s AND node_kind = 'style')
     ORDER BY style, share DESC, genre
 """
+
+
+def _emerges_after(style_year: int | None, genre_year: int | None) -> bool:
+    """Whether a style that emerged in ``style_year`` emerged after a genre that emerged in ``genre_year``.
+
+    A year of ``None`` is an emergence that has not happened, so there is nothing to order and no edge.
+    """
+    return style_year is not None and genre_year is not None and style_year > genre_year
 
 
 def empty_style_atlas() -> StyleAtlasResponse:
@@ -64,12 +76,18 @@ async def read_style_atlas(cursor: Any) -> StyleAtlasResponse:
     last_year = last_complete_year(month)
     await cursor.execute(_YEAR_COUNTS_SQL, (last_year,))
     lifecycles = style_lifecycles(((style, year, count) for style, year, count in await cursor.fetchall()), last_year)
+    emergence = lifecycles.emergence_years()
+    await cursor.execute(_GENRE_YEAR_COUNTS_SQL, (last_year,))
+    genre_emergence = style_lifecycles(
+        ((genre, year, count) for genre, year, count in await cursor.fetchall()), last_year, lifecycles.rule
+    ).emergence_years()
     await cursor.execute(_PARENTS_SQL, (month,))
     parents: dict[str, list[AtlasParent]] = {}
     for style, genre, share, dominant in await cursor.fetchall():
-        parents.setdefault(style, []).append(AtlasParent(genre=genre, share=share, dominant=dominant))
+        parents.setdefault(style, []).append(
+            AtlasParent(genre=genre, share=share, dominant=dominant, emergence_edge=_emerges_after(emergence.get(style), genre_emergence.get(genre)))
+        )
 
-    emergence = lifecycles.emergence_years()
     row_of = {style: i for i, style in enumerate(lifecycles.styles)}
     n_years = len(lifecycles.years)
     provisional_from = last_year - lifecycles.rule.provisional_years + 1
@@ -105,7 +123,10 @@ async def read_style_atlas(cursor: Any) -> StyleAtlasResponse:
             last_year=last_year,
             provisional_from=provisional_from,
         ),
-        genres=[AtlasGenre(genre=g, ring_order=order, sector_start=start, sector_end=end, x=x, y=y) for g, order, start, end, x, y, _at in sectors],
+        genres=[
+            AtlasGenre(genre=g, ring_order=order, sector_start=start, sector_end=end, x=x, y=y, emergence_year=genre_emergence.get(g))
+            for g, order, start, end, x, y, _at in sectors
+        ],
         styles=styles,
         ghosts=ghosts,
     )

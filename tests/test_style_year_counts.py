@@ -79,6 +79,10 @@ def _years(style: str = "House", year: int = 1990, release_count: int = 10, mast
     return {"style": style, "year": year, "release_count": release_count, "master_count": master_count}
 
 
+def _genre_years(genre: str = "Electronic", year: int = 1990, release_count: int = 40) -> dict[str, Any]:
+    return {"genre": genre, "year": year, "release_count": release_count}
+
+
 def _share(style: str, genre: str, share: float) -> dict[str, Any]:
     return {"style": style, "genre": genre, "release_count": int(share * 100), "style_release_count": 100, "share": share}
 
@@ -90,19 +94,21 @@ class TestTheWrite:
             {
                 "style_years": [_years("House", 1990, 10, 4), _years("House", 1991, 12, 5)],
                 "style_parents": [_share("House", "Electronic", 0.9), _share("House", "Funk / Soul", 0.3)],
+                "genre_years": [_genre_years("Electronic", 1990, 40), _genre_years("Electronic", 1991, 50), _genre_years("Funk / Soul", 1990, 8)],
             }
         )
         pool = _make_pool()
 
         written = await compute_and_store_style_year_counts(client, pool)
 
-        assert written == 4
+        assert written == 7
         assert _rows(pool, "style_year_counts") == [("House", 1990, 10, 4), ("House", 1991, 12, 5)]
         assert _rows(pool, "style_parents") == [("House", "Electronic", 0.9, True), ("House", "Funk / Soul", 0.3, False)]
+        assert _rows(pool, "genre_year_counts") == [("Electronic", 1990, 40), ("Electronic", 1991, 50), ("Funk / Soul", 1990, 8)]
 
     @pytest.mark.asyncio
-    async def test_replaces_both_tables_inside_one_transaction_before_inserting(self) -> None:
-        client = _client({"style_years": [_years()], "style_parents": [_share("House", "Electronic", 0.9)]})
+    async def test_replaces_all_three_tables_inside_one_transaction_before_inserting(self) -> None:
+        client = _client({"style_years": [_years()], "style_parents": [_share("House", "Electronic", 0.9)], "genre_years": [_genre_years()]})
         pool = _make_pool()
 
         await compute_and_store_style_year_counts(client, pool)
@@ -110,13 +116,18 @@ class TestTheWrite:
         conn = pool.connection()
         conn.transaction.assert_called_once_with()
         statements = _statements(pool)
-        assert statements[:2] == ["DELETE FROM insights.style_year_counts", "DELETE FROM insights.style_parents"]
-        assert statements[2].startswith("INSERT INTO insights.style_year_counts")
-        assert statements[3].startswith("INSERT INTO insights.style_parents")
+        assert statements[:3] == [
+            "DELETE FROM insights.style_year_counts",
+            "DELETE FROM insights.style_parents",
+            "DELETE FROM insights.genre_year_counts",
+        ]
+        assert statements[3].startswith("INSERT INTO insights.style_year_counts")
+        assert statements[4].startswith("INSERT INTO insights.genre_year_counts")
+        assert statements[5].startswith("INSERT INTO insights.style_parents")
 
     @pytest.mark.asyncio
     async def test_reads_the_endpoint_under_its_own_budget_and_logs_completed(self) -> None:
-        client = _client({"style_years": [_years()], "style_parents": [_share("House", "Electronic", 0.9)]})
+        client = _client({"style_years": [_years()], "style_parents": [_share("House", "Electronic", 0.9)], "genre_years": [_genre_years()]})
         pool = _make_pool()
 
         with patch.object(computations, "_log_computation", new=AsyncMock()) as log:
@@ -125,7 +136,7 @@ class TestTheWrite:
         assert client.get.await_args.args == (STYLE_YEAR_COUNTS_PATH,)
         assert client.get.await_args.kwargs["timeout"] == endpoint_timeout(STYLE_YEAR_COUNTS_PATH)
         assert log.await_args.args[1:3] == ("style_year_counts", "completed")
-        assert log.await_args.args[4] == 2
+        assert log.await_args.args[4] == 3
 
 
 class TestTheReadBudget:
@@ -189,6 +200,7 @@ class TestTheParentRule:
             {
                 "style_years": [_years("House"), _years("Odd")],
                 "style_parents": [_share("House", "Electronic", 0.8), _share("House", "Pop", 0.05), _share("Odd", "Rock", 0.1)],
+                "genre_years": [_genre_years()],
             }
         )
         pool = _make_pool()
@@ -196,16 +208,16 @@ class TestTheParentRule:
         written = await compute_and_store_style_year_counts(client, pool)
 
         assert _rows(pool, "style_parents") == [("House", "Electronic", 0.8, True)]
-        assert written == 3
+        assert written == 4
 
     @pytest.mark.asyncio
     async def test_a_result_whose_parents_all_fall_under_the_threshold_still_replaces_the_counts(self) -> None:
-        client = _client({"style_years": [_years("Odd")], "style_parents": [_share("Odd", "Rock", 0.1)]})
+        client = _client({"style_years": [_years("Odd")], "style_parents": [_share("Odd", "Rock", 0.1)], "genre_years": [_genre_years("Rock")]})
         pool = _make_pool()
 
         written = await compute_and_store_style_year_counts(client, pool)
 
-        assert written == 1
+        assert written == 2
         assert _rows(pool, "style_parents") == []
         assert "DELETE FROM insights.style_parents" in _statements(pool)
 
@@ -215,11 +227,13 @@ class TestTheEmptyResultRule:
     @pytest.mark.parametrize(
         "body",
         [
-            {"style_years": [], "style_parents": []},
-            {"style_years": [_years()], "style_parents": []},
-            {"style_years": [], "style_parents": [_share("House", "Electronic", 0.9)]},
+            {"style_years": [], "style_parents": [], "genre_years": []},
+            {"style_years": [_years()], "style_parents": [], "genre_years": [_genre_years()]},
+            {"style_years": [], "style_parents": [_share("House", "Electronic", 0.9)], "genre_years": [_genre_years()]},
+            {"style_years": [_years()], "style_parents": [_share("House", "Electronic", 0.9)], "genre_years": []},
+            {"style_years": [_years()], "style_parents": [_share("House", "Electronic", 0.9)]},
         ],
-        ids=["both-empty", "no-parents", "no-years"],
+        ids=["all-empty", "no-parents", "no-years", "no-genre-years", "genre-years-absent"],
     )
     async def test_an_empty_producer_result_leaves_the_previous_snapshot_intact(self, body: dict[str, Any]) -> None:
         pool = _make_pool()
@@ -227,7 +241,7 @@ class TestTheEmptyResultRule:
         written = await compute_and_store_style_year_counts(_client(body), pool)
 
         assert written == 0
-        assert not any("style_" in statement and "computation_log" not in statement for statement in _statements(pool))
+        assert not any(("style_" in statement or "genre_year" in statement) and "computation_log" not in statement for statement in _statements(pool))
         _cursor(pool).executemany.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -235,7 +249,7 @@ class TestTheEmptyResultRule:
         pool = _make_pool()
 
         with patch.object(computations, "_log_computation", new=AsyncMock()) as log:
-            await compute_and_store_style_year_counts(_client({"style_years": [], "style_parents": []}), pool)
+            await compute_and_store_style_year_counts(_client({"style_years": [], "style_parents": [], "genre_years": []}), pool)
 
         assert log.await_args.args[1:3] == ("style_year_counts", "completed")
         assert log.await_args.args[4] == 0
@@ -273,7 +287,7 @@ class TestTheFailurePath:
 
     @pytest.mark.asyncio
     async def test_a_storage_error_is_logged_failed_and_reraised(self) -> None:
-        client = _client({"style_years": [_years()], "style_parents": [_share("House", "Electronic", 0.9)]})
+        client = _client({"style_years": [_years()], "style_parents": [_share("House", "Electronic", 0.9)], "genre_years": [_genre_years()]})
         pool = _make_pool()
         _cursor(pool).executemany = AsyncMock(side_effect=RuntimeError("DB error"))
 
@@ -289,7 +303,7 @@ class TestTheFailurePath:
     @pytest.mark.asyncio
     async def test_the_transaction_is_not_swallowed_on_error(self) -> None:
         """The error must propagate through ``conn.transaction()`` so PostgreSQL rolls back."""
-        client = _client({"style_years": [_years()], "style_parents": [_share("House", "Electronic", 0.9)]})
+        client = _client({"style_years": [_years()], "style_parents": [_share("House", "Electronic", 0.9)], "genre_years": [_genre_years()]})
         pool = _make_pool()
         _cursor(pool).executemany = AsyncMock(side_effect=RuntimeError("DB error"))
         transaction = pool.connection().transaction()

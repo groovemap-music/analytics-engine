@@ -144,14 +144,21 @@ class AtlasGenre(BaseModel):
     sector_end: float
     x: float
     y: float
+    emergence_year: int | None = Field(description="The year the genre reached 25 cumulative releases, or null if it has not.")
 
 
 class AtlasParent(BaseModel):
-    """One parent genre of a style, at a share of at least the parent threshold."""
+    """One parent genre of a style, at a share of at least the parent threshold.
+
+    ``emergence_edge`` is whether the atlas draws the style's emergence edge to this genre: the
+    style emerged in a later year than the genre did. It is false for a style or genre that has
+    not reached 25 releases, because there is no emergence year to order.
+    """
 
     genre: str
     share: float
     dominant: bool
+    emergence_edge: bool
 
 
 class AtlasStyle(BaseModel):
