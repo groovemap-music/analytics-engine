@@ -137,6 +137,19 @@ class TestPayload:
         assert by_name["Ambient"]["settled_stage"] == "established"
         assert by_name["Shoegaze"]["settled_stage"] == "absent"
 
+    def test_settled_stage_and_latest_stage_differ_when_the_provisional_years_decline(self, test_client: TestClient, mock_pg_pool: MagicMock) -> None:
+        # 100 releases a year to 2023, then nothing: the settled year (2023) is still established, and the
+        # provisional years drag the trailing mean under half the peak, so the latest year reads declining.
+        _seed(mock_pg_pool, _answer(year_counts=[("Ambient", year, 100) for year in range(1980, 2024)]))
+
+        body = test_client.get("/api/insights/style-atlas").json()
+
+        ambient = next(style for style in body["styles"] if style["style"] == "Ambient")
+        assert body["timeline"] == {"first_year": 1980, "last_year": LAST_YEAR, "provisional_from": LAST_YEAR - 1}
+        assert ambient["settled_stage"] == "established"
+        assert ambient["stage"] == "declining"
+        assert ambient["stages"][-1] == STAGES.index("declining")
+
     def test_settled_stage_is_null_when_the_settled_year_precedes_the_timeline(self, test_client: TestClient, mock_pg_pool: MagicMock) -> None:
         _seed(mock_pg_pool, _answer(year_counts=[("Ambient", LAST_YEAR - 1, 30), ("Ambient", LAST_YEAR, 30)]))
 
