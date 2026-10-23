@@ -68,7 +68,10 @@ dev = [
 packages = ["insights"]
 
 [tool.uv]
-exclude-newer = "2 days"
+exclude-newer = "7 days"
+# Security exception: certifi 2026.10.19 fixes PYSEC-2026-4320 and is inside the
+# 7-day window. Remove after 2026-10-27T02:24:17Z, when the window covers it.
+exclude-newer-package = { certifi = "2026-10-20T02:24:17Z" }
 override-dependencies = ["groovemap-runtime[neo4j,otel,otel-http,postgres] @ git+https://github.com/groovemap-music/python-libraries.git@771515349b592ff569b1b3e5712f7bef936bab58"]
 
 [tool.uv.sources]
