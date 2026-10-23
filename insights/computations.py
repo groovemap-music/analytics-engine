@@ -23,6 +23,8 @@ from insights.catalog_api_contract import (
     GENRE_TRENDS_PATH,
     LABEL_LONGEVITY_PATH,
     RARITY_SCORES_PATH,
+    STYLE_YEAR_COUNTS_MAX_PROCESSING_SECONDS,
+    STYLE_YEAR_COUNTS_PATH,
 )
 from insights.telemetry import computation_span, record_computation
 
@@ -57,16 +59,22 @@ P = ParamSpec("P")
 #   rarity-scores         chunked full-graph Neo4j scans                1800s
 #   community-enrichment  API-published bounded processing time plus    1800s
 #                         20% transport/storage headroom
+#   style-year-counts     API-published bounded processing time x 3      900s
+#                         (a scan of every release-style tag)
 #   everything else       full-graph Neo4j aggregations                  900s
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _WRITE_TIMEOUT_SECONDS = 30.0
 _POOL_TIMEOUT_SECONDS = 60.0
 DEFAULT_READ_TIMEOUT_SECONDS = 900.0
 
+# A genre is a style's parent when it covers at least this share of the style's releases.
+STYLE_PARENT_MIN_SHARE: Final = 0.20
+
 ENDPOINT_READ_TIMEOUTS: dict[str, float] = {
     DATA_COMPLETENESS_PATH: 1800.0,
     RARITY_SCORES_PATH: 1800.0,
     COMMUNITY_ENRICHMENT_PATH: COMMUNITY_ENRICHMENT_MAX_PROCESSING_SECONDS * 1.2,
+    STYLE_YEAR_COUNTS_PATH: STYLE_YEAR_COUNTS_MAX_PROCESSING_SECONDS * 3.0,
 }
 
 
@@ -146,13 +154,13 @@ def _record_lifecycle(
     return decorate
 
 
-async def _fetch_from_api(
+async def _get_json(
     client: httpx.AsyncClient,
     path: str,
     params: dict[str, Any] | None = None,
     timeout: httpx.Timeout | float | None = None,
-) -> list[dict[str, Any]]:
-    """Fetch computation data from the API service.
+) -> dict[str, Any]:
+    """GET a computation endpoint and return its JSON body.
 
     Unless ``timeout`` is given explicitly, the per-endpoint budget from
     :func:`endpoint_timeout` is applied — never the client's scalar default.
@@ -164,6 +172,17 @@ async def _fetch_from_api(
     response = await client.get(path, **kwargs)
     response.raise_for_status()
     data: dict[str, Any] = response.json()
+    return data
+
+
+async def _fetch_from_api(
+    client: httpx.AsyncClient,
+    path: str,
+    params: dict[str, Any] | None = None,
+    timeout: httpx.Timeout | float | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch the ``items`` list of a computation endpoint from the API service."""
+    data = await _get_json(client, path, params, timeout)
     items: list[dict[str, Any]] = data.get("items", [])
     return items
 
@@ -220,6 +239,84 @@ async def compute_and_store_genre_trends(client: httpx.AsyncClient, pool: Any) -
                 )
     logger.info("💾 Genre trends stored", count=len(results))
     return len(results)
+
+
+def _style_parent_rows(shares: Iterable[dict[str, Any]]) -> list[tuple[str, str, float, bool]]:
+    """Reduce raw producer shares to the parents worth keeping, one of them dominant.
+
+    The producer publishes every genre that co-occurs with a style and applies no floor; the
+    parent threshold is this consumer's. A style keeps each genre at ``share >=
+    STYLE_PARENT_MIN_SHARE`` and marks exactly one of those dominant: the highest share, with
+    ties broken by genre name so a re-run over the same data picks the same parent. A style
+    whose every share is under the threshold has no parent and writes no row.
+    """
+    by_style: dict[str, list[tuple[str, float]]] = {}
+    for row in shares:
+        share = float(row["share"])
+        if share >= STYLE_PARENT_MIN_SHARE:
+            by_style.setdefault(row["style"], []).append((row["genre"], share))
+
+    rows: list[tuple[str, str, float, bool]] = []
+    for style, parents in sorted(by_style.items()):
+        dominant_genre = min(parents, key=lambda parent: (-parent[1], parent[0]))[0]
+        rows.extend((style, genre, share, genre == dominant_genre) for genre, share in sorted(parents))
+    return rows
+
+
+@_record_lifecycle("style_year_counts", "❌ Style year counts computation failed")
+async def compute_and_store_style_year_counts(client: httpx.AsyncClient, pool: Any) -> int:
+    """Compute per-style release counts by year and each style's parent genres, and store them.
+
+    One producer read feeds both ``insights.style_year_counts`` and ``insights.style_parents``,
+    replaced together in a single transaction so a reader never sees counts from one snapshot
+    beside parents from another.
+
+    A producer result missing either half is treated as empty and leaves the previous snapshot
+    intact: with real catalog data every style that has dated releases also has genre
+    co-occurrences, so a lone half is an incomplete read, and writing it would wipe the other
+    table's good rows.
+
+    Returns:
+        The number of rows written across both tables.
+    """
+    data = await _get_json(client, STYLE_YEAR_COUNTS_PATH)
+    style_years: list[dict[str, Any]] = data.get("style_years", [])
+    style_parents: list[dict[str, Any]] = data.get("style_parents", [])
+    if not style_years or not style_parents:
+        if style_years or style_parents:
+            logger.warning(
+                "⚠️ Style year counts result is missing one half — keeping the previous snapshot",
+                style_years=len(style_years),
+                style_parents=len(style_parents),
+            )
+        return 0
+
+    year_rows = [(row["style"], row["year"], row["release_count"], row["master_count"]) for row in style_years]
+    parent_rows = _style_parent_rows(style_parents)
+
+    async with pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute("DELETE FROM insights.style_year_counts")
+            await cursor.execute("DELETE FROM insights.style_parents")
+            await cursor.executemany(
+                """
+                INSERT INTO insights.style_year_counts (style, year, release_count, master_count)
+                VALUES (%s, %s, %s, %s)
+                """,
+                year_rows,
+            )
+            if parent_rows:
+                await cursor.executemany(
+                    """
+                    INSERT INTO insights.style_parents (style, genre, share, is_dominant)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    parent_rows,
+                )
+    logger.info("💾 Style year counts stored", style_years=len(year_rows), style_parents=len(parent_rows))
+    return len(year_rows) + len(parent_rows)
 
 
 @_record_lifecycle("label_longevity", "❌ Label longevity computation failed")
@@ -537,7 +634,7 @@ async def compute_and_store_activity_summary(client: httpx.AsyncClient, pool: An
     Args:
         client: Unused. Every other computation fetches from catalog-api; this one reads the
             shared database, and keeps the signature so ``_record_lifecycle`` and
-            ``run_all_computations`` treat all eight computations identically.
+            ``run_all_computations`` treat all nine computations identically.
         pool: The shared PostgreSQL pool. The ``activity`` and ``insights`` schemas live in
             the same database.
         days: Whole UTC days to summarise, including today.
@@ -580,6 +677,7 @@ async def run_all_computations(
     computations: list[tuple[str, Callable[[], Coroutine[Any, Any, int]]]] = [
         ("artist_centrality", lambda: compute_and_store_artist_centrality(client, pool)),
         ("genre_trends", lambda: compute_and_store_genre_trends(client, pool)),
+        ("style_year_counts", lambda: compute_and_store_style_year_counts(client, pool)),
         ("label_longevity", lambda: compute_and_store_label_longevity(client, pool)),
         (
             "anniversaries",
