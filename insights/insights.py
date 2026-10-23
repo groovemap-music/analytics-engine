@@ -48,6 +48,7 @@ from insights.models import (
     LabelLongevityItem,
     ReleaseRarity,
 )
+from insights.style_atlas_read import read_style_atlas
 
 
 logger = structlog.get_logger(__name__)
@@ -547,6 +548,33 @@ async def activity_summary(days: int = Query(ACTIVITY_SUMMARY_DEFAULT_DAYS, ge=1
         for r in rows
     ]
     result = {"days": days, "since": cutoff.isoformat(), "items": items, "count": len(items)}
+    if _cache:
+        await _cache.set(cache_key, result, generation)
+    return JSONResponse(content=result)
+
+
+@app.get("/api/insights/style-atlas")
+async def style_atlas() -> JSONResponse:
+    """Return the latest month's Genre Atlas: sectors, style and ghost nodes, and lifecycles.
+
+    Stages are derived on read from the stored release-year counts. Before the first monthly
+    run the response is empty (no month, no genres or styles), not an error.
+    """
+    if not _pool:
+        return JSONResponse(content={"error": "Service not ready"}, status_code=503)
+
+    cache_key = "insights:style-atlas"
+    # Read the generation BEFORE the DB read — see insights/cache.py.
+    generation = await _cache.generation() if _cache else 0
+    if _cache:
+        cached = await _cache.get(cache_key, generation)
+        if cached is not None:
+            return JSONResponse(content=cached)
+
+    async with _pool.connection() as conn, conn.cursor() as cursor:
+        atlas = await read_style_atlas(cursor)
+
+    result = atlas.model_dump(mode="json")
     if _cache:
         await _cache.set(cache_key, result, generation)
     return JSONResponse(content=result)

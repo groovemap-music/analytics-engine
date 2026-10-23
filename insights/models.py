@@ -1,6 +1,7 @@
 """Pydantic response models for the GrooveMap analytics engine."""
 
 from datetime import date, datetime  # noqa: TC003  # Pydantic resolves these annotations at runtime.
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -132,3 +133,71 @@ class ActivitySummaryItem(BaseModel):
         default=None,
         description="Distinct candidate sets, on policy_id rows only; null on event_type rows.",
     )
+
+
+class AtlasGenre(BaseModel):
+    """One genre's sector on the Genre Atlas ring. Angles are radians; ``sector_end`` may pass 2 pi."""
+
+    genre: str
+    ring_order: int
+    sector_start: float
+    sector_end: float
+    x: float
+    y: float
+
+
+class AtlasParent(BaseModel):
+    """One parent genre of a style, at a share of at least the parent threshold."""
+
+    genre: str
+    share: float
+    dominant: bool
+
+
+class AtlasStyle(BaseModel):
+    """A style's primary node, with its lifecycle derived on read.
+
+    ``stages`` holds one index per year of the response's timeline, into ``rule.stages``.
+    ``stage`` is the stage in the timeline's last year, which is provisional. ``settled_stage`` is
+    the stage in the last year before ``timeline.provisional_from``, or null if that year is before
+    the timeline starts, so the UI can show it next to the provisional latest stage.
+    """
+
+    style: str
+    genre: str = Field(description="The host sector: the style's dominant parent genre.")
+    x: float
+    y: float
+    stage: str
+    settled_stage: str | None
+    emergence_year: int | None = Field(description="The first year with 25 cumulative releases, null if the style has not got there.")
+    stages: list[int]
+    parents: list[AtlasParent]
+
+
+class AtlasGhost(BaseModel):
+    """A ghost copy of a style, drawn in a secondary parent's sector."""
+
+    style: str
+    genre: str = Field(description="The host sector: the secondary parent genre.")
+    x: float
+    y: float
+
+
+class AtlasTimeline(BaseModel):
+    """The years each style's ``stages`` list covers."""
+
+    first_year: int
+    last_year: int
+    provisional_from: int = Field(description="The first provisional year; every year from here to last_year is provisional.")
+
+
+class StyleAtlasResponse(BaseModel):
+    """The latest month's Genre Atlas: geography, nodes, and lifecycles. Empty before the first monthly run."""
+
+    month: date | None
+    computed_at: datetime | None
+    rule: dict[str, Any]
+    timeline: AtlasTimeline | None
+    genres: list[AtlasGenre]
+    styles: list[AtlasStyle]
+    ghosts: list[AtlasGhost]

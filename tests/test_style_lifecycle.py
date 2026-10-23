@@ -73,6 +73,11 @@ class TestTheRule:
         for name in ("emerge_total", "active_share", "establish_years", "revive_ratio", "revive_floor", "window", "provisional_years"):
             assert described[name] == getattr(LIFECYCLE_RULE, name)
 
+    def test_the_rule_version_is_pinned_so_a_threshold_change_is_a_visible_decision(self) -> None:
+        assert LIFECYCLE_RULE.rule_version == "gm-design-4804/1"
+        assert LIFECYCLE_RULE.describe()["rule_version"] == "gm-design-4804/1"
+        assert all(rule.rule_version == "gm-design-4804/1" for _name, rule in LIFECYCLE_RULE.perturbed(1.1))
+
 
 class TestStyleLifecycles:
     def test_emergence_is_the_25_release_year_not_the_first_sighting(self) -> None:

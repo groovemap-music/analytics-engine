@@ -46,8 +46,8 @@ if TYPE_CHECKING:
 ABSENT, EMERGING, ESTABLISHED, DECLINING, REVIVING = range(5)
 STAGES: Final = ("absent", "emerging", "established", "declining", "reviving")
 
-# Fixed parameters, not stage thresholds, so a +-10% sensitivity run leaves them alone.
-_NON_THRESHOLDS: Final = frozenset({"window", "provisional_years"})
+# Fixed parameters and the version label, not stage thresholds, so a +-10% sensitivity run leaves them alone.
+_NON_THRESHOLDS: Final = frozenset({"window", "provisional_years", "rule_version"})
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,9 @@ class LifecycleRule:
     revive_floor: float = 0.25
     window: int = 3
     provisional_years: int = 2
+    # Names the rule and its thresholds, so a later change is visible to clients and caches.
+    # Bump it whenever a default above changes.
+    rule_version: str = "gm-design-4804/1"
 
     def perturbed(self, scale: float) -> list[tuple[str, LifecycleRule]]:
         """One rule per threshold, with that threshold scaled by ``scale``.
@@ -79,7 +82,7 @@ class LifecycleRule:
         return out
 
     def describe(self) -> dict[str, Any]:
-        """The rule as data: the basis, the stage names, and every threshold."""
+        """The rule as data: the basis, the stage names, the version, and every threshold."""
         return {"basis": "release_year", "stages": list(STAGES), **asdict(self)}
 
 
