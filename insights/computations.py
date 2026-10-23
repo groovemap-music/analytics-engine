@@ -267,16 +267,17 @@ def _style_parent_rows(shares: Iterable[dict[str, Any]]) -> list[tuple[str, str,
 
 @_record_lifecycle("style_year_counts", "❌ Style year counts computation failed")
 async def compute_and_store_style_year_counts(client: httpx.AsyncClient, pool: Any) -> int:
-    """Compute per-style release counts by year and each style's parent genres, and store them.
+    """Compute per-style and per-genre release counts by year and each style's parent genres, and store them.
 
-    One producer read feeds both ``insights.style_year_counts`` and ``insights.style_parents``,
-    replaced together in a single transaction so a reader never sees counts from one snapshot
-    beside parents from another.
+    One producer read feeds ``insights.style_year_counts``, ``insights.style_parents`` and
+    ``insights.genre_year_counts``, replaced together in a single transaction so a reader never
+    sees counts from one snapshot beside parents or genre years from another. The genre years
+    date each genre's 25-release emergence, which the atlas read compares with its styles'.
 
-    A producer result missing either half is treated as empty and leaves the previous snapshot
-    intact: with real catalog data every style that has dated releases also has genre
-    co-occurrences, so a lone half is an incomplete read, and writing it would wipe the other
-    table's good rows.
+    A producer result missing any of the three parts is treated as empty and leaves the previous
+    snapshot intact: with real catalog data every style that has dated releases also has genre
+    co-occurrences, and every genre tag implies dated genre releases, so a lone part is an
+    incomplete read, and writing it would wipe the other tables' good rows.
 
     Returns:
         The number of rows written across both tables.
@@ -284,17 +285,20 @@ async def compute_and_store_style_year_counts(client: httpx.AsyncClient, pool: A
     data = await _get_json(client, STYLE_YEAR_COUNTS_PATH)
     style_years: list[dict[str, Any]] = data.get("style_years", [])
     style_parents: list[dict[str, Any]] = data.get("style_parents", [])
-    if not style_years or not style_parents:
-        if style_years or style_parents:
+    genre_years: list[dict[str, Any]] = data.get("genre_years", [])
+    if not style_years or not style_parents or not genre_years:
+        if style_years or style_parents or genre_years:
             logger.warning(
-                "⚠️ Style year counts result is missing one half — keeping the previous snapshot",
+                "⚠️ Style year counts result is missing a part — keeping the previous snapshot",
                 style_years=len(style_years),
                 style_parents=len(style_parents),
+                genre_years=len(genre_years),
             )
         return 0
 
     year_rows = [(row["style"], row["year"], row["release_count"], row["master_count"]) for row in style_years]
     parent_rows = _style_parent_rows(style_parents)
+    genre_year_rows = [(row["genre"], row["year"], row["release_count"]) for row in genre_years]
 
     async with pool.connection() as conn:
         await conn.set_autocommit(False)
@@ -302,12 +306,20 @@ async def compute_and_store_style_year_counts(client: httpx.AsyncClient, pool: A
             cursor = cast("Any", cursor)
             await cursor.execute("DELETE FROM insights.style_year_counts")
             await cursor.execute("DELETE FROM insights.style_parents")
+            await cursor.execute("DELETE FROM insights.genre_year_counts")
             await cursor.executemany(
                 """
                 INSERT INTO insights.style_year_counts (style, year, release_count, master_count)
                 VALUES (%s, %s, %s, %s)
                 """,
                 year_rows,
+            )
+            await cursor.executemany(
+                """
+                INSERT INTO insights.genre_year_counts (genre, year, release_count)
+                VALUES (%s, %s, %s)
+                """,
+                genre_year_rows,
             )
             if parent_rows:
                 await cursor.executemany(
@@ -317,8 +329,8 @@ async def compute_and_store_style_year_counts(client: httpx.AsyncClient, pool: A
                     """,
                     parent_rows,
                 )
-    logger.info("💾 Style year counts stored", style_years=len(year_rows), style_parents=len(parent_rows))
-    return len(year_rows) + len(parent_rows)
+    logger.info("💾 Style year counts stored", style_years=len(year_rows), style_parents=len(parent_rows), genre_years=len(genre_year_rows))
+    return len(year_rows) + len(parent_rows) + len(genre_year_rows)
 
 
 # One writer per month: the lock serialises concurrent runs, and the in-transaction re-check

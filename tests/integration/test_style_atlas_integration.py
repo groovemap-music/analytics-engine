@@ -42,7 +42,9 @@ def _client(body: dict[str, Any]) -> AsyncMock:
 @pytest_asyncio.fixture(autouse=True, loop_scope="session")
 async def _empty_atlas(schema_owner_pool: AsyncPostgreSQLPool) -> None:
     async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
-        await cursor.execute("TRUNCATE insights.genre_atlas_sectors, insights.style_atlas_layout, insights.style_year_counts, insights.style_parents")
+        await cursor.execute(
+            "TRUNCATE insights.genre_atlas_sectors, insights.style_atlas_layout, insights.style_year_counts, insights.style_parents, insights.genre_year_counts"
+        )
 
 
 async def _rows(pool: AsyncPostgreSQLPool, month: date) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
@@ -100,6 +102,13 @@ async def test_the_stored_month_reads_back_as_an_atlas_with_derived_lifecycles(s
     for style in atlas.styles:
         assert len(style.stages) == years
         assert [parent.genre for parent in style.parents if parent.dominant] == [style.genre]
+    genre_emergence = {genre.genre: genre.emergence_year for genre in atlas.genres}
+    assert any(year is not None for year in genre_emergence.values())
+    for style in atlas.styles:
+        for parent in style.parents:
+            genre_year = genre_emergence[parent.genre]
+            assert parent.emergence_edge == (style.emergence_year is not None and genre_year is not None and style.emergence_year > genre_year)
+    assert any(parent.emergence_edge for style in atlas.styles for parent in style.parents)
     hosted = {(ghost.style, ghost.genre) for ghost in atlas.ghosts}
     by_style = {style.style: style for style in atlas.styles}
     assert all(any(parent.genre == genre and not parent.dominant for parent in by_style[name].parents) for name, genre in hosted)

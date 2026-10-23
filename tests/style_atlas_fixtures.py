@@ -74,8 +74,17 @@ class SyntheticMonth:
             for genre, share in sorted(genres.items())
         ]
 
+    def genre_years(self) -> list[dict[str, Any]]:
+        """Each genre's yearly releases: its styles' counts weighted by their share of the genre."""
+        totals: dict[tuple[str, int], float] = {}
+        for style, row in self.counts.items():
+            for genre, share in self.shares.get(style, {}).items():
+                for year, n in zip(self.years, row, strict=True):
+                    totals[genre, year] = totals.get((genre, year), 0.0) + float(n) * share
+        return [{"genre": genre, "year": year, "release_count": int(n)} for (genre, year), n in sorted(totals.items()) if int(n) > 0]
+
     def producer_body(self) -> dict[str, Any]:
-        return {"style_years": self.style_years(), "style_parents": self.style_parents()}
+        return {"style_years": self.style_years(), "style_parents": self.style_parents(), "genre_years": self.genre_years()}
 
 
 def _curve(rng: np.random.Generator, n_years: int) -> np.ndarray:

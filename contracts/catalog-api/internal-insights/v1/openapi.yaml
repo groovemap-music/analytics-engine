@@ -2,7 +2,7 @@
 openapi: 3.1.0
 info:
   title: GrooveMap internal insights API
-  version: 1.2.0
+  version: 1.3.0
   description: Catalog API-owned contract consumed by the analytics engine.
 security:
   - InternalSecret: []
@@ -23,10 +23,11 @@ paths:
     get:
       operationId: style_year_counts
       description: >-
-        Release and master counts per style and release year, and each style's genre
-        co-occurrence shares. Release year, never master year, is the bucket. Shares are
-        raw: no floor is applied, the consumer owns the parent threshold. The read scans
-        every release-style tag, so it runs under a long internal budget.
+        Release and master counts per style and release year, each style's genre
+        co-occurrence shares, and release counts per genre and release year. Release year,
+        never master year, is the bucket; undated releases are left out of the year cells.
+        Shares are raw: no floor is applied, the consumer owns the parent threshold. The read
+        scans every release-style tag, so it runs under a long internal budget.
       x-groovemap-max-processing-seconds: 300
       responses:
         "200": {$ref: "#/components/responses/StyleYearCounts"}
@@ -112,6 +113,18 @@ components:
           type: integer
           minimum: 0
           description: Distinct masters those releases derive from; masterless releases add none.
+      additionalProperties: false
+    GenreYearCount:
+      description: One genre and release year that has at least one dated release.
+      type: object
+      required: [genre, year, release_count]
+      properties:
+        genre: {type: string}
+        year: {type: integer, minimum: 1}
+        release_count:
+          type: integer
+          minimum: 1
+          description: Distinct releases tagged with the genre whose own release year is `year`.
       additionalProperties: false
     StyleParentShare:
       description: A genre that co-occurs with a style, with its raw share of the style's releases.
@@ -223,12 +236,12 @@ components:
         application/json:
           schema: {$ref: "#/components/schemas/CommunityEnrichmentResult"}
     StyleYearCounts:
-      description: Style-by-release-year counts and per-style genre shares.
+      description: Style-by-release-year counts, per-style genre shares and genre-by-release-year counts.
       content:
         application/json:
           schema:
             type: object
-            required: [style_years, style_parents]
+            required: [style_years, style_parents, genre_years]
             properties:
               style_years:
                 type: array
@@ -236,6 +249,9 @@ components:
               style_parents:
                 type: array
                 items: {$ref: "#/components/schemas/StyleParentShare"}
+              genre_years:
+                type: array
+                items: {$ref: "#/components/schemas/GenreYearCount"}
             additionalProperties: false
     RarityScores:
       description: Rarity score data for every release, media-neutral core plus family extensions.
