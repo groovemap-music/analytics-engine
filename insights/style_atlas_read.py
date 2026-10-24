@@ -12,13 +12,16 @@ plane, unpositioned.
 The read is bounded by the catalogue's size, not by the request: one month of sectors and
 nodes, one row per (style, year) and per (genre, year) up to the timeline's last year, one row per
 parent, and at most 25 landmark masters per style.
+
+``insights.style_cotags`` is not part of the atlas payload: the lateral co-tag edges of one style
+are read on demand by :func:`read_style_cotags`, at most 25 rows for the style asked about.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Final, cast
 
-from insights.models import AtlasGenre, AtlasGhost, AtlasMaster, AtlasParent, AtlasStyle, AtlasTimeline, StyleAtlasResponse
+from insights.models import AtlasGenre, AtlasGhost, AtlasMaster, AtlasParent, AtlasStyle, AtlasTimeline, StyleAtlasResponse, StyleCotag
 from insights.style_lifecycle import ABSENT, LIFECYCLE_RULE, STAGES, last_complete_year, style_lifecycles
 
 
@@ -47,6 +50,13 @@ _MASTERS_SQL: Final = """
     WHERE style IN (SELECT style FROM insights.style_atlas_layout WHERE month = %s AND node_kind = 'style')
     ORDER BY style, rank
 """
+_COTAGS_SQL: Final = """
+    SELECT other, release_count, rank
+    FROM insights.style_cotags
+    WHERE style = %s
+    ORDER BY rank
+    LIMIT 25
+"""
 _PARENTS_SQL: Final = """
     SELECT style, genre, share, is_dominant
     FROM insights.style_parents
@@ -68,6 +78,12 @@ def empty_style_atlas() -> StyleAtlasResponse:
     return StyleAtlasResponse(
         month=None, computed_at=None, rule=LIFECYCLE_RULE.describe(), timeline=None, genres=[], styles=[], ghosts=[], masters=[]
     )
+
+
+async def read_style_cotags(cursor: Any, style: str) -> list[StyleCotag]:
+    """The styles that share the most releases with ``style``, by rank; empty for an unknown style."""
+    await cursor.execute(_COTAGS_SQL, (style,))
+    return [StyleCotag(other=other, release_count=release_count, rank=rank) for other, release_count, rank in await cursor.fetchall()]
 
 
 async def read_style_atlas(cursor: Any) -> StyleAtlasResponse:

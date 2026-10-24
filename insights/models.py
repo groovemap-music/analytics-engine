@@ -205,6 +205,14 @@ class AtlasMaster(BaseModel):
     rank: int = Field(description="1 to 25 within the style, by release count descending, then master id.")
 
 
+class StyleCotag(BaseModel):
+    """A style that shares releases with the requested one, ranked 1 to 25 by shared releases."""
+
+    other: str
+    release_count: int = Field(description="Distinct releases tagged with both styles.")
+    rank: int = Field(description="1 to 25 within the style, by release count descending, then name.")
+
+
 class AtlasTimeline(BaseModel):
     """The years each style's ``stages`` list covers."""
 

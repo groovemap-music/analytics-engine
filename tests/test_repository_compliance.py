@@ -108,7 +108,7 @@ def test_actual_checker_rejects_a_schema_pin_that_differs_between_lock_and_stage
     fixture_path = ROOT / path
     original_read = Path.read_text
     original = original_read(fixture_path)
-    expected = "dc8c2c6e2e006ee7a9be7501d572073a558d23c0"
+    expected = "ba047aed60064662b129807c4a730e2102ccfb97"
     assert expected in original
     fixture = original.replace(expected, "4e9720d838c7da8a6bde139c64a69d781c0f67f0")
 

@@ -41,6 +41,9 @@ from insights.telemetry import record_cache_read
 
 logger = structlog.get_logger(__name__)
 
+# A cached response body: an object, or a bare list for the endpoints that return one.
+type CachedValue = dict[str, Any] | list[Any]
+
 # The monotonically increasing cache generation.
 #
 # Deliberately OUTSIDE the "insights:*" namespace: invalidate_all scans and
@@ -89,7 +92,7 @@ class InsightsCache:
             logger.debug("⚠️ Cache generation read failed, using generation 0")
             return 0
 
-    async def get(self, key: str, generation: int) -> dict[str, Any] | None:
+    async def get(self, key: str, generation: int) -> CachedValue | None:
         """Get a cached value from ``generation``. Returns None on miss or Valkey error.
 
         Records ``groovemap.api.cache`` for every read; a Valkey error counts as a miss,
@@ -100,7 +103,7 @@ class InsightsCache:
             if raw is None:
                 record_cache_read(hit=False)
                 return None
-            result: dict[str, Any] = json.loads(raw)
+            result: CachedValue = json.loads(raw)
             record_cache_read(hit=True)
             return result
         except Exception:
@@ -108,7 +111,7 @@ class InsightsCache:
             record_cache_read(hit=False)
             return None
 
-    async def set(self, key: str, value: dict[str, Any], generation: int) -> None:
+    async def set(self, key: str, value: CachedValue, generation: int) -> None:
         """Cache a value in ``generation`` with TTL. Silently fails if Valkey is down.
 
         Writing into a superseded generation is harmless by construction: those

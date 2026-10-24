@@ -82,8 +82,8 @@ class TestComputationStatusEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "statuses" in data
-        assert len(data["statuses"]) == 11
-        assert "style_landmarks" in {status["insight_type"] for status in data["statuses"]}
+        assert len(data["statuses"]) == 12
+        assert {"style_landmarks", "style_cotags"} <= {status["insight_type"] for status in data["statuses"]}
         for status in data["statuses"]:
             assert status["status"] == "never_run"
 
@@ -1124,6 +1124,7 @@ _CACHED_ENDPOINTS = [
     ("/api/insights/release-rarity?limit=10", "insights:release-rarity:10"),
     ("/api/insights/data-completeness", "insights:data-completeness"),
     ("/api/insights/style-atlas", "insights:style-atlas"),
+    ("/api/insights/style-atlas/cotags?style=House", "insights:style-atlas:cotags:House"),
 ]
 
 
