@@ -59,10 +59,10 @@ def test_current_ci_and_existing_release_pass_actual_checker() -> None:
 @pytest.mark.parametrize(
     ("workflow", "old", "replacement"),
     [
-        ("ci.yml", "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26", "833cb464507678c38ab78bd4718ce697399463e9"),
-        ("ci.yml", "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26", "a" * 40),
+        ("ci.yml", "dbf22ed83d486e9484fc8c6385c7c3e5995700e4", "833cb464507678c38ab78bd4718ce697399463e9"),
+        ("ci.yml", "dbf22ed83d486e9484fc8c6385c7c3e5995700e4", "a" * 40),
         ("ci.yml", "groovemap-music/automation/", "foreign/automation/"),
-        ("release.yml", "833cb464507678c38ab78bd4718ce697399463e9", "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26"),
+        ("release.yml", "833cb464507678c38ab78bd4718ce697399463e9", "dbf22ed83d486e9484fc8c6385c7c3e5995700e4"),
         ("release.yml", "833cb464507678c38ab78bd4718ce697399463e9", "a" * 40),
         ("release.yml", "groovemap-music/automation/", "foreign/automation/"),
     ],
