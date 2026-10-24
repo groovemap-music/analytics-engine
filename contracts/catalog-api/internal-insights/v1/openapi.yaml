@@ -2,7 +2,7 @@
 openapi: 3.1.0
 info:
   title: GrooveMap internal insights API
-  version: 1.3.0
+  version: 1.4.0
   description: Catalog API-owned contract consumed by the analytics engine.
 security:
   - InternalSecret: []
@@ -31,6 +31,20 @@ paths:
       x-groovemap-max-processing-seconds: 300
       responses:
         "200": {$ref: "#/components/responses/StyleYearCounts"}
+        "503":
+          description: Neo4j gave up on the read with a retryable error, or is not ready.
+  /api/internal/insights/style-landmarks:
+    get:
+      operationId: style_landmarks
+      description: >-
+        Landmark masters per style: up to 25 masters of each style, ranked by the number of
+        releases that carry the style and derive from the master, ties broken by master id
+        ascending. Releases without a master do not count. The year is the master's own,
+        `null` when it has none. The read ranks every style-master pair, so it runs under a
+        long internal budget.
+      x-groovemap-max-processing-seconds: 300
+      responses:
+        "200": {$ref: "#/components/responses/StyleLandmarks"}
         "503":
           description: Neo4j gave up on the read with a retryable error, or is not ready.
   /api/internal/insights/label-longevity:
@@ -149,6 +163,24 @@ components:
             `release_count / style_release_count`. Shares do not sum to one because releases
             carry several genres. Unfloored.
       additionalProperties: false
+    StyleLandmark:
+      description: One master among the top 25 of a style.
+      type: object
+      required: [style, master_id, title, year, release_count]
+      properties:
+        style: {type: string}
+        master_id: {type: string}
+        title:
+          type: [string, "null"]
+        year:
+          type: [integer, "null"]
+          minimum: 1
+          description: The master's own year; `null` when the master has none.
+        release_count:
+          type: integer
+          minimum: 1
+          description: Distinct releases tagged with the style that derive from the master.
+      additionalProperties: false
     CommunityEnrichmentResult:
       type: object
       required: [enriched, skipped, errors, remaining]
@@ -252,6 +284,20 @@ components:
               genre_years:
                 type: array
                 items: {$ref: "#/components/schemas/GenreYearCount"}
+            additionalProperties: false
+    StyleLandmarks:
+      description: >-
+        Landmark masters, grouped by style and ordered by `release_count` descending, then
+        `master_id`.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [landmarks]
+            properties:
+              landmarks:
+                type: array
+                items: {$ref: "#/components/schemas/StyleLandmark"}
             additionalProperties: false
     RarityScores:
       description: Rarity score data for every release, media-neutral core plus family extensions.
