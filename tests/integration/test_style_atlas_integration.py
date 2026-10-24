@@ -12,10 +12,11 @@ from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
+import psycopg
 import pytest
 import pytest_asyncio
 
-from insights.computations import compute_and_store_style_atlas, compute_and_store_style_year_counts
+from insights.computations import compute_and_store_style_atlas, compute_and_store_style_landmarks, compute_and_store_style_year_counts
 from insights.style_atlas_read import read_style_atlas
 from tests.style_atlas_fixtures import next_month, synthetic_month
 
@@ -43,7 +44,7 @@ def _client(body: dict[str, Any]) -> AsyncMock:
 async def _empty_atlas(schema_owner_pool: AsyncPostgreSQLPool) -> None:
     async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
         await cursor.execute(
-            "TRUNCATE insights.genre_atlas_sectors, insights.style_atlas_layout, insights.style_year_counts, insights.style_parents, insights.genre_year_counts"
+            "TRUNCATE insights.genre_atlas_sectors, insights.style_atlas_layout, insights.style_year_counts, insights.style_parents, insights.genre_year_counts, insights.style_landmark_masters"
         )
 
 
@@ -112,3 +113,106 @@ async def test_the_stored_month_reads_back_as_an_atlas_with_derived_lifecycles(s
     hosted = {(ghost.style, ghost.genre) for ghost in atlas.ghosts}
     by_style = {style.style: style for style in atlas.styles}
     assert all(any(parent.genre == genre and not parent.dominant for parent in by_style[name].parents) for name, genre in hosted)
+
+
+def _landmark(style: str, master_id: str, title: str | None, year: int | None, release_count: int) -> dict[str, Any]:
+    return {"style": style, "master_id": master_id, "title": title, "year": year, "release_count": release_count}
+
+
+async def _landmark_rows(pool: AsyncPostgreSQLPool) -> list[tuple[Any, ...]]:
+    async with pool.connection() as conn, conn.cursor() as cursor:
+        await cursor.execute("SELECT style, master_id, title, year, release_count, rank FROM insights.style_landmark_masters ORDER BY style, rank")
+        return list(await cursor.fetchall())
+
+
+async def test_landmarks_are_ranked_replaced_and_kept_on_an_empty_result(schema_owner_pool: AsyncPostgreSQLPool) -> None:
+    first = {
+        "landmarks": [
+            _landmark("House", "m1", "Strictly Rhythm", 1991, 30),
+            _landmark("House", "m2", None, None, 20),
+            _landmark("Dub", "m9", "King Tubby", 1976, 12),
+        ]
+    }
+
+    written = await compute_and_store_style_landmarks(_client(first), schema_owner_pool)
+
+    assert written == 3
+    assert await _landmark_rows(schema_owner_pool) == [
+        ("Dub", "m9", "King Tubby", 1976, 12, 1),
+        ("House", "m1", "Strictly Rhythm", 1991, 30, 1),
+        ("House", "m2", "", None, 20, 2),
+    ]
+
+    second = {"landmarks": [_landmark("House", "m7", "Acid Tracks", 1987, 99)]}
+    assert await compute_and_store_style_landmarks(_client(second), schema_owner_pool) == 1
+    assert await _landmark_rows(schema_owner_pool) == [("House", "m7", "Acid Tracks", 1987, 99, 1)]
+
+    assert await compute_and_store_style_landmarks(_client({"landmarks": []}), schema_owner_pool) == 0
+    assert await _landmark_rows(schema_owner_pool) == [("House", "m7", "Acid Tracks", 1987, 99, 1)]
+
+
+async def test_a_full_style_of_twenty_five_is_accepted_and_a_longer_one_is_cut_to_the_rank_check(schema_owner_pool: AsyncPostgreSQLPool) -> None:
+    body = {"landmarks": [_landmark("House", f"m{i:02d}", f"Master {i}", 1990, 100 - i) for i in range(27)]}
+
+    written = await compute_and_store_style_landmarks(_client(body), schema_owner_pool)
+
+    rows = await _landmark_rows(schema_owner_pool)
+    assert written == 25
+    assert [row[5] for row in rows] == list(range(1, 26))
+
+
+async def test_a_failed_write_rolls_back_to_the_previous_snapshot(schema_owner_pool: AsyncPostgreSQLPool) -> None:
+    await compute_and_store_style_landmarks(_client({"landmarks": [_landmark("House", "m1", "Keep Me", 1991, 30)]}), schema_owner_pool)
+    duplicate_master = {"landmarks": [_landmark("Dub", "m9", "Twice", 1976, 12), _landmark("Dub", "m9", "Twice", 1976, 12)]}
+
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        await compute_and_store_style_landmarks(_client(duplicate_master), schema_owner_pool)
+
+    assert await _landmark_rows(schema_owner_pool) == [("House", "m1", "Keep Me", 1991, 30, 1)]
+    async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+        await cursor.execute(
+            "SELECT status FROM insights.computation_log WHERE insight_type = 'style_landmarks' ORDER BY started_at DESC, id DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row[0] == "failed"
+
+
+async def test_the_atlas_serves_masters_for_the_styles_in_the_layout_only(schema_owner_pool: AsyncPostgreSQLPool) -> None:
+    month = synthetic_month()
+    client = _client(month.producer_body())
+    await compute_and_store_style_year_counts(client, schema_owner_pool)
+    await compute_and_store_style_atlas(client, schema_owner_pool, now=OCTOBER)
+    async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+        placed = sorted((await read_style_atlas(cursor)).styles, key=lambda style: style.style)
+    first, second = placed[0].style, placed[1].style
+    landmarks = {
+        "landmarks": [
+            _landmark(second, "m3", "Third Title", 2001, 5),
+            _landmark(first, "m2", None, None, 8),
+            _landmark(first, "m1", "First Title", 1999, 9),
+            _landmark("Not In The Layout", "m4", "Elsewhere", 1980, 70),
+        ]
+    }
+    await compute_and_store_style_landmarks(_client(landmarks), schema_owner_pool)
+
+    async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+        atlas = await read_style_atlas(cursor)
+
+    assert [(master.style, master.rank, master.master_id, master.title, master.year, master.release_count) for master in atlas.masters] == [
+        (first, 1, "m2", "", None, 8),
+        (first, 2, "m1", "First Title", 1999, 9),
+        (second, 1, "m3", "Third Title", 2001, 5),
+    ]
+
+
+async def test_an_atlas_with_a_layout_and_no_landmarks_has_no_masters(schema_owner_pool: AsyncPostgreSQLPool) -> None:
+    client = _client(synthetic_month().producer_body())
+    await compute_and_store_style_year_counts(client, schema_owner_pool)
+    await compute_and_store_style_atlas(client, schema_owner_pool, now=OCTOBER)
+
+    async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+        atlas = await read_style_atlas(cursor)
+
+    assert atlas.styles
+    assert atlas.masters == []

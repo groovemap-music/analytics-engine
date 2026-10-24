@@ -190,6 +190,21 @@ class AtlasGhost(BaseModel):
     y: float
 
 
+class AtlasMaster(BaseModel):
+    """A landmark master of a style: one of its top 25 by release count, ranked 1 to 25.
+
+    The atlas places no master; the client positions them. ``title`` is empty when the master has
+    none, and ``year`` is null when it has no year.
+    """
+
+    master_id: str
+    title: str
+    year: int | None
+    style: str
+    release_count: int = Field(description="Distinct releases tagged with the style that derive from the master.")
+    rank: int = Field(description="1 to 25 within the style, by release count descending, then master id.")
+
+
 class AtlasTimeline(BaseModel):
     """The years each style's ``stages`` list covers."""
 
@@ -208,3 +223,4 @@ class StyleAtlasResponse(BaseModel):
     genres: list[AtlasGenre]
     styles: list[AtlasStyle]
     ghosts: list[AtlasGhost]
+    masters: list[AtlasMaster] = Field(description="Landmark masters of the styles in the layout, by style then rank. No positions.")

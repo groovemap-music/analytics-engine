@@ -6,17 +6,19 @@ and ``insights.style_parents`` the parents. Lifecycle stages are not stored (see
 with the same module and rule that dated each style's emergence when the layout was built.
 Each genre's emergence year is dated from ``insights.genre_year_counts`` with that same rule, and
 a style's emergence edge to a parent is drawn when the style emerged in a later year.
+``insights.style_landmark_masters`` supplies each placed style's landmark masters for the master
+plane, unpositioned.
 
 The read is bounded by the catalogue's size, not by the request: one month of sectors and
-nodes, one row per (style, year) and per (genre, year) up to the timeline's last year, and one row per
-parent.
+nodes, one row per (style, year) and per (genre, year) up to the timeline's last year, one row per
+parent, and at most 25 landmark masters per style.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Final, cast
 
-from insights.models import AtlasGenre, AtlasGhost, AtlasParent, AtlasStyle, AtlasTimeline, StyleAtlasResponse
+from insights.models import AtlasGenre, AtlasGhost, AtlasMaster, AtlasParent, AtlasStyle, AtlasTimeline, StyleAtlasResponse
 from insights.style_lifecycle import ABSENT, LIFECYCLE_RULE, STAGES, last_complete_year, style_lifecycles
 
 
@@ -39,6 +41,12 @@ _NODES_SQL: Final = """
 """
 _YEAR_COUNTS_SQL: Final = "SELECT style, year, release_count FROM insights.style_year_counts WHERE year <= %s"
 _GENRE_YEAR_COUNTS_SQL: Final = "SELECT genre, year, release_count FROM insights.genre_year_counts WHERE year <= %s"
+_MASTERS_SQL: Final = """
+    SELECT master_id, title, year, style, release_count, rank
+    FROM insights.style_landmark_masters
+    WHERE style IN (SELECT style FROM insights.style_atlas_layout WHERE month = %s AND node_kind = 'style')
+    ORDER BY style, rank
+"""
 _PARENTS_SQL: Final = """
     SELECT style, genre, share, is_dominant
     FROM insights.style_parents
@@ -57,7 +65,9 @@ def _emerges_after(style_year: int | None, genre_year: int | None) -> bool:
 
 def empty_style_atlas() -> StyleAtlasResponse:
     """The response before the first monthly run: no month, no geography, and the rule still shown."""
-    return StyleAtlasResponse(month=None, computed_at=None, rule=LIFECYCLE_RULE.describe(), timeline=None, genres=[], styles=[], ghosts=[])
+    return StyleAtlasResponse(
+        month=None, computed_at=None, rule=LIFECYCLE_RULE.describe(), timeline=None, genres=[], styles=[], ghosts=[], masters=[]
+    )
 
 
 async def read_style_atlas(cursor: Any) -> StyleAtlasResponse:
@@ -87,6 +97,12 @@ async def read_style_atlas(cursor: Any) -> StyleAtlasResponse:
         parents.setdefault(style, []).append(
             AtlasParent(genre=genre, share=share, dominant=dominant, emergence_edge=_emerges_after(emergence.get(style), genre_emergence.get(genre)))
         )
+
+    await cursor.execute(_MASTERS_SQL, (month,))
+    masters = [
+        AtlasMaster(master_id=master_id, title=title, year=year, style=style, release_count=release_count, rank=rank)
+        for master_id, title, year, style, release_count, rank in await cursor.fetchall()
+    ]
 
     row_of = {style: i for i, style in enumerate(lifecycles.styles)}
     n_years = len(lifecycles.years)
@@ -129,4 +145,5 @@ async def read_style_atlas(cursor: Any) -> StyleAtlasResponse:
         ],
         styles=styles,
         ghosts=ghosts,
+        masters=masters,
     )

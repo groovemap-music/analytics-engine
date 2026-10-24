@@ -45,9 +45,18 @@ YEAR_COUNTS = [("Ambient", year, 10) for year in range(1988, LAST_YEAR + 1)] + [
 GENRE_YEAR_COUNTS = [("Electronic", year, 30) for year in range(1980, LAST_YEAR + 1)] + [("Rock", 1989, 10), ("Rock", 1990, 15), ("Rock", 1991, 40)]
 
 
+# Ambient's masters are ranked 1 and 2 and one has no title or year; Shoegaze has one.
+MASTERS = [
+    ("m100", "Selected Ambient Works", 1992, "Ambient", 120, 1),
+    ("m200", "", None, "Ambient", 80, 2),
+    ("m300", "Loveless", 1991, "Shoegaze", 45, 1),
+]
+
+
 def _answer(
     *,
     month: date | None = MONTH,
+    masters: list[tuple[Any, ...]] | None = None,
     year_counts: list[tuple[str, int, int]] | None = None,
     genre_year_counts: list[tuple[str, int, int]] | None = None,
 ) -> Callable[[str], list[tuple[Any, ...]]]:
@@ -56,6 +65,8 @@ def _answer(
     def rows(sql: str) -> list[tuple[Any, ...]]:
         if "max(month)" in sql:
             return [(month,)]
+        if "style_landmark_masters" in sql:
+            return MASTERS if masters is None else masters
         if "genre_atlas_sectors" in sql:
             return SECTORS
         if "genre_year_counts" in sql:
@@ -109,6 +120,14 @@ class TestPayload:
 
     def test_ghosts_are_separate_copies_in_the_secondary_parents_sector(self, body: dict[str, Any]) -> None:
         assert body["ghosts"] == [{"style": "Ambient", "genre": "Rock", "x": -0.5, "y": -0.3}]
+
+    def test_masters_carry_their_style_rank_and_counts_with_no_positions(self, body: dict[str, Any]) -> None:
+        assert body["masters"] == [
+            {"master_id": "m100", "title": "Selected Ambient Works", "year": 1992, "style": "Ambient", "release_count": 120, "rank": 1},
+            {"master_id": "m200", "title": "", "year": None, "style": "Ambient", "release_count": 80, "rank": 2},
+            {"master_id": "m300", "title": "Loveless", "year": 1991, "style": "Shoegaze", "release_count": 45, "rank": 1},
+        ]
+        assert all({"x", "y"}.isdisjoint(master) for master in body["masters"])
 
     def test_parents_have_shares_the_dominant_flag_and_the_emergence_edge(self, body: dict[str, Any]) -> None:
         ambient = next(style for style in body["styles"] if style["style"] == "Ambient")
@@ -185,7 +204,33 @@ class TestPayload:
         assert shoegaze["emergence_year"] is None
         assert set(shoegaze["stages"]) == {0}
 
-    def test_the_read_is_six_queries_scoped_to_the_latest_month_and_the_last_complete_year(
+    def test_the_masters_query_is_scoped_to_the_styles_in_the_latest_layout_and_ordered_by_rank(
+        self, test_client: TestClient, mock_pg_pool: MagicMock
+    ) -> None:
+        cursor = _seed(mock_pg_pool, _answer())
+
+        test_client.get("/api/insights/style-atlas")
+
+        calls = [(call.args[0], call.args[1:]) for call in cursor.execute.call_args_list if "style_landmark_masters" in call.args[0]]
+        assert len(calls) == 1
+        sql, params = calls[0]
+        assert params == ((MONTH,),)
+        assert "style_atlas_layout" in sql
+        assert "node_kind = 'style'" in sql
+        assert "ORDER BY style, rank" in sql
+
+    def test_a_layout_with_no_stored_landmarks_has_no_masters_and_is_otherwise_unchanged(
+        self, test_client: TestClient, mock_pg_pool: MagicMock
+    ) -> None:
+        _seed(mock_pg_pool, _answer(masters=[]))
+
+        body = test_client.get("/api/insights/style-atlas").json()
+
+        assert body["masters"] == []
+        assert sorted(style["style"] for style in body["styles"]) == ["Ambient", "Shoegaze"]
+        assert body["month"] == "2026-10-01"
+
+    def test_the_read_is_seven_queries_scoped_to_the_latest_month_and_the_last_complete_year(
         self, test_client: TestClient, mock_pg_pool: MagicMock
     ) -> None:
         cursor = _seed(mock_pg_pool, _answer())
@@ -193,13 +238,14 @@ class TestPayload:
         test_client.get("/api/insights/style-atlas")
 
         calls = [(call.args[0], call.args[1] if len(call.args) > 1 else None) for call in cursor.execute.call_args_list]
-        assert len(calls) == 6
+        assert len(calls) == 7
         scoped = {
             "genre_atlas_sectors": (MONTH,),
             "style_atlas_layout": (MONTH,),
             "style_year_counts": (LAST_YEAR,),
             "genre_year_counts": (LAST_YEAR,),
             "style_parents": (MONTH,),
+            "style_landmark_masters": (MONTH,),
         }
         for table, params in scoped.items():
             matching = [args for sql, args in calls if f"insights.{table}" in sql and "max(month)" not in sql]
@@ -280,6 +326,7 @@ class TestEmptyDatabase:
             "genres": [],
             "styles": [],
             "ghosts": [],
+            "masters": [],
         }
         assert cursor.execute.await_count == 1
 
