@@ -48,7 +48,7 @@ from insights.models import (
     LabelLongevityItem,
     ReleaseRarity,
 )
-from insights.style_atlas_read import read_style_atlas
+from insights.style_atlas_read import read_style_atlas, read_style_cotags
 
 
 logger = structlog.get_logger(__name__)
@@ -580,6 +580,34 @@ async def style_atlas() -> JSONResponse:
     return JSONResponse(content=result)
 
 
+@app.get("/api/insights/style-atlas/cotags")
+async def style_atlas_cotags(style: str = Query(...)) -> JSONResponse:
+    """Return the styles that most often share releases with ``style``, ranked 1 to 25.
+
+    A style with no stored co-tags, including an unknown one, gets an empty list rather than
+    an error. The catalog API's proxy forwards to this path.
+    """
+    if not _pool:
+        return JSONResponse(content={"error": "Service not ready"}, status_code=503)
+
+    # See genre_trends: interior colons in `style` are harmless in the cache key.
+    cache_key = f"insights:style-atlas:cotags:{style}"
+    # Read the generation BEFORE the DB read — see insights/cache.py.
+    generation = await _cache.generation() if _cache else 0
+    if _cache:
+        cached = await _cache.get(cache_key, generation)
+        if cached is not None:
+            return JSONResponse(content=cached)
+
+    async with _pool.connection() as conn, conn.cursor() as cursor:
+        cotags = await read_style_cotags(cursor, style)
+
+    result = [cotag.model_dump(mode="json") for cotag in cotags]
+    if _cache:
+        await _cache.set(cache_key, result, generation)
+    return JSONResponse(content=result)
+
+
 @app.get("/api/insights/status")
 async def computation_status() -> JSONResponse:
     """Return the latest computation status for each insight type."""
@@ -592,6 +620,7 @@ async def computation_status() -> JSONResponse:
         "style_year_counts",
         "style_atlas",
         "style_landmarks",
+        "style_cotags",
         "label_longevity",
         "anniversaries",
         "data_completeness",

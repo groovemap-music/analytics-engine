@@ -23,6 +23,8 @@ from insights.catalog_api_contract import (
     GENRE_TRENDS_PATH,
     LABEL_LONGEVITY_PATH,
     RARITY_SCORES_PATH,
+    STYLE_COTAGS_MAX_PROCESSING_SECONDS,
+    STYLE_COTAGS_PATH,
     STYLE_LANDMARKS_MAX_PROCESSING_SECONDS,
     STYLE_LANDMARKS_PATH,
     STYLE_YEAR_COUNTS_MAX_PROCESSING_SECONDS,
@@ -67,6 +69,8 @@ P = ParamSpec("P")
 #                         (a scan of every release-style tag)
 #   style-landmarks       API-published bounded processing time x 3      900s
 #                         (ranks every style-master pair)
+#   style-cotags          API-published bounded processing time x 3      900s
+#                         (counts every style-style pair)
 #   everything else       full-graph Neo4j aggregations                  900s
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _WRITE_TIMEOUT_SECONDS = 30.0
@@ -82,12 +86,16 @@ STYLE_LANDMARK_MAX_RANK: Final = 25
 # stands for "no title" rather than display copy, so the UI chooses how to word its absence.
 STYLE_LANDMARK_MISSING_TITLE: Final = ""
 
+# The same cap for insights.style_cotags.
+STYLE_COTAG_MAX_RANK: Final = 25
+
 ENDPOINT_READ_TIMEOUTS: dict[str, float] = {
     DATA_COMPLETENESS_PATH: 1800.0,
     RARITY_SCORES_PATH: 1800.0,
     COMMUNITY_ENRICHMENT_PATH: COMMUNITY_ENRICHMENT_MAX_PROCESSING_SECONDS * 1.2,
     STYLE_YEAR_COUNTS_PATH: STYLE_YEAR_COUNTS_MAX_PROCESSING_SECONDS * 3.0,
     STYLE_LANDMARKS_PATH: STYLE_LANDMARKS_MAX_PROCESSING_SECONDS * 3.0,
+    STYLE_COTAGS_PATH: STYLE_COTAGS_MAX_PROCESSING_SECONDS * 3.0,
 }
 
 
@@ -515,6 +523,62 @@ async def compute_and_store_style_landmarks(client: httpx.AsyncClient, pool: Any
     return len(rows)
 
 
+def _style_cotag_rows(cotags: Iterable[dict[str, Any]]) -> list[tuple[str, str, int, int]]:
+    """Rank the producer's co-tag pairs 1 to 25 within each style, in the producer's order.
+
+    The producer returns each style's co-tags by shared release count descending, then name, so
+    the rank is the position within the style. Each pair appears under both of its styles and the
+    producer never pairs a style with itself, which the table's ``style <> other`` CHECK also
+    enforces: a violation fails the computation and keeps the previous snapshot. A style over the
+    cap, which the contract rules out, keeps its first 25 so the rank CHECK holds.
+    """
+    by_style: dict[str, list[dict[str, Any]]] = {}
+    for row in cotags:
+        by_style.setdefault(row["style"], []).append(row)
+
+    rows: list[tuple[str, str, int, int]] = []
+    for style, others in by_style.items():
+        if len(others) > STYLE_COTAG_MAX_RANK:
+            logger.warning("⚠️ Style co-tags over the per-style cap — keeping the first 25", style=style, cotags=len(others))
+        rows.extend((style, row["other"], row["release_count"], rank) for rank, row in enumerate(others[:STYLE_COTAG_MAX_RANK], 1))
+    return rows
+
+
+@_record_lifecycle("style_cotags", "❌ Style co-tags computation failed")
+async def compute_and_store_style_cotags(client: httpx.AsyncClient, pool: Any) -> int:
+    """Fetch each style's top co-tags and replace ``insights.style_cotags`` with them.
+
+    The delete and the inserts share one transaction, so a reader never sees a half-replaced
+    table. An empty producer result keeps the previous snapshot: the catalogue always has
+    releases that carry several styles, so nothing at all means an incomplete read, and writing
+    it would wipe the last good rows.
+
+    Returns:
+        The number of rows written, 0 when the previous snapshot is kept.
+    """
+    data = await _get_json(client, STYLE_COTAGS_PATH)
+    cotags: list[dict[str, Any]] = data.get("cotags", [])
+    if not cotags:
+        logger.info("📊 No style co-tags returned — keeping the previous snapshot")
+        return 0
+
+    rows = _style_cotag_rows(cotags)
+    async with pool.connection() as conn:
+        await conn.set_autocommit(False)
+        async with conn.transaction(), conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute("DELETE FROM insights.style_cotags")
+            await cursor.executemany(
+                """
+                INSERT INTO insights.style_cotags (style, other, release_count, rank)
+                VALUES (%s, %s, %s, %s)
+                """,
+                rows,
+            )
+    logger.info("💾 Style co-tags stored", count=len(rows), styles=len({row[0] for row in rows}))
+    return len(rows)
+
+
 @_record_lifecycle("label_longevity", "❌ Label longevity computation failed")
 async def compute_and_store_label_longevity(client: httpx.AsyncClient, pool: Any, limit: int = 50) -> int:
     """Compute label longevity and store results."""
@@ -876,6 +940,7 @@ async def run_all_computations(
         ("style_year_counts", lambda: compute_and_store_style_year_counts(client, pool)),
         ("style_atlas", lambda: compute_and_store_style_atlas(client, pool)),
         ("style_landmarks", lambda: compute_and_store_style_landmarks(client, pool)),
+        ("style_cotags", lambda: compute_and_store_style_cotags(client, pool)),
         ("label_longevity", lambda: compute_and_store_label_longevity(client, pool)),
         (
             "anniversaries",
