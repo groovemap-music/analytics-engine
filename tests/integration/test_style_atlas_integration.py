@@ -16,8 +16,13 @@ import psycopg
 import pytest
 import pytest_asyncio
 
-from insights.computations import compute_and_store_style_atlas, compute_and_store_style_landmarks, compute_and_store_style_year_counts
-from insights.style_atlas_read import read_style_atlas
+from insights.computations import (
+    compute_and_store_style_atlas,
+    compute_and_store_style_cotags,
+    compute_and_store_style_landmarks,
+    compute_and_store_style_year_counts,
+)
+from insights.style_atlas_read import read_style_atlas, read_style_cotags
 from tests.style_atlas_fixtures import next_month, synthetic_month
 
 
@@ -44,7 +49,7 @@ def _client(body: dict[str, Any]) -> AsyncMock:
 async def _empty_atlas(schema_owner_pool: AsyncPostgreSQLPool) -> None:
     async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
         await cursor.execute(
-            "TRUNCATE insights.genre_atlas_sectors, insights.style_atlas_layout, insights.style_year_counts, insights.style_parents, insights.genre_year_counts, insights.style_landmark_masters"
+            "TRUNCATE insights.genre_atlas_sectors, insights.style_atlas_layout, insights.style_year_counts, insights.style_parents, insights.genre_year_counts, insights.style_landmark_masters, insights.style_cotags"
         )
 
 
@@ -216,3 +221,86 @@ async def test_an_atlas_with_a_layout_and_no_landmarks_has_no_masters(schema_own
 
     assert atlas.styles
     assert atlas.masters == []
+
+
+def _cotag(style: str, other: str, release_count: int) -> dict[str, Any]:
+    return {"style": style, "other": other, "release_count": release_count}
+
+
+async def _cotag_rows(pool: AsyncPostgreSQLPool) -> list[tuple[Any, ...]]:
+    async with pool.connection() as conn, conn.cursor() as cursor:
+        await cursor.execute("SELECT style, other, release_count, rank FROM insights.style_cotags ORDER BY style, rank")
+        return list(await cursor.fetchall())
+
+
+async def test_cotags_are_ranked_replaced_and_kept_on_an_empty_result(schema_owner_pool: AsyncPostgreSQLPool) -> None:
+    first = {
+        "cotags": [
+            _cotag("House", "Techno", 30),
+            _cotag("House", "Disco", 20),
+            _cotag("Techno", "House", 30),
+        ]
+    }
+
+    written = await compute_and_store_style_cotags(_client(first), schema_owner_pool)
+
+    assert written == 3
+    assert await _cotag_rows(schema_owner_pool) == [
+        ("House", "Techno", 30, 1),
+        ("House", "Disco", 20, 2),
+        ("Techno", "House", 30, 1),
+    ]
+
+    second = {"cotags": [_cotag("House", "Garage", 99), _cotag("Garage", "House", 99)]}
+    assert await compute_and_store_style_cotags(_client(second), schema_owner_pool) == 2
+    assert await _cotag_rows(schema_owner_pool) == [("Garage", "House", 99, 1), ("House", "Garage", 99, 1)]
+
+    assert await compute_and_store_style_cotags(_client({"cotags": []}), schema_owner_pool) == 0
+    assert await _cotag_rows(schema_owner_pool) == [("Garage", "House", 99, 1), ("House", "Garage", 99, 1)]
+
+
+async def test_a_full_style_of_twenty_five_is_accepted_and_a_longer_one_is_cut_to_the_rank_check_for_cotags(
+    schema_owner_pool: AsyncPostgreSQLPool,
+) -> None:
+    body = {"cotags": [_cotag("House", f"Other {i:02d}", 100 - i) for i in range(27)]}
+
+    written = await compute_and_store_style_cotags(_client(body), schema_owner_pool)
+
+    rows = await _cotag_rows(schema_owner_pool)
+    assert written == 25
+    assert [row[3] for row in rows] == list(range(1, 26))
+
+
+async def test_a_failed_cotag_write_rolls_back_to_the_previous_snapshot(schema_owner_pool: AsyncPostgreSQLPool) -> None:
+    await compute_and_store_style_cotags(_client({"cotags": [_cotag("House", "Techno", 30)]}), schema_owner_pool)
+    self_pair = {"cotags": [_cotag("Dub", "Reggae", 12), _cotag("Dub", "Dub", 12)]}
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        await compute_and_store_style_cotags(_client(self_pair), schema_owner_pool)
+
+    assert await _cotag_rows(schema_owner_pool) == [("House", "Techno", 30, 1)]
+    async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+        await cursor.execute(
+            "SELECT status FROM insights.computation_log WHERE insight_type = 'style_cotags' ORDER BY started_at DESC, id DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row[0] == "failed"
+
+
+async def test_the_cotag_read_serves_one_style_in_rank_order_and_an_unknown_style_is_empty(schema_owner_pool: AsyncPostgreSQLPool) -> None:
+    body = {
+        "cotags": [
+            _cotag("House", "Techno", 30),
+            _cotag("House", "Disco", 20),
+            _cotag("Techno", "House", 30),
+        ]
+    }
+    await compute_and_store_style_cotags(_client(body), schema_owner_pool)
+
+    async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+        house = await read_style_cotags(cursor, "House")
+        unknown = await read_style_cotags(cursor, "No Such Style")
+
+    assert [(cotag.other, cotag.release_count, cotag.rank) for cotag in house] == [("Techno", 30, 1), ("Disco", 20, 2)]
+    assert unknown == []
