@@ -555,7 +555,7 @@ async def activity_summary(days: int = Query(ACTIVITY_SUMMARY_DEFAULT_DAYS, ge=1
 
 @app.get("/api/insights/style-atlas")
 async def style_atlas() -> JSONResponse:
-    """Return the latest month's Genre Atlas: sectors, style and ghost nodes, and lifecycles.
+    """Return the latest month's Genre Atlas: sectors, style and ghost nodes, lifecycles, and landmark masters.
 
     Stages are derived on read from the stored release-year counts. Before the first monthly
     run the response is empty (no month, no genres or styles), not an error.
@@ -591,6 +591,7 @@ async def computation_status() -> JSONResponse:
         "genre_trends",
         "style_year_counts",
         "style_atlas",
+        "style_landmarks",
         "label_longevity",
         "anniversaries",
         "data_completeness",
