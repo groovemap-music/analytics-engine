@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
 CI_AUTOMATION_REVISION = "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26"
 PYTHON_LIBRARIES_REVISION = "771515349b592ff569b1b3e5712f7bef936bab58"
-DATABASE_SCHEMA_REVISION = "dc8c2c6e2e006ee7a9be7501d572073a558d23c0"
+DATABASE_SCHEMA_REVISION = "ba047aed60064662b129807c4a730e2102ccfb97"
 GIT = shutil.which("git")
 if GIT is None:
     raise RuntimeError("git is required to establish the tracked first-party source boundary")
