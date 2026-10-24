@@ -2,7 +2,7 @@
 openapi: 3.1.0
 info:
   title: GrooveMap internal insights API
-  version: 1.4.0
+  version: 1.5.0
   description: Catalog API-owned contract consumed by the analytics engine.
 security:
   - InternalSecret: []
@@ -45,6 +45,20 @@ paths:
       x-groovemap-max-processing-seconds: 300
       responses:
         "200": {$ref: "#/components/responses/StyleLandmarks"}
+        "503":
+          description: Neo4j gave up on the read with a retryable error, or is not ready.
+  /api/internal/insights/style-cotags:
+    get:
+      operationId: style_cotags
+      description: >-
+        Co-tagged styles per style: up to 25 other styles for each style, ranked by the number
+        of releases tagged with both, ties broken by the other style's name ascending. A style
+        is never paired with itself. Each pair appears under both of its styles, with the same
+        count. The read counts every release's style pairs, so it runs under a long internal
+        budget.
+      x-groovemap-max-processing-seconds: 300
+      responses:
+        "200": {$ref: "#/components/responses/StyleCotags"}
         "503":
           description: Neo4j gave up on the read with a retryable error, or is not ready.
   /api/internal/insights/label-longevity:
@@ -181,6 +195,20 @@ components:
           minimum: 1
           description: Distinct releases tagged with the style that derive from the master.
       additionalProperties: false
+    StyleCotag:
+      description: One style among the top 25 co-tagged with a style.
+      type: object
+      required: [style, other, release_count]
+      properties:
+        style: {type: string}
+        other:
+          type: string
+          description: The co-tagged style; never equal to `style`.
+        release_count:
+          type: integer
+          minimum: 1
+          description: Distinct releases tagged with both `style` and `other`.
+      additionalProperties: false
     CommunityEnrichmentResult:
       type: object
       required: [enriched, skipped, errors, remaining]
@@ -298,6 +326,20 @@ components:
               landmarks:
                 type: array
                 items: {$ref: "#/components/schemas/StyleLandmark"}
+            additionalProperties: false
+    StyleCotags:
+      description: >-
+        Co-tagged styles, grouped by style and ordered by `release_count` descending, then
+        `other`.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [cotags]
+            properties:
+              cotags:
+                type: array
+                items: {$ref: "#/components/schemas/StyleCotag"}
             additionalProperties: false
     RarityScores:
       description: Rarity score data for every release, media-neutral core plus family extensions.
