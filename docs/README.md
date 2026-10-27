@@ -10,5 +10,7 @@ This directory documents the responsibilities and operating contract of the `ana
 - [Extraction provenance](extraction.md) — what moved from the monolith and which repositories own adjacent responsibilities.
 - [Embedding quality](embedding_quality.md) — shipped FastRP similar-artist recall on the chw.2 proxy benchmark, vs. the design spike and the production heuristic.
 - [Edges-v3 weight sweep](embedding_weight_sweep.md) — edges-v3 re-embedding, the step-0 weight sweep (w0 ∈ {0, 0.1, 0.25}), recall/churn/quality per weight, the winner's full-run ANN churn, and the memory/host-pressure fixes this bead needed.
+- [FastRP self term and serving-mode verdict](embedding_tie_break.md) — the `self_weight = 0.05` tie-break re-embedding, its recall/churn/duplicate-vector results, and the maintainer's D serving-mode decision.
+- [Exact similar-artist lists](similar_artists.md) — the monthly exact top-K batch, its spool and checkpoint, publication and retirement, and its sizing.
 
 The complete HTTP request and response schema consumed from `catalog-api` is the promoted [OpenAPI contract](../contracts/catalog-api/internal-insights/v1/openapi.yaml). Its [provenance record](../contracts/catalog-api/internal-insights/v1/source.json) pins the producer revision and file digests. Historical implementation plans are preserved in the private organization planning archive rather than published as current product documentation.
