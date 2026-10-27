@@ -102,6 +102,10 @@ The summary filters on the `product_analytics` purpose. Counting what happened i
 
 `insights.activity_summary` is declared in `database-schema` like every other `insights.*` table; this repository holds no DDL. `tests/test_activity_summary.py` carries the table definition as the filed follow-on and fails if a `CREATE TABLE` is introduced here instead.
 
+## Monthly embedding pipeline
+
+A second, one-shot entry point, `analytics-engine-embeddings` (`insights.embedding_pipeline:main`), is not part of the scheduler above. The deployment layer runs it once per catalog dump. It reads the `graph` relations from PostgreSQL directly rather than through `catalog-api`, authenticates as the narrower `embedding_pipeline` role, and writes FastRP artist vectors to `public.artist_embeddings`; with `ENABLE_SIMILAR_ARTISTS=true` it then computes and publishes exact similar-artist lists. See [FastRP artist embeddings](embeddings.md), [exact similar-artist lists](similar_artists.md), and [its configuration](operations.md#the-embedding-pipeline-analytics-engine-embeddings).
+
 ## Cache consistency
 
 Valkey is a cache-aside optimization, not the source of truth. Every cached key belongs to a monotonically increasing generation. A request captures the current generation before reading PostgreSQL and writes only to that generation. After `run_all_computations` returns—even when it isolated one or more per-computation failures—the scheduler advances the generation and reclaims superseded generation keys. A request that straddles a recomputation therefore cannot make stale data visible in the new generation.

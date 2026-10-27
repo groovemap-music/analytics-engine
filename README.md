@@ -25,6 +25,8 @@ The stable repository interface is:
 - `just test` — run the isolated test suite with coverage.
 - `just coverage` — produce the same test coverage report used by CI.
 - `just contract-check` — verify the promoted `catalog-api` contract and generated binding.
+- `just test-integration-pg18` — run the similar-artist and style-atlas integration tier against a disposable PostgreSQL 18 container.
+- `just test-integration-pg19` — run the whole integration suite, including the embedding pipeline's, against the advisory PostgreSQL 19 beta + pgvector image.
 - `just secret-scan` — scan Git history and the working tree with Gitleaks.
 - `just build` — create wheel and source distributions.
 - `just image` — build and inspect the non-root production image.
@@ -39,7 +41,7 @@ Run locally after setup:
 uv run analytics-engine
 ```
 
-Required configuration includes `POSTGRES_HOST`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DATABASE`. Username, password, Valkey password, and the internal API secret support the shared `_FILE` secret convention. The complete runtime and telemetry variable table, including defaults and validation behavior, is in [the operations guide](docs/operations.md#configuration). Supply real secrets through the deployment layer; never commit them here.
+Required configuration includes `POSTGRES_HOST`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DATABASE`. Valkey is configured with `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD`, and `VALKEY_PASSWORD_FILE`; an explicitly empty password is honored, and an unreadable password file fails closed. Username, password, Valkey password, and the internal API secret support the shared `_FILE` secret convention. The complete runtime and telemetry variable table, including defaults and validation behavior, is in [the operations guide](docs/operations.md#configuration). Supply real secrets through the deployment layer; never commit them here.
 
 OpenTelemetry metrics and traces export to a collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Alongside the HTTP, database, and computation metrics, the service reports the process view and its event-loop lag, and opens one `insights {computation}` root span per scheduled computation so a slow insight is attributable to the calls it made. See [docs/operations.md](docs/operations.md#telemetry) for the full variable list, the metrics, and the spans this service emits. Each signal can be turned off on its own, and with no endpoint configured telemetry is a no-op and the service behaves exactly as it does today.
 
@@ -60,5 +62,3 @@ public source.
 The project is independently versioned from PEP 621 metadata with Commitizen and approved `v$version` annotated tags. Migration and release-readiness verification are deliberately non-publishing; the hosted workflow only responds to an explicitly created version tag.
 
 See the [documentation index](docs/README.md) for architecture, operations, extraction provenance, and release-compliance guidance.
-
-Use `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD` and `VALKEY_PASSWORD_FILE`. An explicitly empty password is honored; password `_FILE` takes precedence and unreadable files fail closed. Cache key strings remain unchanged.
