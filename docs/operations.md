@@ -45,7 +45,7 @@ Secrets must be delivered by the deployment layer. Do not place credentials in r
 
 ### The embedding pipeline (`analytics-engine-embeddings`)
 
-A separate, one-shot entry point (`insights.embedding_pipeline:main`), not the FastAPI process above — see docs/embeddings.md, "The monthly load pipeline", for the full design. It shares `POSTGRES_HOST`/`POSTGRES_PORT`/`POSTGRES_DATABASE` above but authenticates with its own, narrower credentials.
+A separate, one-shot entry point (`insights.embedding_pipeline:main`), not the FastAPI process above — see [The monthly load pipeline](embeddings.md#the-monthly-load-pipeline) for the full design. It shares `POSTGRES_HOST`/`POSTGRES_PORT`/`POSTGRES_DATABASE` above but authenticates with its own, narrower credentials.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
@@ -54,7 +54,7 @@ A separate, one-shot entry point (`insights.embedding_pipeline:main`), not the F
 | `SOURCE_DUMP_ID` | yes | The current dump's identifier, recorded as `artist_embeddings.source_dump_id` lineage and as this run's idempotency key alongside the FastRP `model_version` |
 | `SOURCE_DUMP_DATE` | yes | The current dump's date (`YYYY-MM-DD`), recorded as `artist_embeddings.source_dump_date` |
 | `ENABLE_SIMILAR_ARTISTS` | no | Default `false`; only exact `true` opts into exact-list computation, COPY, publication and rotation. Absent or `false` runs the embedding load alone; other values fail closed. The FastRP self-weight is 0.05 either way (`PRODUCTION_FASTRP_CONFIG`). Keep production disabled until the unchanged six-hour admission and real stored recall/Jaccard/publication acceptance pass. |
-| `SIMILAR_ARTISTS_SPOOL_DIR` | no | Does not enable the stage. Local scratch for the exact top-K similar-artist spool and its checkpoint (default `/tmp/analytics-engine-similar-artists`). Needs about 7.5 GB free for the full catalog at K=50; must survive a restart for a stopped run to resume. See docs/similar_artists.md |
+| `SIMILAR_ARTISTS_SPOOL_DIR` | no | Does not enable the stage. Local scratch for the exact top-K similar-artist spool and its checkpoint (default `/tmp/analytics-engine-similar-artists`). Needs about 7.5 GB free for the full catalog at K=50; must survive a restart for a stopped run to resume. See [similar_artists.md](similar_artists.md) |
 
 ## Telemetry
 
@@ -123,6 +123,8 @@ stateDiagram-v2
     WaitingAfterFatalError --> Stopping: shutdown requested
     Stopping --> [*]: scheduler cancelled and clients closed
 ```
+
+The 30-second first-run delay is fixed in the scheduler (`asyncio.sleep(30)` in `insights/insights.py`) and is not configurable. The interval between later cycles is set by `INSIGHTS_SCHEDULE_HOURS`.
 
 `ReadyWithCache` and `ReadyWithoutCache` are explanatory states in this diagram, not health payload values: both report `status=healthy` because PostgreSQL and the catalog client are ready. Valkey failure disables caching without preventing service startup. Within a cycle, each failed computation records failure and the remaining computations continue; the scheduler's cycle-level error path is reserved for an exception that escapes that coordinator. Shutdown cancels the scheduler, closes Valkey, HTTP, and PostgreSQL resources, stops the health listener, and flushes telemetry.
 
