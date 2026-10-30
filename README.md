@@ -43,6 +43,9 @@ curl http://localhost:8009/health   # readiness probe
 curl http://localhost:8008/api/insights/status   # latest run of each computation
 ```
 
+- The readiness probe returns 200 when the service is healthy and 503 while PostgreSQL or the catalog client is unavailable.
+- The status endpoint returns 200 once the database pool is up and 503 (`Service not ready`) before that. Until the first cycle finishes, about 30 seconds after startup plus compute time, the computations show no completed run.
+
 The package has a second, one-shot entry point, `analytics-engine-embeddings`. The deployment layer runs it once per catalog dump to build FastRP artist embeddings and, optionally, similar-artist lists. It is not part of the service process. See [the embeddings guide](docs/embeddings.md) and [its configuration](docs/operations.md#the-embedding-pipeline-analytics-engine-embeddings).
 
 Required configuration includes `POSTGRES_HOST`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DATABASE`. Valkey is configured with `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD`, and `VALKEY_PASSWORD_FILE`; an explicitly empty password is honored, and an unreadable password file fails closed. Username, password, Valkey password, and the internal API secret support the shared `_FILE` secret convention. The complete runtime and telemetry variable table, including defaults and validation behavior, is in [the operations guide](docs/operations.md#configuration). Supply real secrets through the deployment layer; never commit them here.

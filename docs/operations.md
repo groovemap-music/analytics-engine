@@ -45,7 +45,7 @@ Secrets must be delivered by the deployment layer. Do not place credentials in r
 
 ### The embedding pipeline (`analytics-engine-embeddings`)
 
-A separate, one-shot entry point (`insights.embedding_pipeline:main`), not the FastAPI process above — see [The monthly load pipeline](embeddings.md#the-monthly-load-pipeline), for the full design. It shares `POSTGRES_HOST`/`POSTGRES_PORT`/`POSTGRES_DATABASE` above but authenticates with its own, narrower credentials.
+A separate, one-shot entry point (`insights.embedding_pipeline:main`), not the FastAPI process above — see [The monthly load pipeline](embeddings.md#the-monthly-load-pipeline) for the full design. It shares `POSTGRES_HOST`/`POSTGRES_PORT`/`POSTGRES_DATABASE` above but authenticates with its own, narrower credentials.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
@@ -123,6 +123,8 @@ stateDiagram-v2
     WaitingAfterFatalError --> Stopping: shutdown requested
     Stopping --> [*]: scheduler cancelled and clients closed
 ```
+
+The 30-second first-run delay is fixed in the scheduler (`asyncio.sleep(30)` in `insights/insights.py`) and is not configurable. The interval between later cycles is set by `INSIGHTS_SCHEDULE_HOURS`.
 
 `ReadyWithCache` and `ReadyWithoutCache` are explanatory states in this diagram, not health payload values: both report `status=healthy` because PostgreSQL and the catalog client are ready. Valkey failure disables caching without preventing service startup. Within a cycle, each failed computation records failure and the remaining computations continue; the scheduler's cycle-level error path is reserved for an exception that escapes that coordinator. Shutdown cancels the scheduler, closes Valkey, HTTP, and PostgreSQL resources, stops the health listener, and flushes telemetry.
 
