@@ -25,6 +25,8 @@ The outbound client identifies itself as `analytics-engine/<version>` with the c
 | `POSTGRES_POOL_MIN_SIZE` | no | Minimum shared PostgreSQL pool size; defaults to `1` and is clamped to the maximum |
 | `POSTGRES_POOL_MAX_SIZE` | no | Maximum shared PostgreSQL pool size; defaults to `4`; invalid or non-positive values use the default |
 | `LOG_LEVEL` | no | Uvicorn and application log level; defaults to `INFO` |
+| `LOG_FILE` | no | Overrides the log file path (default `/logs/analytics-engine.log`, the container path); an empty value disables the file. When the file cannot be opened, as when running locally without `/logs`, the service logs one warning and continues with console logging only |
+| `PROFILING_LOG_FILE` | no | Same override and console fallback for the query-profiling log |
 | `LOG_FILE_MAX_BYTES` | no | Size in bytes at which the `/logs/analytics-engine.log` file rolls over; defaults to `104857600` (100 MiB); a non-numeric or non-positive override falls back to the default |
 | `LOG_FILE_BACKUP_COUNT` | no | Number of rotated log backups retained; defaults to `5`; a non-numeric or non-positive override falls back to the default |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | no | Collector base URL (for example `http://otel-collector:4318`); unset disables both metrics and trace export |
@@ -151,4 +153,4 @@ The recipes below are the maintained repository interface. `just --summary` list
 
 Valkey settings are read from `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD` and `VALKEY_PASSWORD_FILE`. An explicitly empty password is honored; a nonempty password `_FILE` path wins and unreadable files fail closed. Existing cache keys and PostgreSQL fallback behavior are unchanged.
 
-The consumer overrides the database-schema runtime dependency's older runtime source with immutable python-libraries revision `771515349b592ff569b1b3e5712f7bef936bab58`, retaining the existing `neo4j,otel,otel-http,postgres` extras. This selects the Valkey-only runtime without changing the schema producer commit. `groovemap-database-schema` itself is a first-party runtime dependency pinned to database-schema `ba047aed60064662b129807c4a730e2102ccfb97`; the similar-artist stage imports its release helpers (see [similar artists](similar_artists.md#pipeline-stage)).
+The consumer overrides the database-schema runtime dependency's older runtime source with immutable python-libraries revision `6d0425f908e01a446b040e2993045e2afe30460e`, retaining the existing `neo4j,otel,otel-http,postgres` extras. This selects the Valkey-only runtime without changing the schema producer commit. `groovemap-database-schema` itself is a first-party runtime dependency pinned to database-schema `ba047aed60064662b129807c4a730e2102ccfb97`; the similar-artist stage imports its release helpers (see [similar artists](similar_artists.md#pipeline-stage)).
