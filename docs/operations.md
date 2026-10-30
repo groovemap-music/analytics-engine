@@ -26,7 +26,7 @@ The outbound client identifies itself as `analytics-engine/<version>` with the c
 | `POSTGRES_POOL_MAX_SIZE` | no | Maximum shared PostgreSQL pool size; defaults to `4`; invalid or non-positive values use the default |
 | `LOG_LEVEL` | no | Uvicorn and application log level; defaults to `INFO` |
 | `LOG_FILE` | no | Overrides the log file path (default `/logs/analytics-engine.log`, the container path); an empty value disables the file. When the file cannot be opened, as when running locally without `/logs`, the service logs one warning and continues with console logging only |
-| `PROFILING_LOG_FILE` | no | Same override and console fallback for the query-profiling log |
+| `PROFILING_LOG_FILE` | no | Overrides the query-profiling log path (default `/logs/profiling.log`); an empty value disables the file. When the file cannot be opened, the runtime logs one warning and discards profiling output; there is no console fallback |
 | `LOG_FILE_MAX_BYTES` | no | Size in bytes at which the `/logs/analytics-engine.log` file rolls over; defaults to `104857600` (100 MiB); a non-numeric or non-positive override falls back to the default |
 | `LOG_FILE_BACKUP_COUNT` | no | Number of rotated log backups retained; defaults to `5`; a non-numeric or non-positive override falls back to the default |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | no | Collector base URL (for example `http://otel-collector:4318`); unset disables both metrics and trace export |
