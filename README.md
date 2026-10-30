@@ -1,6 +1,6 @@
 # GrooveMap analytics engine
 
-Independently versioned service for scheduled music analytics. It obtains raw graph and catalog inputs from `catalog-api`, stores precomputed results in PostgreSQL, uses Valkey for cache-aside reads, and exposes a FastAPI service on port 8008 with a separate health listener on port 8009.
+Independently versioned service for scheduled music analytics. This README is for developers and operators of the service. It obtains raw graph and catalog inputs from `catalog-api`, stores precomputed results in PostgreSQL, uses Valkey for cache-aside reads, and exposes a FastAPI service on port 8008 with a separate health listener on port 8009.
 
 This project is licensed under the [GNU Affero General Public License v3.0 only](LICENSE). Commercial use is permitted under the AGPL when its terms are followed; [alternative commercial terms may be negotiated](COMMERCIAL-LICENSING.md).
 
@@ -35,11 +35,15 @@ The stable repository interface is:
 
 ## Runtime
 
-Run locally after setup:
+Run locally after setup, with the required variables below exported:
 
 ```bash
 uv run analytics-engine
+curl http://localhost:8009/health   # readiness probe
+curl http://localhost:8008/api/insights/status   # latest run of each computation
 ```
+
+The package has a second, one-shot entry point, `analytics-engine-embeddings`. The deployment layer runs it once per catalog dump to build FastRP artist embeddings and, optionally, similar-artist lists. It is not part of the service process. See [the embeddings guide](docs/embeddings.md) and [its configuration](docs/operations.md#the-embedding-pipeline-analytics-engine-embeddings).
 
 Required configuration includes `POSTGRES_HOST`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DATABASE`. Valkey is configured with `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD`, and `VALKEY_PASSWORD_FILE`; an explicitly empty password is honored, and an unreadable password file fails closed. Username, password, Valkey password, and the internal API secret support the shared `_FILE` secret convention. The complete runtime and telemetry variable table, including defaults and validation behavior, is in [the operations guide](docs/operations.md#configuration). Supply real secrets through the deployment layer; never commit them here.
 
