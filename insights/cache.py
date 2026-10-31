@@ -32,9 +32,11 @@ invalidation at all.
 """
 
 import json
+import re
 from typing import Any
 
 import structlog
+from common.config import valkey_key, valkey_key_prefix, valkey_pattern
 
 from insights.telemetry import record_cache_read
 
@@ -44,17 +46,29 @@ logger = structlog.get_logger(__name__)
 # A cached response body: an object, or a bare list for the endpoints that return one.
 type CachedValue = dict[str, Any] | list[Any]
 
+# Every key and scan pattern below goes through ``valkey_key`` / ``valkey_pattern``
+# so it lives under the configured ``VALKEY_KEY_PREFIX`` (default ``groovemap:``).
+# The names here are the unprefixed suffixes; SCAN returns keys that already carry
+# the prefix, so they are never prefixed a second time.
+
 # The monotonically increasing cache generation.
 #
-# Deliberately OUTSIDE the "insights:*" namespace: invalidate_all scans and
+# Deliberately OUTSIDE the "insights:g*" sweep: invalidate_all scans and
 # deletes that namespace, and deleting the generation counter would roll the
 # namespace back to g0 and resurrect keys from an earlier generation.
-GENERATION_KEY = "insights-generation"
+GENERATION_KEY_NAME = "insights-generation"
 
 # Only generation-scoped keys belong to this cache. Scanning "insights:*" would
 # also sweep the API service's own "insights:data-completeness" entry (a 6h
-# cache) when both services share a Valkey.
-_VERSIONED_KEY_PATTERN = "insights:g*"
+# cache) when both services share a Valkey. The glob "insights:g*" is still wider
+# than that ("insights:genre-..."), so matches are re-checked against the regex.
+_VERSIONED_KEY_GLOB = "insights:g*"
+_VERSIONED_KEY_RE = re.compile(r"insights:g\d+:")
+
+
+def generation_key() -> str:
+    """Return the prefixed key holding the cache generation counter."""
+    return valkey_key(GENERATION_KEY_NAME)
 
 
 class InsightsCache:
@@ -72,7 +86,7 @@ class InsightsCache:
         sites can keep using their existing cache-key strings.
         """
         suffix = key.removeprefix("insights:")
-        return f"insights:g{generation}:{suffix}"
+        return valkey_key("insights", f"g{generation}", suffix)
 
     async def generation(self) -> int:
         """Return the current cache generation.
@@ -84,7 +98,7 @@ class InsightsCache:
         Returns ``0`` when the counter is unset or Valkey is unavailable.
         """
         try:
-            raw = await self._valkey.get(GENERATION_KEY)
+            raw = await self._valkey.get(generation_key())
             if raw is None:
                 return 0
             return int(raw)
@@ -137,20 +151,20 @@ class InsightsCache:
         them from freshly committed data.
         """
         try:
-            generation = int(await self._valkey.incr(GENERATION_KEY))
+            generation = int(await self._valkey.incr(generation_key()))
         except Exception:
             logger.warning("⚠️ Cache generation bump failed — cache may serve stale data until TTL")
             return
 
         logger.info("🔄 Cache generation advanced", generation=generation)
 
-        current_prefix = f"insights:g{generation}:"
+        current_prefix = valkey_key("insights", f"g{generation}") + ":"
         try:
             cursor: str | int = "0"
             deleted = 0
             while True:
-                cursor, keys = await self._valkey.scan(cursor=int(cursor), match=_VERSIONED_KEY_PATTERN, count=100)
-                stale = [k for k in keys if not _as_str(k).startswith(current_prefix)]
+                cursor, keys = await self._valkey.scan(cursor=int(cursor), match=valkey_pattern(_VERSIONED_KEY_GLOB), count=100)
+                stale = [k for k in keys if _is_versioned(_as_str(k)) and not _as_str(k).startswith(current_prefix)]
                 if stale:
                     await self._valkey.delete(*stale)
                     deleted += len(stale)
@@ -161,6 +175,45 @@ class InsightsCache:
         except Exception:
             # Non-fatal: the generation bump already invalidated the cache.
             logger.debug("⚠️ Cache key reclamation failed")
+
+    async def purge_legacy_keys(self) -> int:
+        """Delete keys this service wrote before key prefixes existed; return how many.
+
+        Only for a stack that previously ran unprefixed on its own dedicated Valkey,
+        enabled explicitly through ``VALKEY_LEGACY_KEYS=migrate``. The prefixed namespace
+        starts empty with its own generation counter, so nothing stale is ever served;
+        what the old keys would leave behind is memory: the generation counter has no
+        TTL, and on a ``noeviction`` instance it would stay forever.
+
+        Touches only the exact known legacy shapes: the ``insights-generation`` counter
+        and ``insights:g<digits>:*`` entries (which carry a TTL and would age out on
+        their own). Never runs without a prefix, because then the "legacy" names are
+        the live ones.
+        """
+        if not valkey_key_prefix():
+            logger.warning("⚠️ Legacy key cleanup skipped: VALKEY_KEY_PREFIX is empty, unprefixed keys are the live ones")
+            return 0
+        deleted = 0
+        try:
+            deleted += int(await self._valkey.delete(GENERATION_KEY_NAME))
+            cursor: str | int = "0"
+            while True:
+                cursor, keys = await self._valkey.scan(cursor=int(cursor), match=_VERSIONED_KEY_GLOB, count=100)
+                legacy = [k for k in keys if _VERSIONED_KEY_RE.match(_as_str(k))]
+                if legacy:
+                    deleted += int(await self._valkey.delete(*legacy))
+                if int(cursor) == 0:
+                    break
+        except Exception:
+            logger.warning("⚠️ Legacy key cleanup failed", deleted=deleted)
+            return deleted
+        logger.info("🧹 Legacy unprefixed cache keys removed", keys_deleted=deleted)
+        return deleted
+
+
+def _is_versioned(key: str) -> bool:
+    """Whether ``key`` (as returned by SCAN, prefix included) is a generation-scoped cache key."""
+    return _VERSIONED_KEY_RE.match(key, len(valkey_key_prefix())) is not None
 
 
 def _as_str(key: Any) -> str:

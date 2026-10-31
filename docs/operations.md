@@ -19,6 +19,9 @@ The outbound client identifies itself as `analytics-engine/<version>` with the c
 | `VALKEY_HOST` | no | Valkey hostname, not a URL; defaults to `localhost` |
 | `VALKEY_PORT` | no | Valkey port; defaults to `6379` |
 | `VALKEY_PASSWORD` / `VALKEY_PASSWORD_FILE` | no | Valkey password; the `_FILE` value takes precedence and the password is URL-escaped |
+| `VALKEY_DB` | no | Valkey database index, `0` to `255`; defaults to `0` |
+| `VALKEY_KEY_PREFIX` | no | Namespace for every key and scan pattern; defaults to `groovemap:`, empty disables it |
+| `VALKEY_LEGACY_KEYS` | no | `off`, `read` (default) or `migrate`, shared with catalog-api; see [Valkey key prefix](#valkey-key-prefix) |
 | `INSIGHTS_INTERNAL_SECRET` / `INSIGHTS_INTERNAL_SECRET_FILE` | no | Shared secret for internal catalog endpoints; the `_FILE` value takes precedence |
 | `INSIGHTS_SCHEDULE_HOURS` | no | Positive integer cycle interval; missing, invalid, zero, and negative values use `24` |
 | `INSIGHTS_MILESTONE_YEARS` | no | Comma-separated integer anniversary milestones; values are deduplicated and sorted, and an empty or invalid list uses `25,30,40,50,75,100` |
@@ -149,8 +152,25 @@ The recipes below are the maintained repository interface. `just --summary` list
 
 `just build`, `just install-check`, `just license-check`, `just release-artifacts`, and `just bump-preview` remain directly invocable focused checks and are also dependencies of `just check`. `just prepare-runtime-wheel` stages the two first-party git dependencies as wheels: `python-libraries` and `database-schema`. It accepts `GROOVEMAP_RUNTIME_REPO` and `GROOVEMAP_SCHEMA_REPO` only as optional build-time overrides; each must name a clean checkout at its pinned revision. Without an override, the recipe uses a matching adjacent checkout or creates a temporary one.
 
+## Valkey key prefix
+
+Every key and scan pattern goes through `valkey_key` / `valkey_pattern`, so the cache lives under `VALKEY_KEY_PREFIX` (default `groovemap:`):
+
+| Key | Name |
+| --- | --- |
+| Generation counter | `groovemap:insights-generation` |
+| Cached results, including data completeness | `groovemap:insights:g{generation}:{name}` |
+
+Generation sweeps scan `groovemap:insights:g*` and delete only keys matching `insights:g<digits>:` inside the prefix, so a shared Valkey's other keys (including `insights:data-completeness` written by another service) are never touched.
+
+### Upgrading a stack that ran unprefixed
+
+The prefixed namespace starts empty with its own counter at generation 0, so the service never serves or collides with pre-upgrade entries. The old cached `insights:g*:*` entries carry a TTL (`INSIGHTS_SCHEDULE_HOURS`, 24h by default) and expire on their own. The old `insights-generation` counter has no TTL and would stay forever, which matters on a `noeviction` Valkey.
+
+`off` and `read` leave legacy keys alone (this service caches only recomputable results, so there is nothing to read across). Set `VALKEY_LEGACY_KEYS=migrate` for one start to delete exactly `insights-generation` and `insights:g<digits>:*`. Enable it only for a stack that previously ran unprefixed on its own dedicated Valkey; never on a shared instance, where those names could belong to someone else. It is skipped when `VALKEY_KEY_PREFIX` is empty, because then those are the live keys. It is idempotent, and a failure is logged without stopping startup. Remove the setting afterwards.
+
 ## Staged Valkey compatibility
 
-Valkey settings are read from `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD` and `VALKEY_PASSWORD_FILE`. An explicitly empty password is honored; a nonempty password `_FILE` path wins and unreadable files fail closed. Existing cache keys and PostgreSQL fallback behavior are unchanged.
+Valkey settings are read from `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD` and `VALKEY_PASSWORD_FILE`. An explicitly empty password is honored; a nonempty password `_FILE` path wins and unreadable files fail closed. PostgreSQL fallback behavior is unchanged; key naming is described under [Valkey key prefix](#valkey-key-prefix).
 
-The consumer overrides the database-schema runtime dependency's older runtime source with immutable python-libraries revision `6d0425f908e01a446b040e2993045e2afe30460e`, retaining the existing `neo4j,otel,otel-http,postgres` extras. This selects the Valkey-only runtime without changing the schema producer commit. `groovemap-database-schema` itself is a first-party runtime dependency pinned to database-schema `ba047aed60064662b129807c4a730e2102ccfb97`; the similar-artist stage imports its release helpers (see [similar artists](similar_artists.md#pipeline-stage)).
+The consumer overrides the database-schema runtime dependency's older runtime source with immutable python-libraries revision `fd0e5487f8e7e791099b3d3587abdd712f77eff1`, retaining the existing `neo4j,otel,otel-http,postgres` extras. This selects the Valkey-only runtime without changing the schema producer commit. `groovemap-database-schema` itself is a first-party runtime dependency pinned to database-schema `ba047aed60064662b129807c4a730e2102ccfb97`; the similar-artist stage imports its release helpers (see [similar artists](similar_artists.md#pipeline-stage)).

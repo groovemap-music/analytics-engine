@@ -154,7 +154,7 @@ class TestCache:
 
         assert second.json() == first.json()
         assert cursor.execute.await_count == 1
-        assert "insights:g0:style-atlas:cotags:House" in store
+        assert "groovemap:insights:g0:style-atlas:cotags:House" in store
 
         store.clear()
         test_client.get(URL, params={"style": "House"})

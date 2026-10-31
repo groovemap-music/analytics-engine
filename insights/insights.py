@@ -162,6 +162,8 @@ async def _initialize_cache(config: InsightsConfig) -> tuple[aiovalkey.Valkey | 
         await valkey_client.ping()
         cache = InsightsCache(valkey_client, ttl_seconds=config.schedule_hours * 3600)
         logger.info("✅ Valkey cache initialized", ttl_hours=config.schedule_hours)
+        if config.valkey_legacy_keys == "migrate":
+            await cache.purge_legacy_keys()
         return valkey_client, cache
     except Exception:
         logger.warning("⚠️ Valkey unavailable — caching disabled, falling back to PostgreSQL")
