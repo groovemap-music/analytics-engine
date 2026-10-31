@@ -27,6 +27,13 @@ from psycopg import AsyncConnection, AsyncCursor, AsyncTransaction
 from insights import telemetry as _telemetry
 
 
+@pytest.fixture(autouse=True)
+def _default_valkey_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the Valkey namespace to its default, whatever the ambient environment sets."""
+    monkeypatch.delenv("VALKEY_KEY_PREFIX", raising=False)
+    monkeypatch.delenv("VALKEY_LEGACY_KEYS", raising=False)
+
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 

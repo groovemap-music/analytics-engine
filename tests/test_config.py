@@ -56,3 +56,23 @@ def test_unreadable_password_file_does_not_fall_back(configured_environment: Non
     monkeypatch.setenv("VALKEY_PASSWORD", "not-selected")
     with pytest.raises(ValueError, match="Cannot read secret file for VALKEY_PASSWORD"):
         InsightsConfig.from_env()
+
+
+def test_valkey_db_is_part_of_the_url(configured_environment: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VALKEY_DB", "3")
+    assert InsightsConfig.from_env().valkey_url == "valkey://cache-fixture:6380/3"
+
+
+def test_legacy_key_mode_defaults_to_read(configured_environment: None) -> None:
+    assert InsightsConfig.from_env().valkey_legacy_keys == "read"
+
+
+def test_legacy_key_cleanup_must_be_enabled_explicitly(configured_environment: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VALKEY_LEGACY_KEYS", "Migrate")
+    assert InsightsConfig.from_env().valkey_legacy_keys == "migrate"
+
+
+def test_unknown_legacy_key_mode_fails_at_startup(configured_environment: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VALKEY_LEGACY_KEYS", "delete")
+    with pytest.raises(ValueError, match="VALKEY_LEGACY_KEYS"):
+        InsightsConfig.from_env()
