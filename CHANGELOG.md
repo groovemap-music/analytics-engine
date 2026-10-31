@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented here by Commitizen.
 
+## v0.4.0 (2026-10-30)
+
+### Feat
+
+- **cache**: prefix all Valkey keys and scans via python-libraries helpers
+- **insights**: store style co-tags and serve them per style
+- **contracts**: promote internal-insights 1.5.0 for style-cotags
+- **insights**: store landmark masters and serve them in the style atlas
+- **contracts**: promote internal-insights 1.4.0 for style-landmarks
+- **insights**: mark atlas emergence edges from stored genre years
+- **contracts**: promote internal-insights 1.3.0 and test settled vs latest stage
+- **insights**: serve GET /api/insights/style-atlas with generation-keyed caching
+- **insights**: derive style lifecycle stages and the month-pinned Genre Atlas layout
+- **insights**: compute style year counts and dominant parent genres
+- **embeddings**: default the monthly pipeline to the self-term config
+
+### Fix
+
+- **deps**: upgrade msgpack past CVE-2026-114613
+- **deps**: upgrade filelock to 4.2.1 past CVE-2026-112940
+- **deps**: upgrade certifi and opentelemetry-api past PYSEC-2026-4320 and CVE-2026-114603
+
 ## v0.3.0 (2026-10-05)
 
 ### Feat
