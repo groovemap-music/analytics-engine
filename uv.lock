@@ -10,7 +10,7 @@ exclude-newer-span = "P7D"
 certifi = "2026-10-20T02:24:17Z"
 
 [manifest]
-overrides = [{ name = "groovemap-runtime", extras = ["neo4j", "otel", "otel-http", "postgres"], git = "https://github.com/groovemap-music/python-libraries.git?rev=fd0e5487f8e7e791099b3d3587abdd712f77eff1" }]
+overrides = [{ name = "groovemap-runtime", extras = ["neo4j", "otel", "otel-http", "postgres"], git = "https://github.com/groovemap-music/python-libraries.git?rev=5f35c03f68b0dd2c1955c731886c0ad8d8f9de63" }]
 
 [[package]]
 name = "annotated-doc"
@@ -522,7 +522,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.143.2" },
     { name = "groovemap-database-schema", git = "https://github.com/groovemap-music/database-schema.git?rev=ba047aed60064662b129807c4a730e2102ccfb97" },
-    { name = "groovemap-runtime", extras = ["postgres", "otel", "otel-http"], git = "https://github.com/groovemap-music/python-libraries.git?rev=fd0e5487f8e7e791099b3d3587abdd712f77eff1" },
+    { name = "groovemap-runtime", extras = ["postgres", "otel", "otel-http"], git = "https://github.com/groovemap-music/python-libraries.git?rev=5f35c03f68b0dd2c1955c731886c0ad8d8f9de63" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "pydantic", specifier = ">=2.14.1" },
@@ -561,7 +561,7 @@ dependencies = [
 [[package]]
 name = "groovemap-runtime"
 version = "0.1.0"
-source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=fd0e5487f8e7e791099b3d3587abdd712f77eff1#fd0e5487f8e7e791099b3d3587abdd712f77eff1" }
+source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=5f35c03f68b0dd2c1955c731886c0ad8d8f9de63#5f35c03f68b0dd2c1955c731886c0ad8d8f9de63" }
 dependencies = [
     { name = "orjson" },
     { name = "structlog" },
