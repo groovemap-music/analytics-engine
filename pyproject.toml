@@ -72,10 +72,10 @@ exclude-newer = "7 days"
 # Security exception: certifi 2026.10.19 fixes PYSEC-2026-4320 and is inside the
 # 7-day window. Remove after 2026-10-27T02:24:17Z, when the window covers it.
 exclude-newer-package = { certifi = "2026-10-20T02:24:17Z" }
-override-dependencies = ["groovemap-runtime[neo4j,otel,otel-http,postgres] @ git+https://github.com/groovemap-music/python-libraries.git@6d0425f908e01a446b040e2993045e2afe30460e"]
+override-dependencies = ["groovemap-runtime[neo4j,otel,otel-http,postgres] @ git+https://github.com/groovemap-music/python-libraries.git@fd0e5487f8e7e791099b3d3587abdd712f77eff1"]
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "6d0425f908e01a446b040e2993045e2afe30460e" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "fd0e5487f8e7e791099b3d3587abdd712f77eff1" }
 groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "ba047aed60064662b129807c4a730e2102ccfb97" }
 
 [tool.ruff]

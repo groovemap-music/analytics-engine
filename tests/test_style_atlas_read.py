@@ -396,13 +396,13 @@ class TestCache:
         second = test_client.get("/api/insights/style-atlas")
         assert second.json() == first.json()
         assert cursor.execute.await_count == queries
-        assert "insights:g0:style-atlas" in store
+        assert "groovemap:insights:g0:style-atlas" in store
 
         # What the scheduler's invalidate_all does first: advance the generation.
-        store["insights-generation"] = "1"
+        store["groovemap:insights-generation"] = "1"
         test_client.get("/api/insights/style-atlas")
         assert cursor.execute.await_count == 2 * queries
-        assert "insights:g1:style-atlas" in store
+        assert "groovemap:insights:g1:style-atlas" in store
 
 
 class TestValkeyDown:

@@ -4,7 +4,7 @@ set -euo pipefail
 # Stages the two first-party git dependencies as wheels (they are not on an index, so they
 # cannot appear in the hash-pinned requirements export): the python-libraries runtime and
 # the database-schema release helpers similar-artist publication imports at runtime.
-expected="6d0425f908e01a446b040e2993045e2afe30460e"
+expected="fd0e5487f8e7e791099b3d3587abdd712f77eff1"
 schema_expected="ba047aed60064662b129807c4a730e2102ccfb97"
 checkouts=()
 resolved=
