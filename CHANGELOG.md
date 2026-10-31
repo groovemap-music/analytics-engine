@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented here by Commitizen.
 
+## v0.5.0 (2026-10-30)
+
+### Feat
+
+- **cache**: document and test Valkey TLS configuration
+
 ## v0.4.0 (2026-10-30)
 
 ### Feat
