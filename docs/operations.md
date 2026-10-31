@@ -20,6 +20,10 @@ The outbound client identifies itself as `analytics-engine/<version>` with the c
 | `VALKEY_PORT` | no | Valkey port; defaults to `6379` |
 | `VALKEY_PASSWORD` / `VALKEY_PASSWORD_FILE` | no | Valkey password; the `_FILE` value takes precedence and the password is URL-escaped |
 | `VALKEY_DB` | no | Valkey database index, `0` to `255`; defaults to `0` |
+| `VALKEY_TLS` | no | `true` switches the URL to `valkeys://` with certificate and hostname verification; defaults to `false`; see [Valkey TLS](#valkey-tls) |
+| `VALKEY_TLS_CA_FILE` | no | Private CA bundle for the Valkey server certificate; unset trusts the system CAs |
+| `VALKEY_TLS_CERT_FILE` / `VALKEY_TLS_KEY_FILE` | no | Client certificate and key; set both or neither |
+| `VALKEY_TLS_VERIFY_HOSTNAME` | no | `false` disables server hostname checking while keeping certificate verification; defaults to `true` |
 | `VALKEY_KEY_PREFIX` | no | Namespace for every key and scan pattern; defaults to `groovemap:`, empty disables it |
 | `VALKEY_LEGACY_KEYS` | no | `off`, `read` (default) or `migrate`, shared with catalog-api; see [Valkey key prefix](#valkey-key-prefix) |
 | `INSIGHTS_INTERNAL_SECRET` / `INSIGHTS_INTERNAL_SECRET_FILE` | no | Shared secret for internal catalog endpoints; the `_FILE` value takes precedence |
@@ -152,6 +156,12 @@ The recipes below are the maintained repository interface. `just --summary` list
 
 `just build`, `just install-check`, `just license-check`, `just release-artifacts`, and `just bump-preview` remain directly invocable focused checks and are also dependencies of `just check`. `just prepare-runtime-wheel` stages the two first-party git dependencies as wheels: `python-libraries` and `database-schema`. It accepts `GROOVEMAP_RUNTIME_REPO` and `GROOVEMAP_SCHEMA_REPO` only as optional build-time overrides; each must name a clean checkout at its pinned revision. Without an override, the recipe uses a matching adjacent checkout or creates a temporary one.
 
+## Valkey TLS
+
+TLS is off by default and the plaintext `valkey://` URL is unchanged. With `VALKEY_TLS=true` (`true`, `1`, `yes` or `on`), the shared `get_valkey_url()` builder returns a `valkeys://` URL carrying `ssl_cert_reqs=required` and `ssl_check_hostname=true`, and the cache client connects through the same `from_url()` call. Certificate chain and hostname are both verified. `VALKEY_TLS_VERIFY_HOSTNAME=false` is the only way to skip hostname checking; the chain is still verified.
+
+`VALKEY_TLS` and `VALKEY_TLS_VERIFY_HOSTNAME` accept only the explicit tokens listed above (case-insensitive). Any other value, such as a typo like `ture`, fails at startup rather than falling back to plaintext. A configured CA, certificate or key file that does not exist also fails at startup, and `VALKEY_TLS_CERT_FILE` and `VALKEY_TLS_KEY_FILE` must be set together.
+
 ## Valkey key prefix
 
 Every key and scan pattern goes through `valkey_key` / `valkey_pattern`, so the cache lives under `VALKEY_KEY_PREFIX` (default `groovemap:`):
@@ -173,4 +183,4 @@ The prefixed namespace starts empty with its own counter at generation 0, so the
 
 Valkey settings are read from `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD` and `VALKEY_PASSWORD_FILE`. An explicitly empty password is honored; a nonempty password `_FILE` path wins and unreadable files fail closed. PostgreSQL fallback behavior is unchanged; key naming is described under [Valkey key prefix](#valkey-key-prefix).
 
-The consumer overrides the database-schema runtime dependency's older runtime source with immutable python-libraries revision `fd0e5487f8e7e791099b3d3587abdd712f77eff1`, retaining the existing `neo4j,otel,otel-http,postgres` extras. This selects the Valkey-only runtime without changing the schema producer commit. `groovemap-database-schema` itself is a first-party runtime dependency pinned to database-schema `ba047aed60064662b129807c4a730e2102ccfb97`; the similar-artist stage imports its release helpers (see [similar artists](similar_artists.md#pipeline-stage)).
+The consumer overrides the database-schema runtime dependency's older runtime source with immutable python-libraries revision `5f35c03f68b0dd2c1955c731886c0ad8d8f9de63`, retaining the existing `neo4j,otel,otel-http,postgres` extras. This selects the Valkey-only runtime without changing the schema producer commit. `groovemap-database-schema` itself is a first-party runtime dependency pinned to database-schema `ba047aed60064662b129807c4a730e2102ccfb97`; the similar-artist stage imports its release helpers (see [similar artists](similar_artists.md#pipeline-stage)).
