@@ -40,6 +40,16 @@ def test_consumer_builds_valkey_url_accepted_by_actual_client(configured_environ
     assert connection["decode_responses"] is True
 
 
+def test_valkey_tls_turns_the_configured_url_into_a_verified_valkeys_url(configured_environment: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VALKEY_TLS", "true")
+    config = InsightsConfig.from_env()
+    assert config.valkey_url == "valkeys://cache-fixture:6380/0?ssl_cert_reqs=required&ssl_check_hostname=true"
+    client = Valkey.from_url(config.valkey_url, decode_responses=True)
+    connection = client.connection_pool.connection_kwargs
+    assert connection["host"] == "cache-fixture"
+    assert connection["ssl_check_hostname"] is True
+
+
 def test_file_password_precedence_and_url_escaping(configured_environment: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     password_file = tmp_path / "fixture-password"
     password_file.write_text("fixture:@/ value\n")
