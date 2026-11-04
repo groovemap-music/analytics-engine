@@ -13,6 +13,7 @@ This directory documents what the `analytics-engine` repository owns and how to 
 The monthly `analytics-engine-embeddings` job is separate from the always-on service. These pages cover it:
 
 - [FastRP artist embeddings](embeddings.md) — the algorithm, its configuration, and the monthly load pipeline.
+- [SQL performance audit, 2026-11-04](sql_performance_audit_2026-11-04.md) — hot spots, local EXPLAIN evidence, and proposed follow-ups.
 - [Exact similar-artist lists](similar_artists.md) — the batch job that computes and publishes top-K lists.
 
 ## Measurement records
