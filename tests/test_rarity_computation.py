@@ -1,5 +1,6 @@
 """Tests for rarity score computation pipeline."""
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +14,11 @@ def _make_mock_pool() -> MagicMock:
     mock_cursor.execute = AsyncMock()
     mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
     mock_cursor.__aexit__ = AsyncMock(return_value=False)
+    mock_copy = MagicMock()
+    mock_copy.write_row = AsyncMock()
+    mock_copy.__aenter__ = AsyncMock(return_value=mock_copy)
+    mock_copy.__aexit__ = AsyncMock(return_value=False)
+    mock_cursor.copy = MagicMock(return_value=mock_copy)
 
     mock_conn = AsyncMock()
     mock_conn.cursor = MagicMock(return_value=mock_cursor)
@@ -26,6 +32,16 @@ def _make_mock_pool() -> MagicMock:
     mock_pool = MagicMock()
     mock_pool.connection = MagicMock(return_value=mock_conn)
     return mock_pool
+
+
+def _copy_of(mock_pool: MagicMock) -> MagicMock:
+    """The mock `COPY` object the pool's cursor handed out."""
+    mock_cursor = mock_pool.connection.return_value.__aenter__.return_value.cursor.return_value
+    return mock_cursor.copy.return_value
+
+
+def _copied_rows(mock_pool: MagicMock) -> list[tuple[Any, ...]]:
+    return [call.args[0] for call in _copy_of(mock_pool).write_row.call_args_list]
 
 
 _MOCK_RARITY_ITEMS = [
@@ -117,6 +133,27 @@ class TestComputeAndStoreRarity:
             rows = await compute_and_store_rarity(mock_client, mock_pool)
 
         assert rows == 0
+        _copy_of(mock_pool).write_row.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_replaces_the_table_in_one_transaction_with_one_copy_and_no_per_row_insert(self) -> None:
+        mock_client = AsyncMock()
+        mock_pool = _make_mock_pool()
+        items = [{**_MOCK_RARITY_ITEMS[0], "release_id": str(index)} for index in range(250)]
+
+        with patch("insights.computations._fetch_from_api") as mock_fetch:
+            mock_fetch.return_value = items
+            rows = await compute_and_store_rarity(mock_client, mock_pool)
+
+        mock_conn = mock_pool.connection.return_value.__aenter__.return_value
+        mock_cursor = mock_conn.cursor.return_value
+        statements = [call.args[0] for call in mock_cursor.execute.call_args_list if "release_rarity" in call.args[0]]
+        assert rows == 250
+        assert statements == ["DELETE FROM insights.release_rarity"]
+        mock_cursor.copy.assert_called_once()
+        assert "COPY insights.release_rarity" in mock_cursor.copy.call_args.args[0]
+        mock_conn.transaction.assert_called_once()
+        assert [row[0] for row in _copied_rows(mock_pool)] == [str(index) for index in range(250)]
 
     @pytest.mark.asyncio
     async def test_logs_computation(self) -> None:
@@ -137,7 +174,7 @@ class TestComputeAndStoreRarity:
 
     @pytest.mark.asyncio
     async def test_grooved_release_writes_pressing_scarcity_and_family_signals(self) -> None:
-        """A grooved release's INSERT carries a populated pressing_scarcity and
+        """A grooved release's COPY row carries a populated pressing_scarcity and
         the grooved family's signal breakdown (ADR 0007)."""
         mock_client = AsyncMock()
         mock_pool = _make_mock_pool()
@@ -147,9 +184,7 @@ class TestComputeAndStoreRarity:
             rows = await compute_and_store_rarity(mock_client, mock_pool)
 
         assert rows == 1
-        mock_cursor = mock_pool.connection.return_value.__aenter__.return_value.cursor.return_value
-        insert_call = next(c for c in mock_cursor.execute.call_args_list if "INSERT INTO insights.release_rarity" in c.args[0])
-        params = insert_call.args[1]
+        (params,) = _copied_rows(mock_pool)
         assert params[0] == "grooved-1"
         assert params[7] == 93.5  # pressing_scarcity
         assert params[13].obj == ["vinyl", "shellac"]  # media_families (Jsonb)
@@ -158,7 +193,7 @@ class TestComputeAndStoreRarity:
 
     @pytest.mark.asyncio
     async def test_non_grooved_release_writes_null_pressing_scarcity_and_empty_family_signals(self) -> None:
-        """A non-grooved release's INSERT carries a null pressing_scarcity and
+        """A non-grooved release's COPY row carries a null pressing_scarcity and
         an empty family_signals object, since no family extension claims it (ADR 0007)."""
         mock_client = AsyncMock()
         mock_pool = _make_mock_pool()
@@ -168,9 +203,7 @@ class TestComputeAndStoreRarity:
             rows = await compute_and_store_rarity(mock_client, mock_pool)
 
         assert rows == 1
-        mock_cursor = mock_pool.connection.return_value.__aenter__.return_value.cursor.return_value
-        insert_call = next(c for c in mock_cursor.execute.call_args_list if "INSERT INTO insights.release_rarity" in c.args[0])
-        params = insert_call.args[1]
+        (params,) = _copied_rows(mock_pool)
         assert params[0] == "digital-1"
         assert params[7] is None  # pressing_scarcity
         assert params[13].obj == ["digital"]  # media_families (Jsonb)

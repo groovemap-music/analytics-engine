@@ -725,6 +725,40 @@ async def compute_and_store_community_enrichment(client: httpx.AsyncClient, pool
     return enriched
 
 
+_RARITY_COPY_SQL = """
+    COPY insights.release_rarity
+        (release_id, title, artist_name, year, rarity_score, tier,
+         hidden_gem_score, pressing_scarcity, label_catalog,
+         format_rarity, temporal_scarcity, graph_isolation,
+         collection_prevalence, media_families, family_signals,
+         medium_rarity)
+    FROM STDIN
+"""
+
+
+def _rarity_copy_row(row: dict[str, Any]) -> tuple[Any, ...]:
+    """One `release_rarity` row in `_RARITY_COPY_SQL`'s column order."""
+    return (
+        row["release_id"],
+        row.get("title", ""),
+        row.get("artist_name", ""),
+        row.get("year"),
+        row["rarity_score"],
+        row["tier"],
+        row.get("hidden_gem_score"),
+        # Grooved-only per ADR 0007; null when no family extension claims the release.
+        row.get("pressing_scarcity"),
+        row.get("label_catalog"),
+        row.get("format_rarity"),
+        row.get("temporal_scarcity"),
+        row.get("graph_isolation"),
+        row.get("collection_prevalence"),
+        Jsonb(row.get("media_families") or []),
+        Jsonb(row.get("family_signals") or {}),
+        row.get("medium_rarity"),
+    )
+
+
 @_record_lifecycle("release_rarity", "❌ Release rarity computation failed")
 async def compute_and_store_rarity(client: httpx.AsyncClient, pool: Any) -> int:
     """Compute release rarity scores and store results."""
@@ -734,42 +768,19 @@ async def compute_and_store_rarity(client: httpx.AsyncClient, pool: Any) -> int:
         logger.info("📊 No rarity score results to store")
         return 0
 
+    # The row count is only known once the API answers, and it is not bounded here: one round
+    # trip per row (the old loop) cost about 6 ms a row on a local container. One COPY streams
+    # them all, inside the same transaction as the DELETE, so readers see the old table or the
+    # new one and a failed row (e.g. a duplicate release_id) rolls the whole replacement back.
+    logger.info("📊 Storing release rarity scores", count=len(results))
     async with pool.connection() as conn:
         await conn.set_autocommit(False)
         async with conn.transaction(), conn.cursor() as cursor:
             cursor = cast("Any", cursor)
             await cursor.execute("DELETE FROM insights.release_rarity")
-            for row in results:
-                await cursor.execute(
-                    """
-                        INSERT INTO insights.release_rarity
-                            (release_id, title, artist_name, year, rarity_score, tier,
-                             hidden_gem_score, pressing_scarcity, label_catalog,
-                             format_rarity, temporal_scarcity, graph_isolation,
-                             collection_prevalence, media_families, family_signals,
-                             medium_rarity)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                    (
-                        row["release_id"],
-                        row.get("title", ""),
-                        row.get("artist_name", ""),
-                        row.get("year"),
-                        row["rarity_score"],
-                        row["tier"],
-                        row.get("hidden_gem_score"),
-                        # Grooved-only per ADR 0007; null when no family extension claims the release.
-                        row.get("pressing_scarcity"),
-                        row.get("label_catalog"),
-                        row.get("format_rarity"),
-                        row.get("temporal_scarcity"),
-                        row.get("graph_isolation"),
-                        row.get("collection_prevalence"),
-                        Jsonb(row.get("media_families") or []),
-                        Jsonb(row.get("family_signals") or {}),
-                        row.get("medium_rarity"),
-                    ),
-                )
+            async with cursor.copy(_RARITY_COPY_SQL) as copy:
+                for row in results:
+                    await copy.write_row(_rarity_copy_row(row))
     logger.info("💾 Release rarity scores stored", count=len(results))
     return len(results)
 
