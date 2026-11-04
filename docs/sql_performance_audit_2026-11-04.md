@@ -122,10 +122,32 @@ These are one-shot, off the request path, and the upsert is a single transaction
 
 All read-only, to run once the load finishes and the indexes settle:
 
-1. `EXPLAIN (ANALYZE, BUFFERS)` of `_CREDITED_ARTIST_EDGE_SQL` and `_TRACK_CREDITED_ARTIST_EDGE_SQL`, to learn the real join and `DISTINCT` plan, with and without `enable_nestloop`.
-2. `SELECT relname, reltuples, relpages FROM pg_class` for `graph.credited_on`, `same_as`, `track_credited_on`, `track_by_artist` and `insights.release_rarity`, to replace the extrapolated row counts.
-3. `SHOW work_mem, hash_mem_multiplier, shared_buffers, effective_cache_size` for the live instance.
-4. `SELECT count(*) FROM activity.events` and the largest partition sizes, to place H3.
+1. Done on 2026-11-04 for the two edge queries and the artist-id discovery (see the live-reads section). Still wanted: the same after v0.6.1 is applied on lux and the load completes, with and without `enable_nestloop`, which `gm-lux-sql` cannot set.
+2. Done for partial data (see above). Repeat after the load: `SELECT relname, reltuples, relpages FROM pg_class` for `graph.credited_on`, `same_as`, `track_credited_on`, `track_by_artist` and `insights.release_rarity`, to replace the extrapolated row counts.
+3. Done (see above).
+4. `activity.events` is empty today; repeat when it holds data, to place H3.
+
+## Live reads on lux (read-only, 2026-11-04 ~20:00 UTC)
+
+Taken through the operator's read-only `gm-lux-sql` wrapper, one statement at a time, with Postgres idle (the load is stalled). **Scale: partial data.** `credited_on` held 18.0M rows (14.6M kept-category), `track_credited_on` 21.7M, `same_as` 2.85M, `track_by_artist` 7.9M. The full 2026-08 dump is about 147M credit rows, so scale these timings by 3x to 5x. `gm-lux-sql` cannot `SET enable_nestloop`, so the hash-join comparison from the local run could not be repeated live.
+
+**Settings.** `work_mem` 64 MB, `hash_mem_multiplier` 2 (so 128 MB per hash node), `shared_buffers` 6 GB, `effective_cache_size` 18 GB, `random_page_cost` 1.1, `max_parallel_workers_per_gather` 4, `statement_timeout` 120 s, `temp_file_limit` unlimited.
+
+**Important: lux still has the pre-v0.6.1 indexes.** `same_as_pkey` is `btree (person_name, artist_id)`, `credited_on_role_category` still exists, and there is no `person_name` hash index. So the live plans below are the *old* shape. The local hash-index finding in H1 is a prediction for after the migration, not something lux shows yet.
+
+| Query (partial data) | Execution | Plan | Notes |
+| --- | --- | --- | --- |
+| `_CREDITED_ARTIST_EDGE_SQL` | **25.9 s** | Seq Scan `credited_on` (14.6M kept of 18.1M), Nested Loop + Memoize over `same_as_pkey`, HashAggregate | 12.5M groups; **Batches 9, 425 MB temp spilled**; Memoize 86% hit (2.04M misses, 1.03M evictions) |
+| `_CREDITED_ARTIST_IDS_SQL` | **13.4 s** | Index Only Scan `credited_on_role_category`, same Nested Loop + Memoize, HashAggregate | 1.79M groups, in memory; **repeats the join the edge query already did** |
+| `_TRACK_CREDITED_ARTIST_EDGE_SQL` | **26.2 s** | Seq Scan `track_credited_on` (21.8M), Nested Loop + Memoize, HashAggregate | 12.5M groups; **Batches 17, 637 MB temp spilled** |
+
+What this changes in the report:
+
+- **H1 is confirmed live.** The artist-id discovery cost 13.4 s next to a 25.9 s edge query, so 34% of the release-credit stage (31% with the track-level queries included). It is the same join, and its output is a projection of the edge query.
+- **The cost is per kept credit row, about 1.8 µs (release) and 1.2 µs (track) here.** At 3x to 5x the rows that is roughly 1.5 to 2.5 min per credit edge query on a warm cache. Memoize keeps the old btree plan healthy while the distinct-name working set fits (86% to 93% hits). Whether the plan stays good after the hash-index migration is open: Memoize applies to nested loops generally, so the migration may keep the benefit, but this needs a check on lux once v0.6.1 is applied.
+- **H2 is confirmed, and the memory estimate was too high.** Under the live `work_mem` the aggregate spills rather than holding gigabytes: **425 MB and 637 MB of temp for 12.5M groups each**. Linearly, that is about 1.5 to 2 GB of temp files per edge query at full size, on the shared server, not the 3.4 to 6.4 GB of RAM estimated earlier. Treat the earlier RAM figures as the upper bound if `work_mem` is raised. The temp writes are real shared-disk I/O either way.
+- The Seq Scan of `credited_on` is 1.7 s warm and about 100k pages read; not a concern at this scale.
+- Not read live: `activity.events` is empty (partitions `events_y2026m11`, `m12` and default are 40 kB), so H3 stays an extrapolation. `insights.release_rarity` is empty (40 kB, `reltuples` -1), so H6 still has no row count.
 
 ## Proposed follow-up beads
 
