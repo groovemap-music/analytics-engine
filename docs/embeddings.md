@@ -264,9 +264,11 @@ own rows rather than colliding with, or being skipped as, the previous edge set'
 no-op — it does not re-read the graph or re-run `fastrp`. Every read and write this job makes is
 scoped to the stored `model_version` it is computing — it never touches a row of any other
 stored `model_version`, so both an earlier month's rows and a version `catalog-api` is currently
-serving are untouched by a load of a new one. `ON CONFLICT (artist_id, model_version) DO UPDATE`
-in the write is retry safety for a crash within the *same* dump's load, never a cross-dump
-upsert, since the stored value already differs per dump.
+serving are untouched by a load of a new one. The `DELETE` of the stored
+`model_version`'s own rows ahead of the binary `COPY` in the write is retry safety for a crash within
+the *same* dump's load, never a cross-dump overwrite, since the stored value already differs per
+dump. (gm-analytics-engine-b1us replaced the per-row `ON CONFLICT` upsert with it: 8k to 94k rows/s
+locally. The similar-artist stage's read-back is binary too, and its `COPY` is binary.)
 
 **No index DDL, ever.** `embedding_pipeline` holds no DDL privilege and no ownership of
 `public.artist_embeddings` — building or rebuilding the ANN index over a stored `model_version`

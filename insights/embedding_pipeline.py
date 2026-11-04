@@ -68,10 +68,10 @@ stored `model_version`, so a retry's idempotency check correctly reports "not lo
 the full load; holding one long-lived transaction across the whole compute would only add lock
 and connection-lifetime risk for no additional safety.
 
-`_write_embeddings`' `ON CONFLICT (artist_id, model_version) DO UPDATE` is retry safety for
-exactly that crash case — a partial previous attempt's rows under *this same* stored
-`model_version` — not a cross-dump upsert: since the stored value already differs per dump, the
-conflict target can never match a row from a different month. Every query and write in this
+`_write_embeddings`' `DELETE ... WHERE model_version = <stored>` before its binary `COPY` is retry
+safety for exactly that crash case — a partial previous attempt's rows under *this same* stored
+`model_version` — not a cross-dump overwrite: since the stored value already differs per dump, it
+can never match a row from a different month. Every query and write in this
 module is scoped by the stored `model_version` throughout, so a version `catalog-api` is
 currently serving is untouched by a load of a new one.
 
@@ -118,6 +118,7 @@ from common import (
     shutdown_telemetry,
 )
 from common.config import _build_postgres_connstr, get_secret
+from psycopg.types.string import BytesBinaryDumper
 
 from insights.embeddings import AdjacencyBuilder, FastRPConfig, NodeIndex, fastrp, node_keys
 from insights.similar_artists import run_similar_artists
@@ -306,19 +307,14 @@ _DISCOVERY_QUERIES: Final[tuple[tuple[str, str, tuple[Any, ...], str], ...]] = (
 # catalog scale (docs/embeddings.md) — is never materialized in one piece.
 _CURSOR_FETCH_SIZE: Final = 50_000
 
-# Rows per multi-row upsert statement.
-_UPSERT_BATCH_SIZE: Final = 5_000
+# Rows encoded and handed to one `COPY` write at a time.
+_COPY_BATCH_SIZE: Final = 5_000
 
-_UPSERT_SQL: Final = f"""
-    INSERT INTO {ARTIST_EMBEDDINGS_TABLE}
-        (artist_id, model_version, embedding, source_dump_id, source_dump_date, computed_at)
-    VALUES (%s, %s, %s::halfvec, %s, %s, %s)
-    ON CONFLICT (artist_id, model_version) DO UPDATE SET
-        embedding = EXCLUDED.embedding,
-        source_dump_id = EXCLUDED.source_dump_id,
-        source_dump_date = EXCLUDED.source_dump_date,
-        computed_at = EXCLUDED.computed_at
-"""  # noqa: S608 -- ARTIST_EMBEDDINGS_TABLE is a module constant, not caller input.
+_DELETE_VERSION_SQL: Final = f"DELETE FROM {ARTIST_EMBEDDINGS_TABLE} WHERE model_version = %s"  # noqa: S608 -- module constant.
+_COPY_SQL: Final = (
+    f"COPY {ARTIST_EMBEDDINGS_TABLE} (artist_id, model_version, embedding, source_dump_id, source_dump_date, computed_at) FROM STDIN (FORMAT BINARY)"
+)
+_HALFVEC_OID_SQL: Final = "SELECT 'halfvec'::regtype::oid"
 
 _ALREADY_LOADED_SQL: Final = f"SELECT 1 FROM {ARTIST_EMBEDDINGS_TABLE} WHERE model_version = %s LIMIT 1"  # noqa: S608
 
@@ -466,14 +462,26 @@ def _sql_string_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _halfvec_literal(vector: NDArray[np.floating]) -> str:
-    """Render one embedding row as pgvector's `halfvec` text input format.
+def _halfvec_binary_rows(vectors: NDArray[np.floating]) -> list[bytes]:
+    """Encode each row of ``vectors`` as pgvector's binary `halfvec` (`halfvec_recv`) payload.
 
-    No `pgvector` Python dependency is added for this: the text format
-    (``"[v1,v2,...]"``, cast with ``::halfvec`` in `_UPSERT_SQL`) is part of pgvector's SQL
-    input syntax and needs no client-side adapter.
+    The wire format is two big-endian int16 (dimensions, unused) then one big-endian IEEE half
+    per dimension. The stored column is `halfvec`, so the float16 cast here is the same
+    rounding the server applied to the old text literal; no client-side adapter package is
+    needed for it.
     """
-    return "[" + ",".join(f"{value:g}" for value in vector.tolist()) + "]"
+    count, dimensions = vectors.shape
+    words = np.empty((count, dimensions + 2), dtype=">u2")
+    words[:, 0] = dimensions
+    words[:, 1] = 0
+    words[:, 2:] = vectors.astype(np.float16).view(np.uint16)
+    row_bytes = (dimensions + 2) * 2
+    buffer = words.tobytes()
+    return [buffer[start : start + row_bytes] for start in range(0, count * row_bytes, row_bytes)]
+
+
+class _HalfvecBinary(bytes):
+    """A `halfvec_send` payload, so psycopg can bind it to the `halfvec` type in a binary COPY."""
 
 
 def _index_name_slug(value: str, *, max_length: int = 48) -> str:
@@ -649,34 +657,34 @@ async def _write_embeddings(
     artist_ids: Sequence[str],
     vectors: NDArray[np.floating],
 ) -> int:
-    """Upsert every artist's embedding row for the stored `model_version`, in one transaction.
+    """Write every artist's embedding row for the stored `model_version`, in one transaction.
 
     `model_version` here is the *stored* value (`stored_model_version(...)`), already unique
-    per dump — so `ON CONFLICT (artist_id, model_version) DO UPDATE` can only ever match a row
-    this same dump's own, possibly-partial, previous attempt wrote, never another dump's. It
-    exists purely for that crash-retry case: `COPY` has no `ON CONFLICT` clause, and a plain
-    re-`INSERT` would fail outright on a retry that reaches those previously-committed rows
-    (which cannot happen after this function returns, by the idempotency check above, but a
-    retry that resumes mid-run before that check would still see them).
+    per dump -- so the `DELETE` below can only ever remove rows this same dump's own,
+    possibly-partial, previous attempt wrote, never another dump's. It exists for the
+    crash-retry case the old `ON CONFLICT ... DO UPDATE` upsert covered: `COPY` has no
+    `ON CONFLICT` clause, and a plain re-insert would fail outright on a retry that reaches
+    those previously-committed rows (which cannot happen after this function returns, by the
+    idempotency check above, but a retry that resumes mid-run before that check would still
+    see them). The delete and the `COPY` share one transaction, so a failure leaves the
+    earlier rows exactly as they were.
     """
     computed_at = datetime.now(UTC)
     rows_written = 0
     async with conn.transaction(), conn.cursor() as cursor:
-        for start in range(0, len(artist_ids), _UPSERT_BATCH_SIZE):
-            stop = min(start + _UPSERT_BATCH_SIZE, len(artist_ids))
-            batch = [
-                (
-                    artist_ids[index],
-                    model_version,
-                    _halfvec_literal(vectors[index]),
-                    dump_id,
-                    dump_date,
-                    computed_at,
-                )
-                for index in range(start, stop)
-            ]
-            await cursor.executemany(_UPSERT_SQL, batch)
-            rows_written += len(batch)
+        await cursor.execute(_HALFVEC_OID_SQL)
+        halfvec_oid = int((await cursor.fetchone())[0])
+        dumper = type("HalfvecBinaryDumper", (BytesBinaryDumper,), {"oid": halfvec_oid})
+        cursor.adapters.register_dumper(_HalfvecBinary, dumper)
+        await cursor.execute(_DELETE_VERSION_SQL, (model_version,))
+        async with cursor.copy(_COPY_SQL) as copy:
+            copy.set_types(["text", "text", halfvec_oid, "text", "date", "timestamptz"])
+            for start in range(0, len(artist_ids), _COPY_BATCH_SIZE):
+                stop = min(start + _COPY_BATCH_SIZE, len(artist_ids))
+                encoded = _halfvec_binary_rows(vectors[start:stop])
+                for offset, payload in enumerate(encoded):
+                    await copy.write_row((artist_ids[start + offset], model_version, _HalfvecBinary(payload), dump_id, dump_date, computed_at))
+                    rows_written += 1
     return rows_written
 
 
