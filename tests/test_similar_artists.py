@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import struct
 import subprocess
 import sys
 from datetime import date
@@ -206,6 +207,9 @@ class _FakeCopy:
     async def write(self, data: bytes) -> None:
         self._sink.append(data)
 
+    def set_types(self, types: list[Any]) -> None:
+        self.types = types
+
     async def write_row(self, row: tuple[Any, ...]) -> None:
         self._sink.append(row)
 
@@ -223,9 +227,11 @@ class _FakeCursor:
     async def __aexit__(self, *_exc: object) -> bool:
         return False
 
-    async def execute(self, sql: str, params: Any = None) -> None:
+    async def execute(self, sql: str, params: Any = None, *, binary: bool | None = None) -> None:
         self.conn.log.append((sql, params))
         self._last_sql = sql
+        if sql == sa._READ_EMBEDDINGS_SQL:
+            self.conn.binary_reads.append(binary)
 
     async def fetchone(self) -> tuple[Any, ...] | None:
         if self._last_sql == sa._RELEASE_WRITE_GUARD_SQL:
@@ -269,6 +275,7 @@ class _FakeConnection:
     ) -> None:
         self.log: list[tuple[str, Any]] = []
         self.copied: list[Any] = []
+        self.binary_reads: list[bool | None] = []
         self.fetchall_rows = fetchall_rows or []
         self.fetchone_by_sql = fetchone_by_sql or {}
         self.streamed_rows = streamed_rows or []
@@ -457,12 +464,13 @@ class TestSchemaReleaseRegistry:
 # ── Reading vectors back and the monthly stage ─────────────────────────────────────────────────
 
 
-def _halfvec_text(vector: np.ndarray) -> str:
-    return "[" + ",".join(str(float(x)) for x in vector) + "]"
+def _halfvec_binary(vector: np.ndarray) -> bytes:
+    """What PostgreSQL's `halfvec_send` returns: dimensions, unused, then big-endian halves."""
+    return struct.pack(">HH", len(vector), 0) + vector.astype(">f2").tobytes()
 
 
-def _stored_rows(vectors: np.ndarray) -> list[tuple[str, str]]:
-    return [(f"a{i:04d}", _halfvec_text(v)) for i, v in enumerate(vectors)]
+def _stored_rows(vectors: np.ndarray) -> list[tuple[str, bytes]]:
+    return [(f"a{i:04d}", _halfvec_binary(v)) for i, v in enumerate(vectors)]
 
 
 class TestReadEmbeddings:
@@ -478,6 +486,7 @@ class TestReadEmbeddings:
         np.testing.assert_array_equal(read, vectors)
         assert conn.log[0] == ("BEGIN", None)
         assert conn.log[-1] == ("COMMIT", None)
+        assert conn.binary_reads == [True]
 
     @pytest.mark.asyncio
     async def test_no_rows_reads_nothing(self) -> None:
@@ -485,6 +494,26 @@ class TestReadEmbeddings:
         ids, read = await sa.read_embeddings(conn, "m1")
         assert ids == []
         assert read.shape == (0, 0)
+
+
+class TestParseHalfvecBlock:
+    def test_decodes_special_values_bit_for_bit(self) -> None:
+        vectors = np.array([[0.0, -0.0, 1.5, np.inf], [-np.inf, 65504.0, 6e-8, np.nan]], dtype=np.float16)
+
+        parsed = sa._parse_halfvec_block([_halfvec_binary(row) for row in vectors])
+
+        assert parsed.dtype == np.float16
+        assert parsed.view(np.uint16).tolist() == vectors.view(np.uint16).tolist()
+
+    def test_rejects_rows_of_different_dimensions(self) -> None:
+        blobs = [_halfvec_binary(np.zeros(4, dtype=np.float16)), _halfvec_binary(np.zeros(3, dtype=np.float16))]
+        with pytest.raises(ValueError, match="different lengths"):
+            sa._parse_halfvec_block(blobs)
+
+    def test_rejects_a_header_that_disagrees_with_the_payload(self) -> None:
+        blob = struct.pack(">HH", 9, 0) + np.zeros(4, dtype=">f2").tobytes()
+        with pytest.raises(ValueError, match="unexpected header"):
+            sa._parse_halfvec_block([blob])
 
 
 class TestRunSimilarArtists:

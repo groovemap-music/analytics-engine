@@ -7,6 +7,7 @@ permission and idempotency regressions live in `tests/integration/test_embedding
 
 from __future__ import annotations
 
+import struct
 from datetime import date
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -31,6 +32,36 @@ class _NullTransaction:
         return False
 
 
+_HALFVEC_OID = 424242
+
+
+class _FakeAdapters:
+    def __init__(self) -> None:
+        self.dumpers: list[tuple[type, type]] = []
+
+    def register_dumper(self, cls: type, dumper: type) -> None:
+        self.dumpers.append((cls, dumper))
+
+
+class _FakeCopy:
+    def __init__(self, sink: list[Any]) -> None:
+        self._sink = sink
+        self.types: list[Any] = []
+
+    async def __aenter__(self) -> _FakeCopy:
+        self._sink.append(self)
+        return self
+
+    async def __aexit__(self, *_exc: object) -> bool:
+        return False
+
+    def set_types(self, types: list[Any]) -> None:
+        self.types = types
+
+    async def write_row(self, row: tuple[Any, ...]) -> None:
+        self._sink.append(row)
+
+
 class FakeCursor:
     """One cursor's worth of canned `fetchmany` results, plus an optional `fetchone` resolver."""
 
@@ -40,12 +71,16 @@ class FakeCursor:
         rows_batches: list[list[tuple[Any, ...]]] | None = None,
         fetchone_resolver: Any = None,
         executemany_log: list[tuple[str, list[tuple[Any, ...]]]] | None = None,
+        copy_log: list[Any] | None = None,
     ) -> None:
         self._batches = [list(batch) for batch in (rows_batches or [])]
         self._fetchone_resolver = fetchone_resolver
         self._last_execute_params: Any = None
         self.executed: list[tuple[str, Any]] = []
         self._executemany_log = executemany_log
+        self._copy_log = copy_log
+        self._last_sql = ""
+        self.adapters = _FakeAdapters()
 
     async def __aenter__(self) -> FakeCursor:
         return self
@@ -56,14 +91,22 @@ class FakeCursor:
     async def execute(self, sql: str, params: Any = None) -> None:
         self.executed.append((sql, params))
         self._last_execute_params = params
+        self._last_sql = sql
 
     async def fetchmany(self, _size: int) -> list[tuple[Any, ...]]:
         return self._batches.pop(0) if self._batches else []
 
     async def fetchone(self) -> tuple[Any, ...] | None:
+        if self._last_sql == pipeline._HALFVEC_OID_SQL:
+            return (_HALFVEC_OID,)
         if self._fetchone_resolver is None:
             return None
         return self._fetchone_resolver(self._last_execute_params)
+
+    def copy(self, sql: str) -> _FakeCopy:
+        assert self._copy_log is not None
+        self._copy_log.append(sql)
+        return _FakeCopy(self._copy_log)
 
     async def executemany(self, sql: str, batch: Any) -> None:
         rows = list(batch)
@@ -96,6 +139,7 @@ class FakeConnection:
             cursor_name: list((discovery_ids or {}).get(cursor_name, ())) for cursor_name, *_rest in pipeline._DISCOVERY_QUERIES
         }
         self.executemany_log: list[tuple[str, list[tuple[Any, ...]]]] = []
+        self.copy_log: list[Any] = []
         self.opened_cursor_names: list[str | None] = []
 
     def _resolve_already_loaded(self, params: Any) -> tuple[Any, ...] | None:
@@ -105,7 +149,7 @@ class FakeConnection:
     def cursor(self, name: str | None = None) -> FakeCursor:
         self.opened_cursor_names.append(name)
         if name is None:
-            return FakeCursor(fetchone_resolver=self._resolve_already_loaded, executemany_log=self.executemany_log)
+            return FakeCursor(fetchone_resolver=self._resolve_already_loaded, executemany_log=self.executemany_log, copy_log=self.copy_log)
         if name == "embedding_pipeline_vertices":
             return FakeCursor(rows_batches=[self.vertex_rows])
         for cursor_name, ids in self.discovery_ids.items():
@@ -176,6 +220,17 @@ _EDGE_ROWS: dict[str, list[tuple[Any, Any]]] = {
     "graph.track_credited_on": [],
     "graph.track_by_artist": [],
 }
+
+
+def _copy_batches(conn: FakeConnection) -> list[list[tuple[Any, ...]]]:
+    """The rows each `COPY` of `conn` received, one list per `_write_embeddings` call."""
+    batches: list[list[tuple[Any, ...]]] = []
+    for entry in conn.copy_log:
+        if entry == pipeline._COPY_SQL:
+            batches.append([])
+        elif isinstance(entry, tuple):
+            batches[-1].append(entry)
+    return batches
 
 
 def _fresh_connection(already_loaded_versions: frozenset[str] = frozenset()) -> FakeConnection:
@@ -286,19 +341,28 @@ class TestEmbeddingPipelineConfig:
 # ── Small pure helpers ───────────────────────────────────────────────────────────────────────
 
 
-class TestHalfvecLiteral:
-    def test_renders_pgvector_text_input_syntax(self) -> None:
-        vector = np.array([1.5, -2.0, 0.0], dtype=np.float16)
+class TestHalfvecBinaryRows:
+    def test_encodes_halfvec_recv_layout(self) -> None:
+        vectors = np.array([[1.5, -2.0, 0.0], [0.25, 3.0, -0.5]], dtype=np.float16)
 
-        assert pipeline._halfvec_literal(vector) == "[1.5,-2,0]"
+        rows = pipeline._halfvec_binary_rows(vectors)
 
-    def test_round_trips_full_dimensionality(self) -> None:
-        vector = np.zeros(128, dtype=np.float16)
+        assert len(rows) == 2
+        for payload, vector in zip(rows, vectors, strict=True):
+            assert struct.unpack(">HH", payload[:4]) == (3, 0)
+            assert np.frombuffer(payload[4:], dtype=">f2").tolist() == vector.tolist()
 
-        literal = pipeline._halfvec_literal(vector)
+    def test_rounds_a_wider_dtype_to_half_precision_like_the_column(self) -> None:
+        vector = np.array([[0.1, 1 / 3]], dtype=np.float32)
 
-        assert literal.startswith("[") and literal.endswith("]")
-        assert literal.count(",") == 127
+        (payload,) = pipeline._halfvec_binary_rows(vector)
+
+        assert np.frombuffer(payload[4:], dtype=">f2").tolist() == vector.astype(np.float16)[0].tolist()
+
+    def test_full_dimensionality_row_length(self) -> None:
+        (payload,) = pipeline._halfvec_binary_rows(np.zeros((1, 128), dtype=np.float16))
+
+        assert len(payload) == 4 + 128 * 2
 
 
 class TestStoredModelVersion:
@@ -874,7 +938,7 @@ class TestStreamEdgeBlocksTrackPerformers:
 
 class TestWriteEmbeddings:
     @pytest.mark.asyncio
-    async def test_writes_one_row_per_artist_with_the_given_lineage(self) -> None:
+    async def test_deletes_the_versions_rows_then_copies_one_row_per_artist_with_the_given_lineage(self) -> None:
         conn = _fresh_connection()
         artist_ids = ["1", "2", "3"]
         vectors = np.zeros((3, 4), dtype=np.float16)
@@ -885,26 +949,73 @@ class TestWriteEmbeddings:
         )
 
         assert rows_written == 3
-        assert len(conn.executemany_log) == 1
-        sql, batch = conn.executemany_log[0]
-        assert sql == pipeline._UPSERT_SQL
-        assert [row[0] for row in batch] == artist_ids
-        assert all(row[1] == "fastrp-v1" and row[3] == "dump-1" and row[4] == date(2026, 9, 1) for row in batch)
-        assert batch[1][2] == pipeline._halfvec_literal(vectors[1])
+        assert conn.executemany_log == []  # no per-row upsert round trips any more
+        assert conn.copy_log[0] == pipeline._COPY_SQL
+        copy = conn.copy_log[1]
+        rows = conn.copy_log[2:]
+        assert copy.types == ["text", "text", _HALFVEC_OID, "text", "date", "timestamptz"]
+        assert [row[0] for row in rows] == artist_ids
+        assert all(row[1] == "fastrp-v1" and row[3] == "dump-1" and row[4] == date(2026, 9, 1) for row in rows)
+        assert bytes(rows[1][2]) == pipeline._halfvec_binary_rows(vectors[1:2])[0]
+        assert isinstance(rows[1][2], pipeline._HalfvecBinary)
+
+    @pytest.mark.asyncio
+    async def test_deletes_only_this_stored_versions_rows_before_copying(self) -> None:
+        conn = _fresh_connection()
+        cursors: list[FakeCursor] = []
+        original = conn.cursor
+
+        def spy(name: str | None = None) -> FakeCursor:
+            cursor = original(name)
+            cursors.append(cursor)
+            return cursor
+
+        conn.cursor = spy  # type: ignore[method-assign]
+
+        await pipeline._write_embeddings(
+            conn, model_version="fastrp-v1@dump-1", dump_id="dump-1", dump_date=date(2026, 9, 1), artist_ids=["1"], vectors=np.zeros((1, 4))
+        )
+
+        statements = [sql for cursor in cursors for sql, _params in cursor.executed]
+        assert statements == [pipeline._HALFVEC_OID_SQL, pipeline._DELETE_VERSION_SQL]
+        delete_params = next(params for cursor in cursors for sql, params in cursor.executed if sql == pipeline._DELETE_VERSION_SQL)
+        assert delete_params == ("fastrp-v1@dump-1",)
+
+    @pytest.mark.asyncio
+    async def test_binds_the_payload_type_to_the_halfvec_oid(self) -> None:
+        conn = _fresh_connection()
+        cursors: list[FakeCursor] = []
+        original = conn.cursor
+
+        def spy(name: str | None = None) -> FakeCursor:
+            cursor = original(name)
+            cursors.append(cursor)
+            return cursor
+
+        conn.cursor = spy  # type: ignore[method-assign]
+
+        await pipeline._write_embeddings(conn, model_version="v", dump_id="d", dump_date=date(2026, 9, 1), artist_ids=["1"], vectors=np.zeros((1, 4)))
+
+        ((payload_type, dumper),) = next(cursor.adapters.dumpers for cursor in cursors if cursor.adapters.dumpers)
+        assert payload_type is pipeline._HalfvecBinary
+        assert dumper.oid == _HALFVEC_OID
 
     @pytest.mark.asyncio
     async def test_batches_large_artist_sets(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(pipeline, "_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr(pipeline, "_COPY_BATCH_SIZE", 2)
         conn = _fresh_connection()
         artist_ids = ["1", "2", "3", "4", "5"]
-        vectors = np.zeros((5, 4), dtype=np.float16)
+        vectors = np.arange(5 * 4, dtype=np.float16).reshape(5, 4)
 
         rows_written = await pipeline._write_embeddings(
             conn, model_version="fastrp-v1", dump_id="dump-1", dump_date=date(2026, 9, 1), artist_ids=artist_ids, vectors=vectors
         )
 
+        rows = conn.copy_log[2:]
         assert rows_written == 5
-        assert [len(rows) for _sql, rows in conn.executemany_log] == [2, 2, 1]
+        assert [row[0] for row in rows] == artist_ids
+        for index, row in enumerate(rows):
+            assert np.frombuffer(bytes(row[2])[4:], dtype=">f2").tolist() == vectors[index].tolist()
 
 
 # ── End-to-end load, without a database ─────────────────────────────────────────────────────
@@ -926,8 +1037,7 @@ class TestLoadEmbeddings:
         assert result.method_version == config.model_version
         assert result.model_version == expected_version
         assert result.rows_written == 3
-        assert len(conn.executemany_log) == 1
-        _sql, batch = conn.executemany_log[0]
+        (batch,) = _copy_batches(conn)
         assert sorted(row[0] for row in batch) == ["1", "2", "3"]
         assert all(row[1] == expected_version for row in batch)
 
@@ -977,7 +1087,7 @@ class TestLoadEmbeddings:
 
     @pytest.mark.asyncio
     async def test_never_touches_a_row_of_a_different_model_version(self) -> None:
-        """The upsert's ON CONFLICT target and the idempotency check are both scoped to
+        """The version-scoped DELETE and the idempotency check are both scoped to
         this call's own stored model_version — verified here at the SQL-parameter level."""
         conn = _fresh_connection()
         pool = FakePool(conn)
@@ -985,7 +1095,7 @@ class TestLoadEmbeddings:
 
         await pipeline.load_embeddings(pool, config, "dump-1", date(2026, 9, 1))
 
-        _sql, batch = conn.executemany_log[0]
+        (batch,) = _copy_batches(conn)
         assert all(row[1] == pipeline.stored_model_version(config, "dump-1") for row in batch)
 
     @pytest.mark.asyncio
@@ -1005,9 +1115,9 @@ class TestLoadEmbeddings:
         assert first.model_version != second.model_version
         assert first.model_version == pipeline.stored_model_version(config, "dump-1")
         assert second.model_version == pipeline.stored_model_version(config, "dump-2")
-        assert len(conn.executemany_log) == 2
-        first_versions = {row[1] for row in conn.executemany_log[0][1]}
-        second_versions = {row[1] for row in conn.executemany_log[1][1]}
+        first_batch, second_batch = _copy_batches(conn)
+        first_versions = {row[1] for row in first_batch}
+        second_versions = {row[1] for row in second_batch}
         assert first_versions == {first.model_version}
         assert second_versions == {second.model_version}
 

@@ -73,7 +73,7 @@ DEFAULT_CHECKPOINT_EVERY_S: Final = 1800.0
 _TASK_BYTES_PER_BLOCK_CELL: Final = 16
 
 _DELETE_VERSION_SQL: Final = f"DELETE FROM {SIMILAR_ARTISTS_TABLE} WHERE release_id = %s"  # noqa: S608
-_COPY_SQL: Final = f"COPY {SIMILAR_ARTISTS_TABLE} (release_id, artist_id, similar_artist_ids, scores) FROM STDIN"
+_COPY_SQL: Final = f"COPY {SIMILAR_ARTISTS_TABLE} (release_id, artist_id, similar_artist_ids, scores) FROM STDIN (FORMAT BINARY)"
 # The producer helpers' own lock, so this stage and their publish/retire checks serialize on one mode.
 _RELEASE_LOCK_SQL: Final = schema_postgres._ARTIST_EMBEDDING_RELEASES_LOCK_SQL
 _RELEASE_WRITE_GUARD_SQL: Final = f"SELECT artists FROM {RELEASES_TABLE} WHERE release_id = %s FOR UPDATE"  # noqa: S608
@@ -83,7 +83,12 @@ _COPY_CHUNK_ARTISTS: Final = 20_000
 _RELEASE_EXISTS_SQL: Final = f"SELECT 1 FROM {RELEASES_TABLE} WHERE model_version = %s AND artists > 0"  # noqa: S608
 # Artist order fixes catalog positions, and so the tie order: equal scores rank by artist_id.
 _COUNT_EMBEDDINGS_SQL: Final = "SELECT count(*) FROM public.artist_embeddings WHERE model_version = %s"
-_READ_EMBEDDINGS_SQL: Final = "SELECT artist_id, embedding::text FROM public.artist_embeddings WHERE model_version = %s ORDER BY artist_id"
+# `embedding` is selected as-is and read in binary format: pgvector's `halfvec_send` is two
+# big-endian int16 (dimensions, unused) then one big-endian IEEE half per dimension, so a
+# fetched block is parsed with one NumPy view instead of `::text` formatting on the server and
+# a `str.split` / float parse per value on the client.
+_READ_EMBEDDINGS_SQL: Final = "SELECT artist_id, embedding FROM public.artist_embeddings WHERE model_version = %s ORDER BY artist_id"
+_HALFVEC_HEADER_HALFWORDS: Final = 2
 _FETCH_SIZE: Final = 50_000
 
 
@@ -289,8 +294,8 @@ def _save_checkpoint(spool: Spool, state: TopKState, next_block: int) -> None:
 def _copy_rows(spool: Spool, artist_ids: Sequence[str], release_id: int) -> Iterator[tuple[int, str, list[str], list[float]]]:
     """One compact COPY row per artist, with ordered, paired neighbour arrays.
 
-    `write_row` delegates quoting/escaping of arbitrary text ids to psycopg, including
-    commas, braces, backslashes, tabs, and newlines. Unfilled slots are omitted together.
+    `write_row` runs in binary COPY format, so arbitrary text ids (commas, braces, backslashes,
+    tabs, newlines) need no quoting at all. Unfilled slots are omitted together.
     """
     for start in range(0, spool.n_artists, _COPY_CHUNK_ARTISTS):
         stop = min(start + _COPY_CHUNK_ARTISTS, spool.n_artists)
@@ -335,6 +340,7 @@ async def write_similar_artists(
             raise PublishError(f"refusing to overwrite published or missing release {model_version!r}")
         await cursor.execute(_DELETE_VERSION_SQL, (release_id,))
         async with cursor.copy(_COPY_SQL) as copy:
+            copy.set_types(["int4", "text", "text[]", "float4[]"])
             for row in _copy_rows(spool, artist_ids, release_id):
                 await copy.write_row(row)
                 rows += 1
@@ -415,6 +421,23 @@ async def publish_and_rotate(
 # ── The monthly stage ────────────────────────────────────────────────────────────────────────
 
 
+def _parse_halfvec_block(blobs: Sequence[bytes]) -> NDArray[np.float16]:
+    """Decode a block of binary `halfvec` values into one ``(rows, dimensions)`` float16 array.
+
+    Raises:
+        ValueError: If a value is not a well-formed `halfvec_send` payload, or the block mixes
+            dimensions -- better a loud failure than vectors silently shifted by a column.
+    """
+    words = np.frombuffer(b"".join(blobs), dtype=">u2")
+    dimensions = len(blobs[0]) // 2 - _HALFVEC_HEADER_HALFWORDS
+    if dimensions < 1 or words.size != len(blobs) * (dimensions + _HALFVEC_HEADER_HALFWORDS):
+        raise ValueError("binary halfvec block has rows of different lengths")
+    rows = words.reshape(len(blobs), dimensions + _HALFVEC_HEADER_HALFWORDS)
+    if bool(np.any(rows[:, 0] != dimensions)) or bool(np.any(rows[:, 1] != 0)):
+        raise ValueError("binary halfvec block has an unexpected header")
+    return np.ascontiguousarray(rows[:, _HALFVEC_HEADER_HALFWORDS:]).astype(np.uint16).view(np.float16)
+
+
 async def read_embeddings(conn: Any, model_version: str) -> tuple[list[str], NDArray[np.float16]]:
     """Every artist's stored vector for ``model_version``, in ``artist_id`` order, as
     ``float16`` (the ``halfvec`` column's own precision), streamed through a named cursor
@@ -427,13 +450,13 @@ async def read_embeddings(conn: Any, model_version: str) -> tuple[list[str], NDA
             (count,) = await cursor.fetchone()
         vectors: NDArray[np.float16] | None = None
         async with conn.cursor(name="similar_artists_embeddings") as cursor:
-            await cursor.execute(_READ_EMBEDDINGS_SQL, (model_version,))
+            await cursor.execute(_READ_EMBEDDINGS_SQL, (model_version,), binary=True)
             while batch := await cursor.fetchmany(_FETCH_SIZE):
-                parsed = np.array([text[1:-1].split(",") for _artist_id, text in batch], dtype=np.float32)
+                parsed = _parse_halfvec_block([blob for _artist_id, blob in batch])
                 if vectors is None:
                     vectors = np.empty((count, parsed.shape[1]), dtype=np.float16)
                 vectors[len(ids) : len(ids) + len(batch)] = parsed
-                ids.extend(artist_id for artist_id, _text in batch)
+                ids.extend(artist_id for artist_id, _blob in batch)
     if vectors is None:
         return [], np.empty((0, 0), dtype=np.float16)
     return ids, vectors[: len(ids)]

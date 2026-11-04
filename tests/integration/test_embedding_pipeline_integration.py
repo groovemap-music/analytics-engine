@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from datetime import date
 from typing import TYPE_CHECKING
 
+import numpy as np
 import psycopg
 import pytest
 
@@ -115,6 +116,41 @@ async def test_two_dumps_coexist_and_the_earlier_ones_rows_are_untouched(pipelin
     rerun_first = await load_embeddings(pipeline_pool, config, DUMP_ID, DUMP_DATE)
     assert rerun_first.skipped is True
     assert rerun_first.model_version == first.model_version
+
+
+async def test_binary_read_back_matches_the_stored_halfvec_text_exactly(pipeline_pool: AsyncPostgreSQLPool) -> None:
+    """`read_embeddings` decodes `halfvec_send` bytes; PostgreSQL's own `::text` is the oracle."""
+    from insights.similar_artists import read_embeddings
+
+    result = await load_embeddings(pipeline_pool, FastRPConfig(), DUMP_ID, DUMP_DATE)
+    async with pipeline_pool.connection() as conn:
+        ids, vectors = await read_embeddings(conn, result.model_version)
+    stored = await _embedding_rows(pipeline_pool, result.model_version)
+
+    assert ids == [row[0] for row in stored]
+    assert vectors.dtype == np.float16
+    for index, row in enumerate(stored):
+        # The text form prints each half as its shortest float32; it narrows back to the same half.
+        oracle = np.array(row[4][1:-1].split(","), dtype=np.float32).astype(np.float16)
+        assert vectors[index].view(np.uint16).tolist() == oracle.view(np.uint16).tolist()
+
+
+async def test_write_replaces_a_partial_earlier_attempt_of_the_same_version(pipeline_pool: AsyncPostgreSQLPool) -> None:
+    """Crash-retry: rows an earlier attempt of this stored version left behind are replaced, not
+    duplicated, and another version's rows are untouched. `COPY` has no `ON CONFLICT`."""
+    from insights.embedding_pipeline import _write_embeddings
+
+    vectors = np.arange(3 * 128, dtype=np.float16).reshape(3, 128) / 7
+    async with pipeline_pool.connection() as conn:
+        await _write_embeddings(conn, model_version="v@a", dump_id="a", dump_date=DUMP_DATE, artist_ids=["1", "2"], vectors=vectors[:2])
+        await _write_embeddings(conn, model_version="v@other", dump_id="o", dump_date=DUMP_DATE, artist_ids=["1"], vectors=vectors[:1])
+        written = await _write_embeddings(conn, model_version="v@a", dump_id="a2", dump_date=DUMP_DATE, artist_ids=["1", "2", "3"], vectors=vectors)
+
+    assert written == 3
+    rows = await _embedding_rows(pipeline_pool, "v@a")
+    assert [row[0] for row in rows] == ["1", "2", "3"]
+    assert {row[1] for row in rows} == {"a2"}
+    assert len(await _embedding_rows(pipeline_pool, "v@other")) == 1
 
 
 @pytest.mark.parametrize(
