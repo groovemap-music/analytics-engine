@@ -119,13 +119,13 @@ from common import (
 )
 from common.config import _build_postgres_connstr, get_secret
 
-from insights.embeddings import AdjacencyBuilder, FastRPConfig, NodeIndex, fastrp, node_keys
+from insights.embeddings import Adjacency, AdjacencyBuilder, FastRPConfig, NodeIndex, fastrp, node_keys
 from insights.similar_artists import run_similar_artists
 from insights.telemetry import computation_span, record_computation, record_embedding_pipeline_failure, record_embedding_rows_written
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     from numpy.typing import NDArray
 
@@ -181,20 +181,14 @@ _DROPPED_CREDIT_CATEGORIES: Final[tuple[str, ...]] = ("mastering", "design", "ma
 # separates -- see docs/embeddings.md's "Release-level credited-artist edges" for the full
 # argument and the real-catalog measurement this fan-out-vs-drop choice is pending.
 _CREDITED_ARTIST_EDGE_SQL: Final = """
-SELECT DISTINCT credited_on.release_id AS release_id, same_as.artist_id AS artist_id
+SELECT credited_on.release_id AS release_id, same_as.artist_id AS artist_id
 FROM graph.credited_on AS credited_on
 JOIN graph.same_as AS same_as ON same_as.person_name = credited_on.person_name
 WHERE credited_on.role_category = ANY(%s)
 """
 
-# The two vertex-discovery queries `_read_vertices` runs beyond `graph.vertex_degree` -- see
+# The release-discovery query `_read_vertices` runs beyond `graph.vertex_degree` -- see
 # that function's docstring for why a credited-only artist or release needs one at all.
-_CREDITED_ARTIST_IDS_SQL: Final = """
-SELECT DISTINCT same_as.artist_id AS artist_id
-FROM graph.credited_on AS credited_on
-JOIN graph.same_as AS same_as ON same_as.person_name = credited_on.person_name
-WHERE credited_on.role_category = ANY(%s)
-"""
 _CREDITED_RELEASE_IDS_SQL: Final = """
 SELECT DISTINCT release_id
 FROM graph.credited_on
@@ -227,13 +221,7 @@ WHERE role_category = ANY(%s)
 # release-level one still contributes a genuinely new edge; one that does match contributes
 # nothing beyond what the release-level relation already said.
 _TRACK_CREDITED_ARTIST_EDGE_SQL: Final = """
-SELECT DISTINCT track_credited_on.release_id AS release_id, same_as.artist_id AS artist_id
-FROM graph.track_credited_on AS track_credited_on
-JOIN graph.same_as AS same_as ON same_as.person_name = track_credited_on.person_name
-WHERE track_credited_on.role_category = ANY(%s)
-"""
-_TRACK_CREDITED_ARTIST_IDS_SQL: Final = """
-SELECT DISTINCT same_as.artist_id AS artist_id
+SELECT track_credited_on.release_id AS release_id, same_as.artist_id AS artist_id
 FROM graph.track_credited_on AS track_credited_on
 JOIN graph.same_as AS same_as ON same_as.person_name = track_credited_on.person_name
 WHERE track_credited_on.role_category = ANY(%s)
@@ -257,12 +245,13 @@ WHERE role_category = ANY(%s)
 # release level -- and the chw.2 spike keeps the same split: `trackartists` is its own CSR list,
 # disjoint from `credits` (`parse_dump.py`'s `LISTS` and the `_parse_chunk` row tuple never
 # combine them). One row per distinct (release, artist) mirrors the release-level `by_artist`
-# scan, which also does not deduplicate a repeated main-artist row itself -- the `DISTINCT` here
-# only collapses the same artist performing on more than one track of the same release, not
-# anything role- or track-identity-related the way the credited-artist queries collapse role
-# fan-out.
-_TRACK_PERFORMER_EDGE_SQL: Final = "SELECT DISTINCT release_id, artist_id FROM graph.track_by_artist"
-_TRACK_PERFORMER_ARTIST_IDS_SQL: Final = "SELECT DISTINCT artist_id FROM graph.track_by_artist"
+# scan, which also does not deduplicate a repeated main-artist row itself. The same artist
+# performing on several tracks of one release streams as repeated (release, artist) rows, and
+# so does a credited person with several roles on one release; none of them is deduplicated in
+# SQL, because `Adjacency`'s `build()` already collapses parallel edges and a server-side
+# `DISTINCT` only forces PostgreSQL to hold or spill every output row first (gm-analytics-
+# engine-wf4h: 425-637 MB of temp per query at a fifth of the data).
+_TRACK_PERFORMER_EDGE_SQL: Final = "SELECT release_id, artist_id FROM graph.track_by_artist"
 _TRACK_PERFORMER_RELEASE_IDS_SQL: Final = "SELECT DISTINCT release_id FROM graph.track_by_artist"
 
 # (name, query, params, source kind, target kind) for every edge relation that connects two of
@@ -270,7 +259,7 @@ _TRACK_PERFORMER_RELEASE_IDS_SQL: Final = "SELECT DISTINCT release_id FROM graph
 # style, plus the release<->artist credited-artist, track-credited-artist, and track-performer
 # edges ieu.6 and this bead added. The first eight are plain table scans, declared in
 # database-schema's `graph.catalog` property graph (docs/architecture.md, "Property graph");
-# the last three are filtered joins or DISTINCT scans over base tables that are not (yet) a
+# the last three are filtered joins or scans over base tables that are not (yet) a
 # `graph.catalog` edge label, so each carries its own query and bind params rather than being
 # built from a bare table/column pair like the first eight.
 _EDGE_RELATIONS: Final[tuple[tuple[str, str, tuple[Any, ...], str, str], ...]] = (
@@ -287,17 +276,16 @@ _EDGE_RELATIONS: Final[tuple[tuple[str, str, tuple[Any, ...], str, str], ...]] =
     ("graph.track_by_artist", _TRACK_PERFORMER_EDGE_SQL, (), "r", "a"),
 )
 
-# Every vertex-discovery query `_read_vertices` runs beyond `graph.vertex_degree` -- see that
-# function's docstring for why a credited-only or track-only artist or release needs one at
-# all. `kind` says which vertex kind the query's single returned column names ("a" artist, "r"
-# release); `_read_vertices` folds every "a" query's results into the same de-duplicated
-# `artist_ids` list it returns, in the order each id is first seen across all of them.
+# Every release-discovery query `_read_vertices` runs beyond `graph.vertex_degree` -- see that
+# function's docstring for why a credit-only or track-only release needs one at all. `kind` is
+# always "r": credited and track-performing *artists* are discovered from the edge stream itself
+# (`_stream_edge_blocks`), not by repeating the `same_as` join here (gm-analytics-engine-wf4h).
+# These keep their `DISTINCT` -- they scan one table with no join and cost under a second --
+# and they cover a release whose every credit fails to resolve through `same_as`, which
+# contributes no edge and so could not be discovered from the stream.
 _DISCOVERY_QUERIES: Final[tuple[tuple[str, str, tuple[Any, ...], str], ...]] = (
-    ("credited_artist_ids", _CREDITED_ARTIST_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),), "a"),
     ("credited_release_ids", _CREDITED_RELEASE_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),), "r"),
-    ("track_credited_artist_ids", _TRACK_CREDITED_ARTIST_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),), "a"),
     ("track_credited_release_ids", _TRACK_CREDITED_RELEASE_IDS_SQL, (list(_KEPT_CREDIT_CATEGORIES),), "r"),
-    ("track_performer_artist_ids", _TRACK_PERFORMER_ARTIST_IDS_SQL, (), "a"),
     ("track_performer_release_ids", _TRACK_PERFORMER_RELEASE_IDS_SQL, (), "r"),
 )
 
@@ -566,8 +554,29 @@ async def _discover_ids(conn: Any, cursor_name: str, query: str, params: tuple[A
     return ids
 
 
-async def _read_vertices(conn: Any) -> tuple[NodeIndex, list[str]]:
-    """Stream every `(kind, key)` vertex of the six FastRP kinds; return it and the artist ids.
+@dataclass
+class _VertexSet:
+    """The vertices known so far: key blocks, plus the artist ids in first-seen order.
+
+    `artist_ids` and `seen_artist_ids` grow while the edges stream, because a credited artist
+    with no `graph.vertex_degree` row is only known once an edge names it.
+    """
+
+    key_chunks: list[NDArray[np.uint64]]
+    artist_ids: list[str]
+    seen_artist_ids: set[str]
+
+    def add_artists(self, candidate_ids: Iterable[str]) -> None:
+        """Record every artist id not seen before, as a key block and in `artist_ids`."""
+        new_ids = [artist_id for artist_id in dict.fromkeys(candidate_ids) if artist_id not in self.seen_artist_ids]
+        if new_ids:
+            self.seen_artist_ids.update(new_ids)
+            self.key_chunks.append(node_keys(("a", artist_id) for artist_id in new_ids))
+            self.artist_ids.extend(new_ids)
+
+
+async def _read_vertices(conn: Any) -> _VertexSet:
+    """Stream the vertices that need no edge: `graph.vertex_degree` plus credited releases.
 
     Named (server-side) cursors, so no full result set is ever materialized as a Python list
     in one piece. PostgreSQL only allows `DECLARE CURSOR` inside a transaction block, so this
@@ -579,21 +588,17 @@ async def _read_vertices(conn: Any) -> tuple[NodeIndex, list[str]]:
     derived_from, alias_of, artist_member_of) — `credited_on`, `same_as`, `track_credited_on`,
     and `track_by_artist` are deliberately absent from that list. An artist credited only via
     `extraartists` (release- or track-level) — never a main artist, an alias, or a group member
-    — therefore has no `graph.vertex_degree` row at all, and the credited-artist edges
-    (`_CREDITED_ARTIST_EDGE_SQL`, `_TRACK_CREDITED_ARTIST_EDGE_SQL`) or the track-performer edge
-    (`_TRACK_PERFORMER_EDGE_SQL`) would then name a node this pipeline had never seen; the same
-    is true, in principle, of a release asserting only credits or track data and none of the
-    other eight relations. `_DISCOVERY_QUERIES` runs one extra query per artist- or
-    release-shaped gap each of the three added relations can open, over the same kept-category
-    filter the credit queries already use, so every endpoint `_stream_edge_blocks` will later
-    ask `NodeIndex.positions` for already has a node. Every discovery query is an unordered
-    `SELECT DISTINCT`; the final `np.unique` sorts and dedupes the combined key array, so the
-    resulting node set (and therefore the resulting embeddings) does not depend on the order
-    PostgreSQL happens to return any of them in.
+    — therefore has no `graph.vertex_degree` row at all. Those artists are *not* discovered
+    here: `_stream_edge_blocks` adds every artist an edge names, which is the same set the old
+    per-relation `SELECT DISTINCT artist_id` discovery queries returned, without running the
+    `credited_on JOIN same_as` a second time (gm-analytics-engine-wf4h). A release asserting
+    only credits or track data, none of the other eight relations, is still discovered here by
+    `_DISCOVERY_QUERIES`, because a release whose credits resolve to no `same_as` row yields
+    no edge. Both are unordered; the final `np.unique` in `_assemble` sorts and dedupes the
+    combined key array, so the resulting node set (and therefore the resulting embeddings)
+    does not depend on the order PostgreSQL happens to return any of them in.
     """
-    key_chunks: list[NDArray[np.uint64]] = []
-    artist_ids: list[str] = []
-    seen_artist_ids: set[str] = set()
+    vertices = _VertexSet(key_chunks=[], artist_ids=[], seen_artist_ids=set())
     async with conn.transaction():
         async with conn.cursor(name="embedding_pipeline_vertices") as cursor:
             await cursor.execute("SELECT kind, key FROM graph.vertex_degree WHERE kind = ANY(%s)", (list(_VERTEX_KINDS),))
@@ -601,31 +606,28 @@ async def _read_vertices(conn: Any) -> tuple[NodeIndex, list[str]]:
                 batch = await cursor.fetchmany(_CURSOR_FETCH_SIZE)
                 if not batch:
                     break
-                key_chunks.append(node_keys(batch))
+                vertices.key_chunks.append(node_keys(batch))
                 for kind, key in batch:
-                    if kind == "a" and key not in seen_artist_ids:
-                        seen_artist_ids.add(key)
-                        artist_ids.append(key)
+                    if kind == "a" and key not in vertices.seen_artist_ids:
+                        vertices.seen_artist_ids.add(key)
+                        vertices.artist_ids.append(key)
         for cursor_name, query, params, kind in _DISCOVERY_QUERIES:
             ids = await _discover_ids(conn, cursor_name, query, params)
-            if kind == "a":
-                new_ids = [artist_id for artist_id in ids if artist_id not in seen_artist_ids]
-                seen_artist_ids.update(new_ids)
-                if new_ids:
-                    key_chunks.append(node_keys((kind, artist_id) for artist_id in new_ids))
-                    artist_ids.extend(new_ids)
-            elif ids:
-                key_chunks.append(node_keys((kind, key) for key in ids))
-    keys = np.unique(np.concatenate(key_chunks)) if key_chunks else np.zeros(0, dtype=np.uint64)
-    return NodeIndex(keys), artist_ids
+            if ids:
+                vertices.key_chunks.append(node_keys((kind, key) for key in ids))
+    return vertices
 
 
-async def _stream_edge_blocks(conn: Any, builder: AdjacencyBuilder) -> None:
-    """Add every edge of the eleven relations that connect the six FastRP kinds, in blocks.
+async def _stream_edge_blocks(conn: Any, vertices: _VertexSet) -> list[tuple[NDArray[np.uint64], NDArray[np.uint64]]]:
+    """Read every edge of the eleven relations in blocks; return them as node-key pairs.
 
     One read-only transaction for the whole scan — see `_read_vertices` on why a named
-    cursor needs one.
+    cursor needs one. Every artist an edge names that `graph.vertex_degree` did not list is
+    added to `vertices` here, so the node set exists once the stream ends. The edges stay as
+    key pairs until `_assemble` builds the `NodeIndex` that turns them into positions; that
+    holds 16 bytes per streamed edge until then, against the 8 the position blocks cost.
     """
+    blocks: list[tuple[NDArray[np.uint64], NDArray[np.uint64]]] = []
     async with conn.transaction():
         for name, query, params, source_kind, target_kind in _EDGE_RELATIONS:
             cursor_name = f"embedding_pipeline_{name.replace('.', '_')}"
@@ -635,9 +637,35 @@ async def _stream_edge_blocks(conn: Any, builder: AdjacencyBuilder) -> None:
                     batch = await cursor.fetchmany(_CURSOR_FETCH_SIZE)
                     if not batch:
                         break
-                    sources = node_keys((source_kind, str(source_key)) for source_key, _target_key in batch)
-                    targets = node_keys((target_kind, str(target_key)) for _source_key, target_key in batch)
-                    builder.add_edges(sources, targets)
+                    sources = [str(source_key) for source_key, _target_key in batch]
+                    targets = [str(target_key) for _source_key, target_key in batch]
+                    if source_kind == "a":
+                        vertices.add_artists(sources)
+                    if target_kind == "a":
+                        vertices.add_artists(targets)
+                    blocks.append((node_keys((source_kind, key) for key in sources), node_keys((target_kind, key) for key in targets)))
+    return blocks
+
+
+def _assemble(vertices: _VertexSet, blocks: list[tuple[NDArray[np.uint64], NDArray[np.uint64]]]) -> tuple[NodeIndex, list[str], Adjacency]:
+    """Build the `NodeIndex` from every vertex seen, then the CSR adjacency from the edge blocks.
+
+    Blocks are consumed as they are converted, so the key pairs are freed progressively.
+    """
+    keys = np.unique(np.concatenate(vertices.key_chunks)) if vertices.key_chunks else np.zeros(0, dtype=np.uint64)
+    nodes = NodeIndex(keys)
+    builder = AdjacencyBuilder(nodes)
+    while blocks:
+        sources, targets = blocks.pop()
+        builder.add_edges(sources, targets)
+    return nodes, vertices.artist_ids, builder.build()
+
+
+async def _read_graph(conn: Any) -> tuple[NodeIndex, list[str], Adjacency]:
+    """Read the whole graph: vertices, then edges once, then the node index and adjacency."""
+    vertices = await _read_vertices(conn)
+    blocks = await _stream_edge_blocks(conn, vertices)
+    return _assemble(vertices, blocks)
 
 
 async def _write_embeddings(
@@ -711,14 +739,10 @@ async def load_embeddings(pool: AsyncPostgreSQLPool, config: FastRPConfig, dump_
             logger.info("⏭️ Embedding load skipped — already loaded", model_version=version, dump_id=dump_id)
             return LoadResult(method_version=config.model_version, model_version=version, rows_written=0, skipped=True)
 
-        nodes, artist_ids = await _read_vertices(conn)
+        nodes, artist_ids, adjacency = await _read_graph(conn)
         if not artist_ids:
             logger.warning("⚠️ No artist vertices found in the graph — nothing to embed", model_version=version, dump_id=dump_id)
             return LoadResult(method_version=config.model_version, model_version=version, rows_written=0, skipped=False)
-
-        builder = AdjacencyBuilder(nodes)
-        await _stream_edge_blocks(conn, builder)
-        adjacency = builder.build()
 
         artist_positions = nodes.positions(node_keys(("a", artist_id) for artist_id in artist_ids))
         # float16 output: the stored column is `halfvec`, so a wider dtype buys nothing and

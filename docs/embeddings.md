@@ -171,10 +171,14 @@ follow-up rather than guessed at here.
 
 Because a session player or producer credited only this way is never a main artist, an alias,
 or a group member, `graph.vertex_degree` — scoped to the ten path-traversal relations
-database-schema sums it over — has no row for them. `_read_vertices` runs two extra discovery
-queries (over the same kept-category filter) to find exactly those artist and, defensively,
-release ids before building the node index, so the credited-artist edge never names a vertex
-the pipeline has not already seen; see that function's docstring.
+database-schema sums it over — has no row for them. The edge stream names them: `_stream_edge_blocks`
+adds every artist an edge returns that `graph.vertex_degree` did not list, and the node index is
+built after the stream, so the credited-artist edge never names a vertex the pipeline has not
+seen. A cheap release-id discovery query (`_CREDITED_RELEASE_IDS_SQL`, over the same
+kept-category filter, no join) still runs for releases whose credits resolve to no artist; see
+`_read_vertices`'s docstring. The artist set used to come from a second run of the same
+`credited_on JOIN same_as` (gm-analytics-engine-wf4h removed it), and the edge queries no longer
+apply a server-side `DISTINCT`, because `Adjacency`'s `build()` collapses parallel edges.
 
 `FASTRP_ALGORITHM_VERSION`/`config.model_version` cover the *algorithm*; they do not change
 when the graph fed into it does. So that a dump reprocessed under a different edge set can
@@ -221,11 +225,10 @@ its own edge, mirroring the spike's own separate `trackartists` list.
 
 `graph.vertex_degree`'s ten path-traversal relations cover neither new relation, so an artist or
 release reachable only through a track-level credit or performer needs the same discovery
-treatment ieu.6 introduced for release-level credits: `_read_vertices` runs one artist- and one
-release-discovery query per new relation (`_TRACK_CREDITED_ARTIST_IDS_SQL`/
-`_TRACK_CREDITED_RELEASE_IDS_SQL`, `_TRACK_PERFORMER_ARTIST_IDS_SQL`/
-`_TRACK_PERFORMER_RELEASE_IDS_SQL`), over the same kept-category filter where one applies, before
-building the node index.
+treatment ieu.6 introduced for release-level credits: the artists come from the edge stream, and
+`_read_vertices` runs one release-discovery query per new relation
+(`_TRACK_CREDITED_RELEASE_IDS_SQL`, `_TRACK_PERFORMER_RELEASE_IDS_SQL`), over the same
+kept-category filter where one applies, before building the node index.
 
 `_EDGE_SET_VERSION` bumps to `"edges-v3"` for these two relations — see "The stored
 `model_version` is per dump and per edge set, not per algorithm" below — and see "Updated for
