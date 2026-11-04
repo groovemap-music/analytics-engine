@@ -76,7 +76,7 @@ class FakeConnection:
 
     `discovery_ids` stands in for what every `_DISCOVERY_QUERIES` entry would discover beyond
     `graph.vertex_degree` — see `_read_vertices`'s docstring — keyed by the same cursor-name
-    suffix `_DISCOVERY_QUERIES` uses (e.g. `"credited_artist_ids"`, `"track_performer_artist_ids"`).
+    suffix `_DISCOVERY_QUERIES` uses (`"credited_release_ids"`, `"track_credited_release_ids"`, `"track_performer_release_ids"`).
     Defaults every entry `pipeline._DISCOVERY_QUERIES` declares to empty, so a fixture that never
     mentions credited- or track-only vertices behaves exactly as it did before this bead.
     """
@@ -457,7 +457,7 @@ class TestReadVertices:
     async def test_returns_a_node_index_over_all_six_kinds_and_every_artist_id(self) -> None:
         conn = _fresh_connection()
 
-        nodes, artist_ids = await pipeline._read_vertices(conn)
+        nodes, artist_ids, _adjacency = await pipeline._read_graph(conn)
 
         assert len(nodes) == len(_VERTEX_ROWS)
         assert sorted(artist_ids) == ["1", "2", "3"]
@@ -466,14 +466,10 @@ class TestReadVertices:
 class TestStreamEdgeBlocks:
     @pytest.mark.asyncio
     async def test_builds_an_adjacency_connecting_every_shared_release_and_master(self) -> None:
-        from insights.embeddings import AdjacencyBuilder, node_key
+        from insights.embeddings import node_key
 
         conn = _fresh_connection()
-        nodes, _artist_ids = await pipeline._read_vertices(conn)
-        builder = AdjacencyBuilder(nodes)
-
-        await pipeline._stream_edge_blocks(conn, builder)
-        adjacency = builder.build()
+        nodes, _artist_ids, adjacency = await pipeline._read_graph(conn)
 
         artist_1 = nodes.positions([node_key("a", "1")])[0]
         artist_2 = nodes.positions([node_key("a", "2")])[0]
@@ -519,10 +515,11 @@ class TestCreditedArtistEdgeSql:
         assert params == (list(pipeline._KEPT_CREDIT_CATEGORIES),)
         assert (source_kind, target_kind) == ("r", "a")
 
-    def test_discovery_queries_use_the_same_kept_categories(self) -> None:
-        assert "role_category = ANY(%s)" in pipeline._CREDITED_ARTIST_IDS_SQL
-        assert "graph.same_as" in pipeline._CREDITED_ARTIST_IDS_SQL
+    def test_release_discovery_uses_the_same_kept_categories(self) -> None:
         assert "role_category = ANY(%s)" in pipeline._CREDITED_RELEASE_IDS_SQL
+
+    def test_edge_query_leaves_deduplication_to_the_csr_build(self) -> None:
+        assert "DISTINCT" not in pipeline._CREDITED_ARTIST_EDGE_SQL
 
 
 def _connection_isolating_relation(
@@ -552,7 +549,6 @@ def _connection_isolating_relation(
 def _connection_with_credited_edges(
     *,
     credited_edges: list[tuple[str, str]],
-    credited_artist_ids: tuple[str, ...] = (),
     credited_release_ids: tuple[str, ...] = (),
     vertex_rows: list[tuple[str, str]] | None = None,
 ) -> FakeConnection:
@@ -560,7 +556,7 @@ def _connection_with_credited_edges(
     return _connection_isolating_relation(
         relation="graph.credited_on",
         edges=credited_edges,
-        discovery_ids={"credited_artist_ids": credited_artist_ids, "credited_release_ids": credited_release_ids},
+        discovery_ids={"credited_release_ids": credited_release_ids},
         vertex_rows=vertex_rows,
     )
 
@@ -573,9 +569,9 @@ class TestReadVerticesCreditedArtists:
         `_read_vertices`'s docstring."""
         from insights.embeddings import node_key
 
-        conn = _connection_with_credited_edges(credited_edges=[("101", "99")], credited_artist_ids=("99",))
+        conn = _connection_with_credited_edges(credited_edges=[("101", "99")])
 
-        nodes, artist_ids = await pipeline._read_vertices(conn)
+        nodes, artist_ids, _adjacency = await pipeline._read_graph(conn)
 
         assert "99" in artist_ids
         nodes.positions([node_key("a", "99")])  # raises KeyError if the node is missing
@@ -586,7 +582,7 @@ class TestReadVerticesCreditedArtists:
 
         conn = _connection_with_credited_edges(credited_edges=[("202", "1")], credited_release_ids=("202",))
 
-        nodes, _artist_ids = await pipeline._read_vertices(conn)
+        nodes, _artist_ids, _adjacency = await pipeline._read_graph(conn)
 
         nodes.positions([node_key("r", "202")])  # raises KeyError if the node is missing
 
@@ -594,9 +590,9 @@ class TestReadVerticesCreditedArtists:
     async def test_drops_an_unresolvable_credited_name(self) -> None:
         """A `same_as` name with no recorded artist id (nothing to `JOIN` onto) contributes no
         edge row and no discovered artist id -- an accepted, silent drop, not an error."""
-        conn = _connection_with_credited_edges(credited_edges=[], credited_artist_ids=())
+        conn = _connection_with_credited_edges(credited_edges=[])
 
-        nodes, artist_ids = await pipeline._read_vertices(conn)
+        nodes, artist_ids, _adjacency = await pipeline._read_graph(conn)
 
         assert artist_ids == ["1"]
         assert len(nodes) == 2  # the base artist and release only
@@ -609,9 +605,9 @@ class TestReadVerticesCreditedArtists:
         resolution rule rather than picking one."""
         from insights.embeddings import node_key
 
-        conn = _connection_with_credited_edges(credited_edges=[("101", "99"), ("101", "100")], credited_artist_ids=("99", "100"))
+        conn = _connection_with_credited_edges(credited_edges=[("101", "99"), ("101", "100")])
 
-        nodes, artist_ids = await pipeline._read_vertices(conn)
+        nodes, artist_ids, _adjacency = await pipeline._read_graph(conn)
 
         assert sorted(artist_ids) == ["1", "100", "99"]
         nodes.positions([node_key("a", "99"), node_key("a", "100")])  # raises KeyError if either is missing
@@ -621,9 +617,9 @@ class TestReadVerticesCreditedArtists:
         """A credited artist who is also a main artist elsewhere appears exactly once in
         `artist_ids` -- a duplicate would make `_write_embeddings`' multi-row upsert try to
         affect the same `(artist_id, model_version)` row twice within one statement."""
-        conn = _connection_with_credited_edges(credited_edges=[("101", "1")], credited_artist_ids=("1",))
+        conn = _connection_with_credited_edges(credited_edges=[("101", "1")])
 
-        _nodes, artist_ids = await pipeline._read_vertices(conn)
+        _nodes, artist_ids, _adjacency = await pipeline._read_graph(conn)
 
         assert artist_ids == ["1"]
 
@@ -631,27 +627,47 @@ class TestReadVerticesCreditedArtists:
     async def test_is_order_independent_across_discovery_batches(self) -> None:
         """Neither discovery query is ordered (`SELECT DISTINCT`, no `ORDER BY`); the resulting
         node set must not depend on the order PostgreSQL happens to return either of them in."""
-        forward = _connection_with_credited_edges(credited_edges=[("101", "99"), ("101", "100")], credited_artist_ids=("99", "100"))
-        reversed_ = _connection_with_credited_edges(credited_edges=[("101", "100"), ("101", "99")], credited_artist_ids=("100", "99"))
+        forward = _connection_with_credited_edges(credited_edges=[("101", "99"), ("101", "100")])
+        reversed_ = _connection_with_credited_edges(credited_edges=[("101", "100"), ("101", "99")])
 
-        forward_nodes, forward_ids = await pipeline._read_vertices(forward)
-        reversed_nodes, reversed_ids = await pipeline._read_vertices(reversed_)
+        forward_nodes, forward_ids, _fa = await pipeline._read_graph(forward)
+        reversed_nodes, reversed_ids, _ra = await pipeline._read_graph(reversed_)
 
         assert np.array_equal(forward_nodes.keys, reversed_nodes.keys)
         assert sorted(forward_ids) == sorted(reversed_ids)
 
 
+class TestEdgeStreamWithoutServerSideDistinct:
+    @pytest.mark.asyncio
+    async def test_repeated_edge_rows_give_the_same_nodes_and_adjacency_as_deduplicated_rows(self) -> None:
+        """Without server-side `DISTINCT` a person credited under several roles streams as
+        repeated (release, artist) rows; the artist list and the CSR must not change."""
+        distinct = _connection_with_credited_edges(credited_edges=[("101", "99"), ("101", "100")])
+        repeated = _connection_with_credited_edges(credited_edges=[("101", "99"), ("101", "99"), ("101", "100"), ("101", "99"), ("101", "100")])
+
+        distinct_nodes, distinct_ids, distinct_adjacency = await pipeline._read_graph(distinct)
+        repeated_nodes, repeated_ids, repeated_adjacency = await pipeline._read_graph(repeated)
+
+        assert repeated_ids == distinct_ids
+        assert len(set(repeated_ids)) == len(repeated_ids)
+        assert np.array_equal(repeated_nodes.keys, distinct_nodes.keys)
+        assert np.array_equal(repeated_adjacency.transition.indptr, distinct_adjacency.transition.indptr)
+        assert np.array_equal(repeated_adjacency.transition.indices, distinct_adjacency.transition.indices)
+        assert np.array_equal(repeated_adjacency.transition.data, distinct_adjacency.transition.data)
+
+    @pytest.mark.asyncio
+    async def test_every_artist_is_discovered_from_the_edge_stream_alone(self) -> None:
+        """No per-relation artist-id discovery query remains: only release ids are discovered."""
+        assert {kind for *_rest, kind in pipeline._DISCOVERY_QUERIES} == {"r"}
+
+
 class TestStreamEdgeBlocksCreditedArtists:
     @pytest.mark.asyncio
     async def test_connects_a_release_to_every_resolved_credited_artist(self) -> None:
-        from insights.embeddings import AdjacencyBuilder, node_key
+        from insights.embeddings import node_key
 
-        conn = _connection_with_credited_edges(credited_edges=[("101", "99"), ("101", "100")], credited_artist_ids=("99", "100"))
-        nodes, _artist_ids = await pipeline._read_vertices(conn)
-        builder = AdjacencyBuilder(nodes)
-
-        await pipeline._stream_edge_blocks(conn, builder)
-        adjacency = builder.build()
+        conn = _connection_with_credited_edges(credited_edges=[("101", "99"), ("101", "100")])
+        nodes, _artist_ids, adjacency = await pipeline._read_graph(conn)
 
         artist_99 = nodes.positions([node_key("a", "99")])[0]
         artist_100 = nodes.positions([node_key("a", "100")])[0]
@@ -660,14 +676,10 @@ class TestStreamEdgeBlocksCreditedArtists:
 
     @pytest.mark.asyncio
     async def test_a_credited_edge_to_an_existing_main_artist_adds_to_its_degree(self) -> None:
-        from insights.embeddings import AdjacencyBuilder, node_key
+        from insights.embeddings import node_key
 
         conn = _connection_with_credited_edges(credited_edges=[("202", "1")], credited_release_ids=("202",))
-        nodes, _artist_ids = await pipeline._read_vertices(conn)
-        builder = AdjacencyBuilder(nodes)
-
-        await pipeline._stream_edge_blocks(conn, builder)
-        adjacency = builder.build()
+        nodes, _artist_ids, adjacency = await pipeline._read_graph(conn)
 
         artist_1 = nodes.positions([node_key("a", "1")])[0]
         assert adjacency.degree[artist_1] == 1  # the new credited release only; 101 is untouched
@@ -690,10 +702,11 @@ class TestTrackCreditedArtistEdgeSql:
         assert params == (list(pipeline._KEPT_CREDIT_CATEGORIES),)
         assert (source_kind, target_kind) == ("r", "a")
 
-    def test_discovery_queries_use_the_same_kept_categories(self) -> None:
-        assert "role_category = ANY(%s)" in pipeline._TRACK_CREDITED_ARTIST_IDS_SQL
-        assert "graph.same_as" in pipeline._TRACK_CREDITED_ARTIST_IDS_SQL
+    def test_release_discovery_uses_the_same_kept_categories(self) -> None:
         assert "role_category = ANY(%s)" in pipeline._TRACK_CREDITED_RELEASE_IDS_SQL
+
+    def test_edge_query_leaves_deduplication_to_the_csr_build(self) -> None:
+        assert "DISTINCT" not in pipeline._TRACK_CREDITED_ARTIST_EDGE_SQL
 
 
 class TestReadVerticesTrackCreditedArtists:
@@ -701,11 +714,9 @@ class TestReadVerticesTrackCreditedArtists:
     async def test_includes_a_track_credited_only_artist_with_no_vertex_degree_row(self) -> None:
         from insights.embeddings import node_key
 
-        conn = _connection_isolating_relation(
-            relation="graph.track_credited_on", edges=[("101", "99")], discovery_ids={"track_credited_artist_ids": ("99",)}
-        )
+        conn = _connection_isolating_relation(relation="graph.track_credited_on", edges=[("101", "99")])
 
-        nodes, artist_ids = await pipeline._read_vertices(conn)
+        nodes, artist_ids, _adjacency = await pipeline._read_graph(conn)
 
         assert "99" in artist_ids
         nodes.positions([node_key("a", "99")])  # raises KeyError if the node is missing
@@ -718,7 +729,7 @@ class TestReadVerticesTrackCreditedArtists:
             relation="graph.track_credited_on", edges=[("202", "1")], discovery_ids={"track_credited_release_ids": ("202",)}
         )
 
-        nodes, _artist_ids = await pipeline._read_vertices(conn)
+        nodes, _artist_ids, _adjacency = await pipeline._read_graph(conn)
 
         nodes.positions([node_key("r", "202")])  # raises KeyError if the node is missing
 
@@ -731,10 +742,9 @@ class TestReadVerticesTrackCreditedArtists:
         conn = _connection_isolating_relation(
             relation="graph.track_credited_on",
             edges=[("101", "99"), ("101", "100")],
-            discovery_ids={"track_credited_artist_ids": ("99", "100")},
         )
 
-        nodes, artist_ids = await pipeline._read_vertices(conn)
+        nodes, artist_ids, _adjacency = await pipeline._read_graph(conn)
 
         assert sorted(artist_ids) == ["1", "100", "99"]
         nodes.positions([node_key("a", "99"), node_key("a", "100")])  # raises KeyError if either is missing
@@ -743,18 +753,13 @@ class TestReadVerticesTrackCreditedArtists:
 class TestStreamEdgeBlocksTrackCreditedArtists:
     @pytest.mark.asyncio
     async def test_connects_a_release_to_every_resolved_track_credited_artist(self) -> None:
-        from insights.embeddings import AdjacencyBuilder, node_key
+        from insights.embeddings import node_key
 
         conn = _connection_isolating_relation(
             relation="graph.track_credited_on",
             edges=[("101", "99"), ("101", "100")],
-            discovery_ids={"track_credited_artist_ids": ("99", "100")},
         )
-        nodes, _artist_ids = await pipeline._read_vertices(conn)
-        builder = AdjacencyBuilder(nodes)
-
-        await pipeline._stream_edge_blocks(conn, builder)
-        adjacency = builder.build()
+        nodes, _artist_ids, adjacency = await pipeline._read_graph(conn)
 
         artist_99 = nodes.positions([node_key("a", "99")])[0]
         artist_100 = nodes.positions([node_key("a", "100")])[0]
@@ -767,7 +772,7 @@ class TestStreamEdgeBlocksTrackCreditedArtists:
         credit that resolve to the same (release, artist) pair are the *same* edge, not two --
         `AdjacencyBuilder` collapses the parallel edge regardless of which relation contributed
         it, so the artist's degree reflects one connection to the release, not two."""
-        from insights.embeddings import AdjacencyBuilder, node_key
+        from insights.embeddings import node_key
 
         edge_rows = {name: [] for name, *_rest in pipeline._EDGE_RELATIONS}
         edge_rows["graph.credited_on"] = [("101", "99")]
@@ -775,13 +780,8 @@ class TestStreamEdgeBlocksTrackCreditedArtists:
         conn = FakeConnection(
             vertex_rows=[("a", "1"), ("r", "101")],
             edge_rows=edge_rows,
-            discovery_ids={"credited_artist_ids": ("99",), "track_credited_artist_ids": ("99",)},
         )
-        nodes, _artist_ids = await pipeline._read_vertices(conn)
-        builder = AdjacencyBuilder(nodes)
-
-        await pipeline._stream_edge_blocks(conn, builder)
-        adjacency = builder.build()
+        nodes, _artist_ids, adjacency = await pipeline._read_graph(conn)
 
         artist_99 = nodes.positions([node_key("a", "99")])[0]
         release_101 = nodes.positions([node_key("r", "101")])[0]
@@ -793,8 +793,9 @@ class TestStreamEdgeBlocksTrackCreditedArtists:
 
 
 class TestTrackPerformerEdgeSql:
-    def test_is_a_distinct_release_artist_scan(self) -> None:
-        assert "SELECT DISTINCT release_id, artist_id" in pipeline._TRACK_PERFORMER_EDGE_SQL
+    def test_is_a_plain_release_artist_scan_without_server_side_distinct(self) -> None:
+        assert "SELECT release_id, artist_id" in pipeline._TRACK_PERFORMER_EDGE_SQL
+        assert "DISTINCT" not in pipeline._TRACK_PERFORMER_EDGE_SQL
         assert "graph.track_by_artist" in pipeline._TRACK_PERFORMER_EDGE_SQL
 
     def test_registered_with_the_release_artist_kinds_and_no_params(self) -> None:
@@ -814,11 +815,9 @@ class TestReadVerticesTrackPerformers:
         relations -- see `_read_vertices`'s docstring."""
         from insights.embeddings import node_key
 
-        conn = _connection_isolating_relation(
-            relation="graph.track_by_artist", edges=[("101", "77")], discovery_ids={"track_performer_artist_ids": ("77",)}
-        )
+        conn = _connection_isolating_relation(relation="graph.track_by_artist", edges=[("101", "77")])
 
-        nodes, artist_ids = await pipeline._read_vertices(conn)
+        nodes, artist_ids, _adjacency = await pipeline._read_graph(conn)
 
         assert "77" in artist_ids
         nodes.positions([node_key("a", "77")])  # raises KeyError if the node is missing
@@ -831,7 +830,7 @@ class TestReadVerticesTrackPerformers:
             relation="graph.track_by_artist", edges=[("303", "1")], discovery_ids={"track_performer_release_ids": ("303",)}
         )
 
-        nodes, _artist_ids = await pipeline._read_vertices(conn)
+        nodes, _artist_ids, _adjacency = await pipeline._read_graph(conn)
 
         nodes.positions([node_key("r", "303")])  # raises KeyError if the node is missing
 
@@ -839,16 +838,10 @@ class TestReadVerticesTrackPerformers:
 class TestStreamEdgeBlocksTrackPerformers:
     @pytest.mark.asyncio
     async def test_connects_a_release_to_every_track_performer(self) -> None:
-        from insights.embeddings import AdjacencyBuilder, node_key
+        from insights.embeddings import node_key
 
-        conn = _connection_isolating_relation(
-            relation="graph.track_by_artist", edges=[("101", "77"), ("101", "78")], discovery_ids={"track_performer_artist_ids": ("77", "78")}
-        )
-        nodes, _artist_ids = await pipeline._read_vertices(conn)
-        builder = AdjacencyBuilder(nodes)
-
-        await pipeline._stream_edge_blocks(conn, builder)
-        adjacency = builder.build()
+        conn = _connection_isolating_relation(relation="graph.track_by_artist", edges=[("101", "77"), ("101", "78")])
+        nodes, _artist_ids, adjacency = await pipeline._read_graph(conn)
 
         artist_77 = nodes.positions([node_key("a", "77")])[0]
         artist_78 = nodes.positions([node_key("a", "78")])[0]
@@ -861,7 +854,7 @@ class TestStreamEdgeBlocksTrackPerformers:
         comment -- so a performer credit and a *different* credited-artist edge to the same
         release both count: this is not the merge case `TestStreamEdgeBlocksTrackCreditedArtists`
         covers, since the two relations name different artists here."""
-        from insights.embeddings import AdjacencyBuilder, node_key
+        from insights.embeddings import node_key
 
         edge_rows = {name: [] for name, *_rest in pipeline._EDGE_RELATIONS}
         edge_rows["graph.credited_on"] = [("101", "99")]
@@ -869,13 +862,8 @@ class TestStreamEdgeBlocksTrackPerformers:
         conn = FakeConnection(
             vertex_rows=[("r", "101")],
             edge_rows=edge_rows,
-            discovery_ids={"credited_artist_ids": ("99",), "track_performer_artist_ids": ("77",)},
         )
-        nodes, _artist_ids = await pipeline._read_vertices(conn)
-        builder = AdjacencyBuilder(nodes)
-
-        await pipeline._stream_edge_blocks(conn, builder)
-        adjacency = builder.build()
+        nodes, _artist_ids, adjacency = await pipeline._read_graph(conn)
 
         release_101 = nodes.positions([node_key("r", "101")])[0]
         assert adjacency.degree[release_101] == 2  # both artist 99 (credit) and 77 (performer)
