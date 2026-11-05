@@ -56,6 +56,8 @@ def _item(release_id: str, **overrides: Any) -> dict[str, Any]:
         "media_families": ["vinyl"],
         "family_signals": {"grooved": {"pressing_scarcity": 92.0}},
         "medium_rarity": 7.0,
+        "label_ids": [10, 2**40],
+        "artist_ids": [5],
         **overrides,
     }
 
@@ -118,7 +120,7 @@ async def _rows(pool: AsyncPostgreSQLPool) -> list[tuple[Any, ...]]:
     async with pool.connection() as conn, conn.cursor() as cursor:
         await cursor.execute(
             "SELECT release_id, title, artist_name, year, rarity_score, tier, hidden_gem_score, pressing_scarcity, "
-            "media_families, family_signals, medium_rarity FROM insights.release_rarity ORDER BY release_id"
+            "media_families, family_signals, medium_rarity, label_ids, artist_ids FROM insights.release_rarity ORDER BY release_id"
         )
         return await cursor.fetchall()
 
@@ -135,9 +137,25 @@ async def test_copy_round_trips_escaping_nulls_and_jsonb(schema_owner_pool: Asyn
     assert await _store(schema_owner_pool, items) == 3
 
     rows = await _rows(schema_owner_pool)
-    assert rows[0] == (1, awkward, "", 1970, 12.5, "rare", 3.0, None, ["vinyl"], {"grooved": {"pressing_scarcity": 92.0}}, 7.0)
-    assert rows[1] == (2, "Plain", "Artist", None, 12.5, "rare", None, None, [], {}, None)
+    assert rows[0] == (1, awkward, "", 1970, 12.5, "rare", 3.0, None, ["vinyl"], {"grooved": {"pressing_scarcity": 92.0}}, 7.0, [10, 2**40], [5])
+    assert rows[1] == (2, "Plain", "Artist", None, 12.5, "rare", None, None, [], {}, None, [10, 2**40], [5])
     assert rows[2][1] is None  # an explicit None title stays NULL, not the empty string
+
+
+async def test_label_and_artist_ids_are_stored_and_an_older_stream_still_loads(schema_owner_pool: AsyncPostgreSQLPool) -> None:
+    older = _item("3")
+    del older["label_ids"], older["artist_ids"]
+    items = [_item("1", label_ids=[3, 7, 9], artist_ids=[11, 12]), _item("2", label_ids=[], artist_ids=[]), older]
+
+    assert await _store(schema_owner_pool, items) == 3
+
+    rows = {row[0]: row[-2:] for row in await _rows(schema_owner_pool)}
+    assert rows == {1: ([3, 7, 9], [11, 12]), 2: ([], []), 3: (None, None)}
+    async with schema_owner_pool.connection() as conn, conn.cursor() as cursor:
+        await cursor.execute(
+            "SELECT release_id FROM insights.release_rarity WHERE label_ids @> ARRAY[7]::bigint[] AND artist_ids @> ARRAY[12]::bigint[]"
+        )
+        assert await cursor.fetchall() == [(1,)]
 
 
 async def test_a_second_run_replaces_the_first_runs_rows(schema_owner_pool: AsyncPostgreSQLPool) -> None:

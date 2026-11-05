@@ -366,6 +366,7 @@ class TestComputeAndStoreRarity:
         assert params[13].obj == ["vinyl", "shellac"]  # media_families (Jsonb)
         assert params[14].obj == {"grooved": {"pressing_scarcity": 90.0}}  # family_signals (Jsonb)
         assert params[15] == 74.0  # medium_rarity
+        assert params[16:] == (None, None)  # label_ids, artist_ids: an older stream omits them
 
     @pytest.mark.asyncio
     async def test_non_grooved_release_writes_null_pressing_scarcity_and_empty_family_signals(self) -> None:
@@ -383,6 +384,17 @@ class TestComputeAndStoreRarity:
         assert params[13].obj == ["digital"]  # media_families (Jsonb)
         assert params[14].obj == {}  # family_signals (Jsonb)
         assert params[15] == 38.0  # medium_rarity
+
+    @pytest.mark.asyncio
+    async def test_label_and_artist_ids_from_the_stream_are_copied_as_given(self) -> None:
+        mock_pool = _make_mock_pool()
+        item = {**_MOCK_GROOVED_RARITY_ITEM, "label_ids": [4, 9], "artist_ids": []}
+
+        async with _FakeApi([[item]]).client() as client:
+            await compute_and_store_rarity(client, mock_pool)
+
+        (params,) = _copied_rows(mock_pool)
+        assert params[16:] == ([4, 9], [])  # an empty list is "none", distinct from a stream without the field
 
     @pytest.mark.asyncio
     async def test_logs_failure(self) -> None:
