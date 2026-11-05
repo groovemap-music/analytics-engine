@@ -141,7 +141,7 @@ The 30-second first-run delay is fixed in the scheduler (`asyncio.sleep(30)` in 
 
 `release_rarity` replaces every row of `insights.release_rarity` in one PostgreSQL transaction. Readers keep the previous table until commit, so they see no partial results, and any failure costs only the run. On a catalog the size of production the transaction stays open for about an hour, and that is what the rules below are about.
 
-Deploy `catalog-api` 1.6.0 first. Against an older API the paged routes return `404`, the run fails at once, and the previous table stays in place.
+Deploy `catalog-api` 1.7.0 first. Against an older API the paged routes return `404`, the run fails at once, and the previous table stays in place.
 
 **Don't run it during a reload.** While the transaction is open, PostgreSQL can't remove dead rows from any table in the database, not only the rarity table, so updates elsewhere pile up as bloat. Autovacuum keeps running but reclaims nothing. In a 60-minute held transaction, a test table taking about 420 updates a second went from 16.7k to 1.53M dead rows, 59 autovacuums reclaimed nothing, and the table grew from 51.6 MB to 405 MB and stayed that size after commit. Dead rows cleared about 90 seconds after commit, but only `VACUUM FULL` or a rewrite returns the space. A reload rewrites far more rows than that test did, so the two must not overlap.
 
@@ -220,4 +220,4 @@ The prefixed namespace starts empty with its own counter at generation 0, so the
 
 Valkey settings are read from `VALKEY_HOST`, `VALKEY_PORT`, `VALKEY_PASSWORD` and `VALKEY_PASSWORD_FILE`. An explicitly empty password is honored; a nonempty password `_FILE` path wins and unreadable files fail closed. PostgreSQL fallback behavior is unchanged; key naming is described under [Valkey key prefix](#valkey-key-prefix).
 
-The consumer overrides the database-schema runtime dependency's older runtime source with immutable python-libraries revision `5f35c03f68b0dd2c1955c731886c0ad8d8f9de63`, retaining the existing `neo4j,otel,otel-http,postgres` extras. This selects the Valkey-only runtime without changing the schema producer commit. `groovemap-database-schema` itself is a first-party runtime dependency pinned to database-schema `ba047aed60064662b129807c4a730e2102ccfb97`; the similar-artist stage imports its release helpers (see [similar artists](similar_artists.md#pipeline-stage)).
+The consumer overrides the database-schema runtime dependency's older runtime source with immutable python-libraries revision `5f35c03f68b0dd2c1955c731886c0ad8d8f9de63`, retaining the existing `neo4j,otel,otel-http,postgres` extras. This selects the Valkey-only runtime without changing the schema producer commit. `groovemap-database-schema` itself is a first-party runtime dependency pinned to database-schema `7937373f328e21efd745fe51357600d564a2ae75`; the similar-artist stage imports its release helpers (see [similar artists](similar_artists.md#pipeline-stage)).

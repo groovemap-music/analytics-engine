@@ -5,7 +5,7 @@ set -euo pipefail
 # cannot appear in the hash-pinned requirements export): the python-libraries runtime and
 # the database-schema release helpers similar-artist publication imports at runtime.
 expected="5f35c03f68b0dd2c1955c731886c0ad8d8f9de63"
-schema_expected="ba047aed60064662b129807c4a730e2102ccfb97"
+schema_expected="7937373f328e21efd745fe51357600d564a2ae75"
 checkouts=()
 resolved=
 trap 'for checkout in ${checkouts[@]+"${checkouts[@]}"}; do rm -rf -- "${checkout}"; done' EXIT
