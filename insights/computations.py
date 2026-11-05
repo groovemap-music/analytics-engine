@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import wraps
@@ -22,7 +24,10 @@ from insights.catalog_api_contract import (
     DATA_COMPLETENESS_PATH,
     GENRE_TRENDS_PATH,
     LABEL_LONGEVITY_PATH,
-    RARITY_SCORES_PATH,
+    RARITY_PAGE_MAX_PROCESSING_SECONDS,
+    RARITY_PAGE_PATH,
+    RARITY_QUALITY_COUNTS_MAX_PROCESSING_SECONDS,
+    RARITY_QUALITY_COUNTS_PATH,
     STYLE_COTAGS_MAX_PROCESSING_SECONDS,
     STYLE_COTAGS_PATH,
     STYLE_LANDMARKS_MAX_PROCESSING_SECONDS,
@@ -62,9 +67,10 @@ P = ParamSpec("P")
 #   --------------------  --------------------------------------  -----------
 #   data-completeness     ~400s releases seq scan (>600s on bad         1800s
 #                         days); API caches the result for 6h
-#   rarity-scores         chunked full-graph Neo4j scans                1800s
 #   community-enrichment  API-published bounded processing time plus    1800s
 #                         20% transport/storage headroom
+#   rarity pages          API-published bounded processing time plus     360s
+#                         20% transport headroom; a walk is many of these
 #   style-year-counts     API-published bounded processing time x 3      900s
 #                         (a scan of every release-style tag)
 #   style-landmarks       API-published bounded processing time x 3      900s
@@ -91,8 +97,9 @@ STYLE_COTAG_MAX_RANK: Final = 25
 
 ENDPOINT_READ_TIMEOUTS: dict[str, float] = {
     DATA_COMPLETENESS_PATH: 1800.0,
-    RARITY_SCORES_PATH: 1800.0,
     COMMUNITY_ENRICHMENT_PATH: COMMUNITY_ENRICHMENT_MAX_PROCESSING_SECONDS * 1.2,
+    RARITY_QUALITY_COUNTS_PATH: RARITY_QUALITY_COUNTS_MAX_PROCESSING_SECONDS * 1.2,
+    RARITY_PAGE_PATH: RARITY_PAGE_MAX_PROCESSING_SECONDS * 1.2,
     STYLE_YEAR_COUNTS_PATH: STYLE_YEAR_COUNTS_MAX_PROCESSING_SECONDS * 3.0,
     STYLE_LANDMARKS_PATH: STYLE_LANDMARKS_MAX_PROCESSING_SECONDS * 3.0,
     STYLE_COTAGS_PATH: STYLE_COTAGS_MAX_PROCESSING_SECONDS * 3.0,
@@ -759,30 +766,124 @@ def _rarity_copy_row(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+class RarityWalkShortError(RuntimeError):
+    """A rarity walk ended with fewer rows than the catalog held when it started."""
+
+
+# The contract's largest page. One page is the unit of retry and of memory here, and it stays far
+# inside the API's processing budget: 20,000 releases took under 5 s of Neo4j time on lux.
+RARITY_PAGE_SIZE: Final = 20_000
+
+# Ten attempts wait up to about four minutes in all, which covers an API restart or redeploy. A walk
+# that gave up early would throw away the hours already written.
+_RARITY_REQUEST_ATTEMPTS: Final = 10
+_RARITY_BACKOFF_MAX_SECONDS: Final = 60.0
+_RARITY_PROGRESS_PAGES: Final = 50
+
+# Applies to everything the replacement transaction takes: the DELETE's table lock and row locks, and
+# the COPY's unique-index waits. Waiting behind DDL or a second run would hold the transaction open
+# for nothing, so the run fails, keeps the old table, and tries again next cycle.
+RARITY_LOCK_TIMEOUT: Final = "30s"
+
+_RARITY_SIGNALS: Final = ("artist", "label", "genre")
+
+
+async def _rarity_request(
+    client: httpx.AsyncClient,
+    method: str,
+    path: str,
+    *,
+    after: str,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Send one page of the rarity walk, repeating the same page on a 429, 5xx or dropped connection.
+
+    Any other status is a request the API will never accept, so it fails at once. A page is whole or
+    it fails, and nothing is written until it has arrived, so repeating one cannot duplicate a row.
+    """
+    params: dict[str, str | int] = {"after": after, "limit": RARITY_PAGE_SIZE}
+    attempt = 1
+    while True:
+        try:
+            response = await client.request(method, path, params=params, json=body, timeout=endpoint_timeout(path))
+            response.raise_for_status()
+            data: dict[str, Any] = response.json()
+            return data
+        except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            if status != httpx.codes.TOO_MANY_REQUESTS and status < httpx.codes.INTERNAL_SERVER_ERROR:
+                raise
+            failure: httpx.HTTPError = error
+        except httpx.TransportError as error:
+            failure = error
+        if attempt == _RARITY_REQUEST_ATTEMPTS:
+            raise failure
+        delay = min(2.0 ** (attempt - 1), _RARITY_BACKOFF_MAX_SECONDS)
+        logger.warning("⚠️ Rarity page failed, retrying", path=path, after=after, attempt=attempt, delay=delay, error=describe_exception(failure))
+        await asyncio.sleep(delay)
+        attempt += 1
+
+
+async def _sum_rarity_quality_counts(client: httpx.AsyncClient) -> tuple[dict[str, list[tuple[float, int]]], int]:
+    """Walk the first pass, returning the catalog-wide signal counts and the first ``release_total``."""
+    totals: dict[str, Counter[float]] = {signal: Counter() for signal in _RARITY_SIGNALS}
+    release_total: int | None = None
+    after: str | None = ""
+    while after is not None:
+        page = await _rarity_request(client, "GET", RARITY_QUALITY_COUNTS_PATH, after=after)
+        if release_total is None:
+            release_total = int(page["release_total"])
+        for signal, counts in totals.items():
+            for value, count in page[signal]:
+                counts[value] += count
+        after = page["next_after"]
+    return {signal: sorted(counts.items()) for signal, counts in totals.items()}, release_total or 0
+
+
+async def _copy_rarity_pages(client: httpx.AsyncClient, cursor: Any, distributions: dict[str, list[tuple[float, int]]]) -> int:
+    """Walk the second pass into the open transaction, one COPY per page, and return the rows written."""
+    written = 0
+    pages = 0
+    after: str | None = ""
+    while after is not None:
+        page = await _rarity_request(client, "POST", RARITY_PAGE_PATH, after=after, body=distributions)
+        async with cursor.copy(_RARITY_COPY_SQL) as copy:
+            for row in page["items"]:
+                await copy.write_row(_rarity_copy_row(row))
+        written += len(page["items"])
+        pages += 1
+        after = page["next_after"]
+        if pages % _RARITY_PROGRESS_PAGES == 0:
+            logger.info("📊 Storing release rarity scores", rows=written)
+    return written
+
+
 @_record_lifecycle("release_rarity", "❌ Release rarity computation failed")
 async def compute_and_store_rarity(client: httpx.AsyncClient, pool: Any) -> int:
-    """Compute release rarity scores and store results."""
-    # Chunked, sequential rarity scans need the extended read budget above.
-    results = await _fetch_from_api(client, RARITY_SCORES_PATH)
-    if not results:
+    """Walk the rarity pages from catalog-api and replace ``insights.release_rarity`` in one transaction.
+
+    The counts come first because every page is ranked against them, and because the walk over them
+    needs no transaction. Then one transaction deletes the old rows and copies each page: readers keep
+    the old table until the commit, and any failure, or a walk shorter than the first ``release_total``,
+    rolls back to it. See ``docs/architecture.md`` for what holding that transaction costs.
+    """
+    distributions, release_total = await _sum_rarity_quality_counts(client)
+    if not release_total:
         logger.info("📊 No rarity score results to store")
         return 0
 
-    # The row count is only known once the API answers, and it is not bounded here: one round
-    # trip per row (the old loop) cost about 6 ms a row on a local container. One COPY streams
-    # them all, inside the same transaction as the DELETE, so readers see the old table or the
-    # new one and a failed row (e.g. a duplicate release_id) rolls the whole replacement back.
-    logger.info("📊 Storing release rarity scores", count=len(results))
+    logger.info("📊 Replacing release rarity scores", release_total=release_total)
     async with pool.connection() as conn:
         await conn.set_autocommit(False)
         async with conn.transaction(), conn.cursor() as cursor:
             cursor = cast("Any", cursor)
+            await cursor.execute(f"SET LOCAL lock_timeout = '{RARITY_LOCK_TIMEOUT}'")
             await cursor.execute("DELETE FROM insights.release_rarity")
-            async with cursor.copy(_RARITY_COPY_SQL) as copy:
-                for row in results:
-                    await copy.write_row(_rarity_copy_row(row))
-    logger.info("💾 Release rarity scores stored", count=len(results))
-    return len(results)
+            written = await _copy_rarity_pages(client, cursor, distributions)
+            if written < release_total:
+                raise RarityWalkShortError(f"rarity walk wrote {written} rows of {release_total} releases")
+    logger.info("💾 Release rarity scores stored", count=written)
+    return written
 
 
 # ── Activity summary ────────────────────────────────────────────────────────

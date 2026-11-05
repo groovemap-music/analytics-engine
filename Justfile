@@ -42,12 +42,13 @@ coverage: test
 # groovemap-database-schema runtime dependency; see tests/integration/conftest.py) to a
 # disposable official PostgreSQL 18 container -- the same digest database-schema's required
 # tier uses -- and runs the synthetic compact-COPY, publish and retire suite under the real
-# embedding_pipeline role, and the style atlas's monthly writes against the real atlas tables.
+# embedding_pipeline role, the style atlas's monthly writes against the real atlas tables, and the
+# rarity replacement, including a dropped connection mid-run.
 # Neither needs pgvector, so the bare image is enough.
 # There is no PostgreSQL 19 GA image yet; this is the tier that stands in for it.
 test-integration-pg18:
     POSTGRES_INTEGRATION_IMAGE=postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2 \
-        INTEGRATION_TESTS="tests/integration/test_similar_artists_integration.py tests/integration/test_style_atlas_integration.py" \
+        INTEGRATION_TESTS="tests/integration/test_similar_artists_integration.py tests/integration/test_style_atlas_integration.py tests/integration/test_rarity_integration.py" \
         bash scripts/test-integration.sh
 
 # Advisory tier: the same schema, plus the vector extension and public.artist_embeddings, on

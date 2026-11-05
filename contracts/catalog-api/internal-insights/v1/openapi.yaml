@@ -2,7 +2,7 @@
 openapi: 3.1.0
 info:
   title: GrooveMap internal insights API
-  version: 1.5.0
+  version: 1.6.0
   description: Catalog API-owned contract consumed by the analytics engine.
 security:
   - InternalSecret: []
@@ -91,8 +91,44 @@ paths:
   /api/internal/insights/rarity-scores:
     get:
       operationId: rarity_scores
+      deprecated: true
+      description: >-
+        One response for the whole catalog, which cannot be retried and which a client has to
+        hold whole. Use rarity-scores/quality-counts and rarity-scores/page.
       responses:
         "200": {$ref: "#/components/responses/RarityScores"}
+  /api/internal/insights/rarity-scores/quality-counts:
+    get:
+      operationId: rarity_quality_counts
+      x-groovemap-max-processing-seconds: 300
+      description: >-
+        One keyset page of the first rarity pass. Follow next_after until it is null, summing the
+        counts of each signal value and keeping the first release_total. A request is whole or
+        fails: on a 429, 5xx or dropped connection, retry the same `after`.
+      parameters:
+        - $ref: "#/components/parameters/RarityAfter"
+        - $ref: "#/components/parameters/RarityPageLimit"
+      responses:
+        "200": {$ref: "#/components/responses/RarityQualityCounts"}
+  /api/internal/insights/rarity-scores/page:
+    post:
+      operationId: rarity_page
+      x-groovemap-max-processing-seconds: 300
+      description: >-
+        One keyset page of scored rows, ranked against the summed counts in the body. Follow
+        next_after until it is null. A request is whole or fails: on a 429, 5xx or dropped
+        connection, retry the same `after`. A complete walk returns at least the first
+        release_total rows; fewer means releases were missed, and the walk must not be stored.
+      parameters:
+        - $ref: "#/components/parameters/RarityAfter"
+        - $ref: "#/components/parameters/RarityPageLimit"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RarityDistributions"}
+      responses:
+        "200": {$ref: "#/components/responses/RarityPage"}
 components:
   securitySchemes:
     InternalSecret:
@@ -125,7 +161,37 @@ components:
       in: query
       required: false
       schema: {type: string, default: "25,30,40,50,75,100"}
+    RarityAfter:
+      name: after
+      in: query
+      required: false
+      description: The next_after of the previous page; empty for the first page.
+      schema: {type: string, default: ""}
+    RarityPageLimit:
+      name: limit
+      in: query
+      required: false
+      schema: {type: integer, minimum: 1, maximum: 20000, default: 20000}
   schemas:
+    RarityValueCounts:
+      type: array
+      description: "`[value, count]` pairs: how many releases have this signal value."
+      items:
+        type: array
+        prefixItems:
+          - {type: number}
+          - {type: integer}
+        minItems: 2
+        maxItems: 2
+    RarityDistributions:
+      type: object
+      description: Quality-signal counts summed over every page of rarity-scores/quality-counts.
+      required: [artist, label, genre]
+      properties:
+        artist: {$ref: "#/components/schemas/RarityValueCounts"}
+        label: {$ref: "#/components/schemas/RarityValueCounts"}
+        genre: {$ref: "#/components/schemas/RarityValueCounts"}
+      additionalProperties: false
     StyleYearCount:
       description: One style and release year that has at least one dated release.
       type: object
@@ -340,6 +406,42 @@ components:
               cotags:
                 type: array
                 items: {$ref: "#/components/schemas/StyleCotag"}
+            additionalProperties: false
+    RarityQualityCounts:
+      description: One page of quality-signal value counts.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [artist, label, genre, releases, release_total, next_after]
+            properties:
+              artist: {$ref: "#/components/schemas/RarityValueCounts"}
+              label: {$ref: "#/components/schemas/RarityValueCounts"}
+              genre: {$ref: "#/components/schemas/RarityValueCounts"}
+              releases:
+                type: integer
+                description: Releases this page covered.
+              release_total:
+                type: integer
+                description: Releases in the graph when this page was read.
+              next_after:
+                type: [string, "null"]
+                description: The `after` of the next page; null on the last page.
+            additionalProperties: false
+    RarityPage:
+      description: One page of rarity score data, media-neutral core plus family extensions.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [items, next_after]
+            properties:
+              items:
+                type: array
+                items: {$ref: "#/components/schemas/RarityScoreItem"}
+              next_after:
+                type: [string, "null"]
+                description: The `after` of the next page; null on the last page.
             additionalProperties: false
     RarityScores:
       description: Rarity score data for every release, media-neutral core plus family extensions.
