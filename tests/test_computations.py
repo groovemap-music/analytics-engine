@@ -196,11 +196,13 @@ class TestReadTimeoutIsDiagnosable:
         mock_client = AsyncMock()
         # httpx.ReadTimeout("") stringifies to "" — the exact production case.
         mock_client.get = AsyncMock(side_effect=httpx.ReadTimeout(""))
+        mock_client.request = AsyncMock(side_effect=httpx.ReadTimeout(""))
         mock_pool = _make_mock_pool()
 
         with (
             patch.object(computations.logger, "error") as mock_log_error,
             patch.object(computations, "_log_computation", new=AsyncMock()) as mock_log_computation,
+            patch.object(computations.asyncio, "sleep", new=AsyncMock()),
             pytest.raises(httpx.ReadTimeout),
         ):
             await func(mock_client, mock_pool)
@@ -701,8 +703,8 @@ class TestLogComputationFailureDuringError:
         mock_pool = AsyncMock()
         mock_pool.connection = MagicMock(return_value=mock_conn)
 
-        with patch("insights.computations._fetch_from_api") as mock_fetch:
-            mock_fetch.side_effect = RuntimeError("API server error")
+        with patch("insights.computations._rarity_request") as mock_request:
+            mock_request.side_effect = RuntimeError("API server error")
             with pytest.raises(RuntimeError, match="API server error"):
                 await compute_and_store_rarity(mock_client, mock_pool)
 
@@ -999,16 +1001,29 @@ class TestEndpointTimeouts:
         assert read is not None
         assert read > COMMUNITY_ENRICHMENT_MAX_PROCESSING_SECONDS
 
-    def test_rarity_read_budget_clears_the_neo4j_transaction_timeout(self) -> None:
-        """Must outlast the server-side db.transaction.timeout (600s) plus overhead."""
+    def test_rarity_read_budgets_clear_what_the_api_publishes(self) -> None:
+        """The API answers or fails within its budget, so the read has to outlast that and no more."""
+        from insights.catalog_api_contract import (
+            RARITY_PAGE_MAX_PROCESSING_SECONDS,
+            RARITY_PAGE_PATH,
+            RARITY_QUALITY_COUNTS_MAX_PROCESSING_SECONDS,
+            RARITY_QUALITY_COUNTS_PATH,
+        )
         from insights.computations import endpoint_timeout
 
-        read = endpoint_timeout("/api/internal/insights/rarity-scores").read
-        assert read is not None
-        assert read >= 1200.0
+        for path, budget in (
+            (RARITY_PAGE_PATH, RARITY_PAGE_MAX_PROCESSING_SECONDS),
+            (RARITY_QUALITY_COUNTS_PATH, RARITY_QUALITY_COUNTS_MAX_PROCESSING_SECONDS),
+        ):
+            read = endpoint_timeout(path).read
+            assert read is not None
+            assert budget < read < 600.0, path
 
-    def test_every_mapped_endpoint_meets_the_default(self) -> None:
+    def test_every_whole_result_endpoint_meets_the_default(self) -> None:
+        """Rarity pages are excluded: each is one small bounded request, and a walk is many of them."""
+        from insights.catalog_api_contract import RARITY_PAGE_PATH, RARITY_QUALITY_COUNTS_PATH
         from insights.computations import DEFAULT_READ_TIMEOUT_SECONDS, ENDPOINT_READ_TIMEOUTS
 
         for path, read in ENDPOINT_READ_TIMEOUTS.items():
-            assert read >= DEFAULT_READ_TIMEOUT_SECONDS, path
+            if path not in (RARITY_PAGE_PATH, RARITY_QUALITY_COUNTS_PATH):
+                assert read >= DEFAULT_READ_TIMEOUT_SECONDS, path

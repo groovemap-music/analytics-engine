@@ -137,6 +137,43 @@ The 30-second first-run delay is fixed in the scheduler (`asyncio.sleep(30)` in 
 
 `ReadyWithCache` and `ReadyWithoutCache` are explanatory states in this diagram, not health payload values: both report `status=healthy` because PostgreSQL and the catalog client are ready. Valkey failure disables caching without preventing service startup. Within a cycle, each failed computation records failure and the remaining computations continue; the scheduler's cycle-level error path is reserved for an exception that escapes that coordinator. Shutdown cancels the scheduler, closes Valkey, HTTP, and PostgreSQL resources, stops the health listener, and flushes telemetry.
 
+## Running the rarity computation
+
+`release_rarity` replaces every row of `insights.release_rarity` in one PostgreSQL transaction. Readers keep the previous table until commit, so they see no partial results, and any failure costs only the run. On a catalog the size of production the transaction stays open for about an hour, and that is what the rules below are about.
+
+Deploy `catalog-api` 1.6.0 first. Against an older API the paged routes return `404`, the run fails at once, and the previous table stays in place.
+
+**Don't run it during a reload.** While the transaction is open, PostgreSQL can't remove dead rows from any table in the database, not only the rarity table, so updates elsewhere pile up as bloat. Autovacuum keeps running but reclaims nothing. In a 60-minute held transaction, a test table taking about 420 updates a second went from 16.7k to 1.53M dead rows, 59 autovacuums reclaimed nothing, and the table grew from 51.6 MB to 405 MB and stayed that size after commit. Dead rows cleared about 90 seconds after commit, but only `VACUUM FULL` or a rewrite returns the space. A reload rewrites far more rows than that test did, so the two must not overlap.
+
+**Don't set `idle_in_transaction_session_timeout` on the role.** The connection sits idle in transaction while each page is scored, for as long as the catalog-api takes and through any retries. A timeout on the role kills the run, or leaves it unable to finish, and every other computation shares that role. The same applies to PgBouncer's `idle_transaction_timeout`. The deployment repository sets neither, so keep it that way.
+
+**The run does not queue for locks.** It sets `lock_timeout` to 30 seconds for its own transaction, so if another session holds a conflicting lock, the run fails with `LockNotAvailable`, keeps the previous table, and tries again next cycle.
+
+**Schema changes wait behind the run.** The transaction holds `ROW EXCLUSIVE` on the table for its whole length. An `ALTER TABLE` queued behind it then blocks every later reader of the table for as long as it waits: measured reads took 2.96, 9.96 and 30.02 seconds for 3, 10 and 30 second waits, against a normal 6.5 ms. Give any such statement a short `lock_timeout`, or wait for the run to finish. `CREATE INDEX IF NOT EXISTS` in the schema initializer also waits behind the run, though readers aren't affected. That is tracked in database-schema.
+
+**Space.** Rows take about 243 bytes each including indexes, so about 4.8 GB at 19.6 million releases. After a replacing run the table holds about double that until vacuum reuses the old rows' space. The row width comes from local data, so treat this as an estimate.
+
+**Memory.** The engine holds one page at a time, so its memory doesn't grow with the catalog. A 120-page walk of 2.4 million rows, replaying a captured real page into real PostgreSQL, reached 276 MB within 10 seconds and stayed between 276 and 292 MB to the end. Real 200,000-release runs peaked at 143 to 184 MB. The old single response reached 530 MB at that size and grew with the catalog.
+
+**Expected time.** About 1 to 1.5 hours at 19.6 million releases, with the transaction open for about 50 to 75 minutes. This is extrapolated from real 20,000-row pages sampled at five catalog positions, not from a full production run.
+
+### What a failed run leaves behind
+
+All of these were measured on a 200,000-release run with real Neo4j, `catalog-api`, and PostgreSQL 18, connected directly rather than through PgBouncer. In every case readers kept the complete previous table, and no locks remained.
+
+| Failure mid-run | What happened | `computation_log` |
+| --- | --- | --- |
+| Engine killed (`SIGKILL`) between pages | Backend gone in 0.013 s | No new row |
+| Engine killed (`SIGKILL`) during a `COPY` | Backend gone in 0.011 s | No new row |
+| Engine stopped (`SIGTERM`) | Exited in 0.13 s, backend gone in 0.012 s | No new row |
+| PostgreSQL restarted | Run failed in 6.5 s with `AdminShutdown`; the next run wrote all 200,000 rows | `failed` |
+| `catalog-api` killed, back after 8 s | Four retries on the same cursor; the run finished with all 200,000 rows | `completed` |
+| `catalog-api` stays down | Nine retries, gave up after 243 s | `failed` |
+
+A killed or stopped engine writes no `computation_log` row, so `/api/insights/status` still shows the previous completed run. Look for a missing `💾 Release rarity scores stored` log line. The scheduler starts rarity again on its next cycle, or 30 seconds after a restart.
+
+A lost network or host wasn't measured. In that case the backend can't see the client go, so the transaction can stay open until TCP keepalive ends it. If dead rows climb with no run in progress, check `pg_stat_activity` for an old `idle in transaction` session.
+
 ## Operator checks
 
 The recipes below are the maintained repository interface. `just --summary` lists them, and `just --dry-run check` shows the authoritative dependency graph without executing it.
@@ -148,7 +185,7 @@ The recipes below are the maintained repository interface. `just --summary` list
 | `just test` / `just coverage` | Run the isolated test suite and write `coverage.xml`; `coverage` is the CI-facing alias. |
 | `just secret-scan` | Scan Git history and the working directory with Gitleaks. |
 | `just check` | Run source, type, coverage, secret, build, install, license, release-artifact, and version-preview checks. This is the authoritative pre-merge gate. `just test`/`just coverage` (and therefore `just check`) exclude `integration`-marked tests. |
-| `just test-integration-pg18` | Similar-artist and style-atlas tier: runs the synthetic compact-COPY, publish and retire suite, and the style atlas's once-a-month and pinned writes, against a disposable official PostgreSQL 18 container (the digest database-schema's required tier pins) with the real `embedding_pipeline` role, applying database-schema's own DDL. The image must already be present locally; the script never pulls or builds it. There is no PostgreSQL 19 GA image yet. |
+| `just test-integration-pg18` | Similar-artist, style-atlas and rarity tier: runs the synthetic compact-COPY, publish and retire suite, the style atlas's once-a-month and pinned writes, and the rarity replacement with its dropped connection, short walk and lock timeout runs, against a disposable official PostgreSQL 18 container (the digest database-schema's required tier pins) with the real `embedding_pipeline` role, applying database-schema's own DDL. The image must already be present locally; the script never pulls or builds it. There is no PostgreSQL 19 GA image yet. |
 | `just test-integration-pg19` | Advisory tier: runs the whole integration suite, including the embedding pipeline's, against a disposable PostgreSQL 19 beta + pgvector container with the real `embedding_pipeline` role, applying database-schema's own DDL. Reuses the existing local `database-schema-postgres19-pgvector:local` image; never builds it (see `scripts/test-integration.sh`). |
 | `just audit` | Run the network-backed dependency vulnerability scan. |
 | `just image` | Build the repository-named image and verify its import, non-root user, repository, license, and exact-revision annotations. |

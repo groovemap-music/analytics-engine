@@ -34,7 +34,7 @@ The promoted OpenAPI document is the authority for the producer transport. This 
 | `anniversaries` | `/api/internal/insights/anniversaries` | `insights.monthly_anniversaries` | `/api/insights/this-month` |
 | `data_completeness` | `/api/internal/insights/data-completeness` | `insights.data_completeness` | `/api/insights/data-completeness` |
 | `community_enrichment` | `/api/internal/insights/community-enrichment` | Triggers the producer-owned bounded enrichment batch | No dedicated read endpoint |
-| `release_rarity` | `/api/internal/insights/rarity-scores` | `insights.release_rarity` | `/api/insights/release-rarity` |
+| `release_rarity` | `/api/internal/insights/rarity-scores/quality-counts`, then `/api/internal/insights/rarity-scores/page`, both paged | `insights.release_rarity` | `/api/insights/release-rarity` |
 | `activity_summary` | None — reads `activity.events` and `activity.impressions` directly | `insights.activity_summary` | `/api/insights/activity-summary` |
 
 `/api/insights/status` reads the latest `insights.computation_log` row for all twelve computation keys. `/health` is also available on the FastAPI port; the independently served readiness probe is `GET /health` on port 8009.
@@ -117,6 +117,10 @@ If Valkey is unavailable, endpoints continue reading PostgreSQL. The failed Valk
 Release rarity combines catalog and community signals into a normalized score and category. Community have/want counts are stored with the other precomputed inputs, and missing signals are handled explicitly rather than silently treated as complete observations. The read API serves the stored result; it does not recompute rarity during a request.
 
 Per ADR 0007, the score is media-neutral: `medium_rarity` is the canonical-medium signal that every release carries, `media_families` records the ADR 0007 family ids the release covers, and `family_signals` carries per-family-extension scores, keyed by module id (for example `grooved`) to a mapping of signal name to score. `pressing_scarcity` is a grooved-only signal populated only for vinyl, shellac, and grooved-other releases; it is `null` for every other family. `format_rarity` is retained for one minor version as a deprecated alias, computed at weight `0.0` and superseded by `medium_rarity`.
+
+The run walks the catalog-api's paged routes twice and keeps one page in memory at a time. The first walk sums the quality counts, which take no transaction and give the score distributions and the `release_total`. The second walk happens inside one PostgreSQL transaction: `DELETE`, then one `COPY` per page. Readers keep the previous table until commit, so a failed run costs nothing but its time. A run that writes fewer rows than the first `release_total` raises and rolls back. A catalog that reports no releases leaves the previous table in place. Each request retries `429`, `5xx` and transport errors with backoff on the same cursor, for about four minutes, and any other status fails the run at once.
+
+This trades one long transaction for not needing a staging table, and that transaction has a real cost across the whole database. See [Running the rarity computation](operations.md#running-the-rarity-computation).
 
 ## Source identity
 
