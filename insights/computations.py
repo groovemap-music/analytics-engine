@@ -738,7 +738,7 @@ _RARITY_COPY_SQL = """
          hidden_gem_score, pressing_scarcity, label_catalog,
          format_rarity, temporal_scarcity, graph_isolation,
          collection_prevalence, media_families, family_signals,
-         medium_rarity)
+         medium_rarity, label_ids, artist_ids)
     FROM STDIN
 """
 
@@ -763,6 +763,11 @@ def _rarity_copy_row(row: dict[str, Any]) -> tuple[Any, ...]:
         Jsonb(row.get("media_families") or []),
         Jsonb(row.get("family_signals") or {}),
         row.get("medium_rarity"),
+        # catalog-api 1.7.0 and later: every distinct label (ON) and artist (BY) of the release,
+        # ascending, empty when it has none. A page from an older API omits them; that stays NULL
+        # ("not computed"), which an empty list would misreport as "has no label or artist".
+        row.get("label_ids"),
+        row.get("artist_ids"),
     )
 
 
