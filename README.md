@@ -25,7 +25,7 @@ The stable repository interface is:
 - `just test` — run the isolated test suite with coverage.
 - `just coverage` — produce the same test coverage report used by CI.
 - `just contract-check` — verify the promoted `catalog-api` contract and generated binding.
-- `just test-integration-pg18` — run the similar-artist and style-atlas integration tier against a disposable PostgreSQL 18 container.
+- `just test-integration-pg18` — run the similar-artist, style-atlas and rarity integration tier against a disposable PostgreSQL 18 container.
 - `just test-integration-pg19` — run the whole integration suite, including the embedding pipeline's, against the advisory PostgreSQL 19 beta + pgvector image.
 - `just secret-scan` — scan Git history and the working tree with Gitleaks.
 - `just build` — create wheel and source distributions.
