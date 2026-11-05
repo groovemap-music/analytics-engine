@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented here by Commitizen.
 
+## v0.6.0 (2026-11-05)
+
+### Feat
+
+- **insights**: write label_ids and artist_ids in the rarity COPY
+- **contracts**: promote internal-insights 1.7.0 and pin database-schema v0.7.0
+
+### Fix
+
+- **insights**: walk rarity pages instead of the whole-catalog route
+
+### Perf
+
+- **insights**: store release_rarity with one COPY instead of a round trip per row
+- **embeddings**: binary read-back, COPY write and binary similar-artist COPY
+- **embeddings**: derive credited artist ids from the edge stream, drop server DISTINCT
+
 ## v0.5.0 (2026-10-30)
 
 ### Feat
