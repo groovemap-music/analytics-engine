@@ -2,7 +2,7 @@
 openapi: 3.1.0
 info:
   title: GrooveMap internal insights API
-  version: 1.6.0
+  version: 1.7.0
   description: Catalog API-owned contract consumed by the analytics engine.
 security:
   - InternalSecret: []
@@ -312,6 +312,8 @@ components:
         - medium_rarity
         - media_families
         - family_signals
+        - label_ids
+        - artist_ids
       properties:
         release_id: {type: string}
         title: {type: string}
@@ -342,6 +344,14 @@ components:
           type: object
           additionalProperties: true
           description: Per-family-extension signal scores keyed by module id (e.g. `grooved`).
+        label_ids:
+          type: array
+          items: {type: integer, format: int64}
+          description: Every distinct label the release is ON, ascending. Empty when it has none.
+        artist_ids:
+          type: array
+          items: {type: integer, format: int64}
+          description: Every distinct artist the release is BY, ascending. Empty when it has none.
       additionalProperties: true
   responses:
     Items:
