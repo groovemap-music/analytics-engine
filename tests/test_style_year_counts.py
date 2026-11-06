@@ -52,9 +52,9 @@ def _cursor(pool: MagicMock) -> AsyncMock:
 
 
 def _statements(pool: MagicMock) -> list[str]:
-    """Normalised SQL of every execute and executemany, in call order."""
+    """Normalised SQL of every execute and executemany, in call order (the computation_log writes excluded)."""
     statements: list[str] = _cursor(pool).statements
-    return statements
+    return [statement for statement in statements if "computation_log" not in statement]
 
 
 def _rows(pool: MagicMock, table: str) -> list[Any]:

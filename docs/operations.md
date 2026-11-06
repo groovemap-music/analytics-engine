@@ -172,7 +172,7 @@ All of these were measured on a 200,000-release run with real Neo4j, `catalog-ap
 | `catalog-api` killed, back after 8 s | Four retries on the same cursor; the run finished with all 200,000 rows | `completed` |
 | `catalog-api` stays down | Nine retries, gave up after 243 s | `failed` |
 
-A killed or stopped engine writes no `computation_log` row, so `/api/insights/status` still shows the previous completed run. Look for a missing `💾 Release rarity scores stored` log line. The scheduler starts rarity again on its next cycle, or 30 seconds after a restart.
+Every computation writes a `running` `computation_log` row, committed before it starts and outside its own transaction, and finishes that row as `completed`, `failed` or `interrupted`. SIGTERM finishes it as `interrupted` within a second. SIGKILL, an OOM kill and a power loss run no code, so the engine marks every leftover `running` row `interrupted` when it next starts, before the scheduler runs; `/api/insights/status` reports it as `interrupted` from then. An engine that stays down is reported `stale` once a `running` row is older than `INSIGHTS_RUNNING_STALE_AFTER_S` (default 21600, six hours; rarity takes a little over one). While a run is live the status is `running`, and `last_computed` stays on the last run that finished. The scheduler starts rarity again on its next cycle, or 30 seconds after a restart.
 
 A lost network or host wasn't measured. In that case the backend can't see the client go, so the transaction can stay open until TCP keepalive ends it. If dead rows climb with no run in progress, check `pg_stat_activity` for an old `idle in transaction` session.
 

@@ -202,7 +202,7 @@ class TestASecondRunInTheSameMonth:
 
         assert written == 0
         assert atlas.month_rows(date(2026, 10, 1)) == ([concurrent], [])
-        assert not any(statement.startswith("INSERT") for statement in atlas.statements)
+        assert not any(statement.startswith("INSERT") and "computation_log" not in statement for statement in atlas.statements)
 
 
 class TestTheNextMonth:

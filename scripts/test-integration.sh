@@ -58,4 +58,4 @@ POSTGRES_USERNAME=groovemap \
 POSTGRES_PASSWORD="${password}" \
 EMBEDDING_PIPELINE_POSTGRES_USERNAME=embedding_pipeline_login \
 EMBEDDING_PIPELINE_POSTGRES_PASSWORD="${password}" \
-    uv run pytest -m integration ${integration_tests}
+    uv run pytest -m integration ${integration_tests} "$@"
