@@ -61,6 +61,19 @@ async def _until_printed(child: asyncio.subprocess.Process, marker: bytes) -> No
                 return
 
 
+async def _seed_completed_run(pool: AsyncPostgreSQLPool) -> str:
+    """A finished run two days ago; returns its completed_at as the status endpoint renders it."""
+    async with pool.connection() as conn, conn.cursor() as cursor:
+        await cursor.execute(
+            "INSERT INTO insights.computation_log (insight_type, status, started_at, completed_at, duration_ms) "
+            "VALUES (%s, 'completed', NOW() - interval '2 days', NOW() - interval '2 days', 1000) RETURNING completed_at",
+            (INSIGHT,),
+        )
+        row = await cursor.fetchone()
+    assert row is not None
+    return str(row[0].isoformat().replace("+00:00", ""))[:19]
+
+
 async def _spawn(mode: str) -> asyncio.subprocess.Process:
     child = await asyncio.create_subprocess_exec(sys.executable, str(CHILD), mode, stdout=asyncio.subprocess.PIPE, env=os.environ.copy())
     await _until_printed(child, b"READY")
@@ -91,21 +104,25 @@ async def test_a_completed_run_reports_as_it_always_did(pool: AsyncPostgreSQLPoo
 
 
 async def test_sigkill_mid_transaction_leaves_a_run_that_status_reports_interrupted_after_restart(pool: AsyncPostgreSQLPool) -> None:
+    seeded = await _seed_completed_run(pool)
     child = await _spawn("hang")
     # Written, committed and visible from another session while the run's own transaction is still open.
-    assert await _rows(pool) == [("running", False, None)]
-    assert (await _status(pool))["status"] == "running"
+    assert [row[:2] for row in await _rows(pool)] == [("completed", True), ("running", False)]
+    live = await _status(pool)
+    assert live["status"] == "running"
+    assert live["last_computed"].startswith(seeded), "a live run must not stand in for the last finished one"
 
     child.send_signal(signal.SIGKILL)
     await child.wait()
     killed_at = time.monotonic()
 
-    assert await _rows(pool) == [("running", False, None)], "SIGKILL runs no code, so the row is still open until a restart"
+    assert [row[:2] for row in await _rows(pool)][-1] == ("running", False), "SIGKILL runs no code, so the row is still open until a restart"
     assert await mark_interrupted_runs(pool) == 1  # what lifespan() does before the scheduler starts
     status = await _status(pool)
     print(f"\nSIGKILL: status {status['status']!r} {time.monotonic() - killed_at:.3f}s after the kill, once the engine restarts")
     assert status["status"] == "interrupted"
-    assert (await _rows(pool))[0][:2] == ("interrupted", True)
+    assert status["last_computed"].startswith(seeded), "an interrupted run did not compute anything: last_computed is the last finished run"
+    assert [row[:2] for row in await _rows(pool)][-1] == ("interrupted", True)
 
 
 async def test_sigterm_is_recorded_by_the_run_itself_before_it_exits(pool: AsyncPostgreSQLPool) -> None:
@@ -147,3 +164,30 @@ async def test_a_run_nobody_swept_is_reported_stale_after_the_bound(pool: AsyncP
     status = await _status(pool)
     assert status["status"] == "stale"
     assert status["last_computed"] is not None, "last_computed stays on the last run that finished"
+
+
+async def test_a_run_whose_start_row_is_gone_still_logs_its_outcome(pool: AsyncPostgreSQLPool) -> None:
+    @_record_lifecycle(INSIGHT, "failed")
+    async def compute(_client: Any, _pool: Any) -> int:
+        async with _pool.connection() as conn, conn.cursor() as cursor:
+            await cursor.execute("DELETE FROM insights.computation_log WHERE insight_type = %s", (INSIGHT,))
+        return 3
+
+    assert await compute(None, pool) == 3
+
+    assert [row[:2] for row in await _rows(pool)] == [("completed", True)]
+
+
+async def test_a_failed_latest_run_reports_the_last_completed_time(pool: AsyncPostgreSQLPool) -> None:
+    seeded = await _seed_completed_run(pool)
+
+    @_record_lifecycle(INSIGHT, "failed")
+    async def compute(_client: Any, _pool: Any) -> int:
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        await compute(None, pool)
+
+    status = await _status(pool)
+    assert status["status"] == "failed"
+    assert status["last_computed"].startswith(seeded)

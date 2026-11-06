@@ -656,11 +656,13 @@ async def computation_status() -> JSONResponse:
                 statuses.append(ComputationStatus(insight_type=itype, status="never_run").model_dump(mode="json"))
                 continue
             status, last_computed = row[1], row[2]
-            if status == "running":
-                # An unfinished run is not a completed one: report it as such, and keep
-                # last_computed on the last run that did finish. A run older than any computation
-                # takes has lost its process, whether or not a restart has swept it yet.
-                status = "stale" if row[4] < stale_before else "running"
+            if status != "completed":
+                # A run that did not finish says nothing about when the data was last computed, so
+                # last_computed always names the last run that did. An unfinished run is reported as
+                # such: a run older than any computation takes has lost its process, whether or not a
+                # restart has swept it yet.
+                if status == "running":
+                    status = "stale" if row[4] < stale_before else "running"
                 await cursor.execute(
                     "SELECT completed_at FROM insights.computation_log "
                     "WHERE insight_type = %s AND status = 'completed' ORDER BY started_at DESC LIMIT 1",

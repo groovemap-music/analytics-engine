@@ -174,7 +174,10 @@ async def _log_computation(
                 """,
                 (status, completed_at, rows_affected, duration_ms, error_message, run_id),
             )
-            return
+            if cursor.rowcount:
+                return
+            # The row is gone (or was never this run's): log the outcome as a new row, as a run
+            # with no start row does.
         await cursor.execute(
             """
             INSERT INTO insights.computation_log
