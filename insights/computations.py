@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -126,6 +127,30 @@ def endpoint_timeout(path: str | None = None) -> httpx.Timeout:
     )
 
 
+async def _start_computation(pool: Any, insight_type: str, started_at: datetime) -> int | None:
+    """Record that a run began, in its own statement and connection checkout.
+
+    The row is written and committed before the computation does any work and outside the
+    computation's own transaction, so neither a rollback nor a killed process can erase it. A run
+    that never reaches :func:`_log_computation` leaves this ``running`` row behind, which is what
+    makes an interrupted run visible. Returns ``None`` when the row could not be written: the run
+    then logs once, at its end, as it did before, and is not blocked by a failing log.
+    """
+    try:
+        async with pool.connection() as conn, conn.cursor() as cursor:
+            cursor = cast("Any", cursor)
+            await cursor.execute(
+                "INSERT INTO insights.computation_log (insight_type, status, started_at) VALUES (%s, 'running', %s) RETURNING id",
+                (insight_type, started_at),
+            )
+            row = await cursor.fetchone()
+    except Exception as error:
+        logger.warning("⚠️ Failed to record computation start", insight_type=insight_type, error=describe_exception(error))
+        return None
+    run_id = row[0] if row else None
+    return run_id if isinstance(run_id, int) else None
+
+
 async def _log_computation(
     pool: Any,
     insight_type: str,
@@ -133,12 +158,26 @@ async def _log_computation(
     started_at: datetime,
     rows_affected: int = 0,
     error_message: str | None = None,
+    run_id: int | None = None,
 ) -> None:
-    """Write a computation log entry."""
+    """Write a computation log entry, finishing the ``running`` row ``run_id`` names when there is one."""
     completed_at = datetime.now(UTC)
     duration_ms = int((completed_at - started_at).total_seconds() * 1000)
     async with pool.connection() as conn, conn.cursor() as cursor:
         cursor = cast("Any", cursor)
+        if run_id is not None:
+            await cursor.execute(
+                """
+                UPDATE insights.computation_log
+                SET status = %s, completed_at = %s, rows_affected = %s, duration_ms = %s, error_message = %s
+                WHERE id = %s
+                """,
+                (status, completed_at, rows_affected, duration_ms, error_message, run_id),
+            )
+            if cursor.rowcount:
+                return
+            # The row is gone (or was never this run's): log the outcome as a new row, as a run
+            # with no start row does.
         await cursor.execute(
             """
             INSERT INTO insights.computation_log
@@ -147,6 +186,31 @@ async def _log_computation(
             """,
             (insight_type, status, started_at, completed_at, rows_affected, duration_ms, error_message),
         )
+
+
+async def mark_interrupted_runs(pool: Any) -> int:
+    """Close every run still marked ``running`` as ``interrupted``; returns how many.
+
+    Called once at startup, before the scheduler starts: a ``running`` row can only belong to a
+    process that is gone, because computations run inside this one process. SIGKILL, an OOM kill and
+    a power loss all run no code, so this sweep is how those runs become visible, as soon as the
+    engine is back. SIGTERM is closed by the wrapper itself.
+    """
+    async with pool.connection() as conn, conn.cursor() as cursor:
+        cursor = cast("Any", cursor)
+        await cursor.execute(
+            """
+            UPDATE insights.computation_log
+            SET status = 'interrupted', completed_at = NOW(),
+                duration_ms = (EXTRACT(EPOCH FROM (NOW() - started_at)) * 1000)::bigint,
+                error_message = 'the engine stopped before this run finished'
+            WHERE status = 'running'
+            """
+        )
+        count = int(cursor.rowcount or 0)
+    if count:
+        logger.warning("⚠️ Marked runs from a previous process as interrupted", count=count)
+    return count
 
 
 def _record_lifecycle(
@@ -164,17 +228,26 @@ def _record_lifecycle(
         @wraps(operation)
         async def wrapped(client: httpx.AsyncClient, pool: Any, *args: P.args, **kwargs: P.kwargs) -> int:
             started_at = datetime.now(UTC)
+            run_id = await _start_computation(pool, insight_type, started_at)
             try:
                 rows_affected = await operation(client, pool, *args, **kwargs)
-                await _log_computation(pool, insight_type, "completed", started_at, rows_affected)
+                await _log_computation(pool, insight_type, "completed", started_at, rows_affected, run_id=run_id)
                 return rows_affected
             except Exception as error:
                 description = describe_exception(error)
                 logger.error(failure_message, error=description)
                 try:
-                    await _log_computation(pool, insight_type, "failed", started_at, error_message=description)
+                    await _log_computation(pool, insight_type, "failed", started_at, error_message=description, run_id=run_id)
                 except Exception as log_error:
                     logger.warning("⚠️ Failed to log computation error", error=describe_exception(log_error))
+                raise
+            except asyncio.CancelledError:
+                # SIGTERM reaches a running computation as a cancellation. Finish the row before
+                # letting it propagate, shielded so the cancellation cannot cut the write short.
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(
+                        _log_computation(pool, insight_type, "interrupted", started_at, error_message="cancelled before it finished", run_id=run_id)
+                    )
                 raise
 
         return wrapped

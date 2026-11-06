@@ -22,6 +22,7 @@ import valkey.asyncio as aiovalkey
 from common import (
     AsyncPostgreSQLPool,
     HealthServer,
+    describe_exception,
     instrument_fastapi_app,
     instrument_httpx,
     parse_postgres_host_port,
@@ -35,7 +36,7 @@ from fastapi.responses import JSONResponse
 
 from insights import __version__
 from insights.cache import InsightsCache
-from insights.computations import ACTIVITY_SUMMARY_DEFAULT_DAYS, endpoint_timeout, run_all_computations
+from insights.computations import ACTIVITY_SUMMARY_DEFAULT_DAYS, endpoint_timeout, mark_interrupted_runs, run_all_computations
 from insights.config import InsightsConfig
 from insights.models import (
     ActivitySummaryItem,
@@ -68,6 +69,10 @@ STARTUP_BANNER = r"""
 
 INSIGHTS_PORT = 8008
 INSIGHTS_HEALTH_PORT = 8009
+# A run still marked "running" after this long is reported as "stale". The longest computation (release
+# rarity) runs a little over an hour, so six hours leaves room without letting a lost run pose as live.
+# A restart marks such runs "interrupted" at once; this covers an engine that has not restarted.
+RUNNING_STALE_AFTER_S = float(os.getenv("INSIGHTS_RUNNING_STALE_AFTER_S", "21600"))
 
 _config: InsightsConfig | None = None
 _pool: AsyncPostgreSQLPool | None = None
@@ -216,6 +221,10 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     logger.info("🏥 Health server started", port=INSIGHTS_HEALTH_PORT)
 
     _pool = await _initialize_pool(_config)
+    try:
+        await mark_interrupted_runs(_pool)
+    except Exception as error:
+        logger.warning("⚠️ Could not close runs left over from a previous process", error=describe_exception(error))
     _http_client = _initialize_http_client(_config)
     _valkey, _cache = await _initialize_cache(_config)
 
@@ -632,27 +641,43 @@ async def computation_status() -> JSONResponse:
     ]
     statuses: list[dict[str, Any]] = []
 
+    stale_before = datetime.now(UTC) - timedelta(seconds=RUNNING_STALE_AFTER_S)
     async with _pool.connection() as conn, conn.cursor() as cursor:
         cursor = cast("Any", cursor)
         for itype in insight_types:
             await cursor.execute(
-                "SELECT insight_type, status, completed_at, duration_ms "
+                "SELECT insight_type, status, completed_at, duration_ms, started_at "
                 "FROM insights.computation_log "
                 "WHERE insight_type = %s ORDER BY started_at DESC LIMIT 1",
                 (itype,),
             )
             row = await cursor.fetchone()
-            if row:
-                statuses.append(
-                    ComputationStatus(
-                        insight_type=row[0],
-                        status=row[1],
-                        last_computed=row[2],
-                        duration_ms=row[3],
-                    ).model_dump(mode="json")
-                )
-            else:
+            if not row:
                 statuses.append(ComputationStatus(insight_type=itype, status="never_run").model_dump(mode="json"))
+                continue
+            status, last_computed = row[1], row[2]
+            if status != "completed":
+                # A run that did not finish says nothing about when the data was last computed, so
+                # last_computed always names the last run that did. An unfinished run is reported as
+                # such: a run older than any computation takes has lost its process, whether or not a
+                # restart has swept it yet.
+                if status == "running":
+                    status = "stale" if row[4] < stale_before else "running"
+                await cursor.execute(
+                    "SELECT completed_at FROM insights.computation_log "
+                    "WHERE insight_type = %s AND status = 'completed' ORDER BY started_at DESC LIMIT 1",
+                    (itype,),
+                )
+                completed = await cursor.fetchone()
+                last_computed = completed[0] if completed else None
+            statuses.append(
+                ComputationStatus(
+                    insight_type=row[0],
+                    status=status,
+                    last_computed=last_computed,
+                    duration_ms=row[3],
+                ).model_dump(mode="json")
+            )
 
     return JSONResponse(content={"statuses": statuses})
 
