@@ -49,6 +49,8 @@ if [[ "${postgres_ready}" != true ]]; then
     exit 1
 fi
 
+echo "integration tier: PostgreSQL $(docker exec "${postgres_container}" psql --username groovemap --dbname groovemap --tuples-only --no-align --command "show server_version") from ${postgres_image}"
+
 postgres_published="$(docker port "${postgres_container}" 5432/tcp)"
 postgres_port="${postgres_published##*:}"
 

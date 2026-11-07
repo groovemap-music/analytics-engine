@@ -27,6 +27,7 @@ jobs:
       package-command: just build
       install-command: just install-check
       image-command: just image
+      integration-command: just test-integration-ci
       coverage-files: coverage.xml
       coverage-flags: python,analytics
       upload-codecov: true
