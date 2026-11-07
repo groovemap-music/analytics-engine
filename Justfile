@@ -2,6 +2,8 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # Digest-pinned official PostgreSQL 18 image for the integration tier. CI pulls it; the local script never does.
 pg18_image := "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2"
+# Official pgvector image on PostgreSQL 18 (linux/amd64 manifest verified), for the embedding-pipeline suite.
+pgvector_pg18_image := "pgvector/pgvector:pg18@sha256:c29f30688a9ad961691bdf0ec1650717cc132a5814619d80f80463d6e4c42e47"
 
 default:
     @just --list
@@ -56,10 +58,20 @@ test-integration-pg18:
         INTEGRATION_TESTS="tests/integration/test_similar_artists_integration.py tests/integration/test_style_atlas_integration.py tests/integration/test_rarity_integration.py tests/integration/test_label_longevity_integration.py tests/integration/test_data_completeness_integration.py tests/integration/test_interrupted_runs_integration.py" \
         bash scripts/test-integration.sh -v
 
-# CI entry point: pull the pinned PG18 image (the script itself never pulls), then run the tier verbosely.
+# CI entry point: pull the pinned images (the script itself never pulls), then run the PG18 and pgvector tiers verbosely.
 test-integration-ci:
     docker pull {{pg18_image}}
+    docker pull {{pgvector_pg18_image}}
     just test-integration-pg18
+    just test-integration-pgvector
+
+# pgvector tier: the embedding-pipeline suite on the digest-pinned pgvector PG18 image. CI-only: it pulls
+# the image first, because the local script never does.
+test-integration-pgvector:
+    docker pull {{pgvector_pg18_image}}
+    POSTGRES_INTEGRATION_IMAGE={{pgvector_pg18_image}} \
+        INTEGRATION_TESTS="tests/integration/test_embedding_pipeline_integration.py" \
+        bash scripts/test-integration.sh -v
 
 # Advisory tier: the same schema, plus the vector extension and public.artist_embeddings, on
 # the existing local PG19 beta + pgvector image, running the whole integration suite including
