@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented here by Commitizen.
 
+## v0.6.1 (2026-11-06)
+
+### Release notes
+
+No schema change. The insights status reports interrupted computations and the last completed time for an unfinished latest run.
+
+### Fix
+
+- **status**: report the last completed time for any unfinished latest run
+- **status**: show interrupted computations in the insights status
+
 ## v0.6.0 (2026-11-05)
 
 ### Feat
