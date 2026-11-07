@@ -42,6 +42,7 @@ class LabelLongevityItem(BaseModel):
     total_releases: int
     peak_decade: int | None = None
     still_active: bool = False
+    is_placeholder: bool = False
 
 
 class AnniversaryItem(BaseModel):

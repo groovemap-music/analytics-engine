@@ -390,6 +390,35 @@ class TestComputeAndStoreLabelLongevity:
             rows = await compute_and_store_label_longevity(mock_client, mock_pool)
 
         assert rows == 1
+        assert mock_fetch.call_args.args[2] == {"limit": 50, "include_placeholders": "true"}
+
+    @pytest.mark.asyncio
+    async def test_real_labels_keep_their_ranks_and_placeholders_follow(self) -> None:
+        from insights.computations import compute_and_store_label_longevity
+
+        def label(label_id: str, *, placeholder: bool = False) -> dict[str, object]:
+            return {
+                "label_id": label_id,
+                "label_name": label_id,
+                "first_year": 1950,
+                "last_year": 2025,
+                "years_active": 70,
+                "total_releases": 10,
+                "is_placeholder": placeholder,
+            }
+
+        mock_pool = _make_mock_pool()
+        with patch("insights.computations._fetch_from_api", return_value=[label("a"), label("nol", placeholder=True), label("b")]):
+            await compute_and_store_label_longevity(AsyncMock(), mock_pool)
+
+        cursor = mock_pool.connection.return_value.cursor.return_value
+        inserts = [c.args[1] for c in cursor.execute.call_args_list if "INSERT INTO insights.label_longevity" in c.args[0]]
+        assert [(p[0], p[1], p[9]) for p in inserts] == [(1, "a", False), (3, "nol", True), (2, "b", False)]
+
+    def test_ranks_without_a_placeholder_flag_are_positions(self) -> None:
+        from insights.computations import _label_longevity_ranks
+
+        assert _label_longevity_ranks([{}, {}, {}]) == [1, 2, 3]
 
     @pytest.mark.asyncio
     async def test_handles_empty_results(self) -> None:

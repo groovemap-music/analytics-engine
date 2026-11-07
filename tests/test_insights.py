@@ -5,6 +5,7 @@ import contextlib
 from datetime import UTC
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -225,7 +226,7 @@ class TestLabelLongevityCacheIntegration:
         mock_cache.get.return_value = None
         response = test_client_with_cache.get("/api/insights/label-longevity?limit=10")
         assert response.status_code == 200
-        mock_cache.get.assert_called_once_with("insights:label-longevity:10", TEST_CACHE_GENERATION)
+        mock_cache.get.assert_called_once_with("insights:label-longevity:10:real", TEST_CACHE_GENERATION)
         mock_cache.set.assert_called_once()
 
     def test_cache_hit_returns_cached_data(
@@ -239,6 +240,44 @@ class TestLabelLongevityCacheIntegration:
         assert response.status_code == 200
         assert response.json() == cached
         mock_cache.set.assert_not_called()
+
+
+class TestLabelLongevityPlaceholders:
+    def test_include_placeholders_uses_its_own_cache_key(
+        self,
+        test_client_with_cache: TestClient,
+        mock_cache: AsyncMock,
+    ) -> None:
+        mock_cache.get.return_value = None
+        response = test_client_with_cache.get("/api/insights/label-longevity?limit=10&include_placeholders=true")
+        assert response.status_code == 200
+        mock_cache.get.assert_called_once_with("insights:label-longevity:10:placeholders", TEST_CACHE_GENERATION)
+
+    def test_rejects_a_non_boolean_flag(self, test_client: TestClient) -> None:
+        assert test_client.get("/api/insights/label-longevity?include_placeholders=maybe").status_code == 422
+
+
+def _longevity_row(rank: int, label_id: str, years: int, *, placeholder: bool = False) -> tuple[Any, ...]:
+    return (rank, label_id, f"Label {label_id}", 1950, 2025, years, 100, 1970, True, placeholder)
+
+
+class TestTrimTrailingPlaceholders:
+    def test_drops_placeholders_ranking_after_the_last_real_label(self) -> None:
+        from insights.insights import _trim_trailing_placeholders
+
+        rows = [
+            _longevity_row(1, "a", 90),
+            _longevity_row(3, "p", 80, placeholder=True),
+            _longevity_row(2, "b", 70),
+            _longevity_row(4, "q", 10, placeholder=True),
+        ]
+        assert _trim_trailing_placeholders(rows, 2) == rows[:3]
+
+    def test_keeps_every_placeholder_while_fewer_real_labels_than_the_limit_exist(self) -> None:
+        from insights.insights import _trim_trailing_placeholders
+
+        rows = [_longevity_row(1, "a", 90), _longevity_row(2, "p", 10, placeholder=True)]
+        assert _trim_trailing_placeholders(rows, 5) == rows
 
 
 class TestThisMonthCacheIntegration:
@@ -1144,7 +1183,8 @@ class TestServiceNotReadyResponses:
 _CACHED_ENDPOINTS = [
     ("/api/insights/top-artists?limit=10", "insights:top-artists:10"),
     ("/api/insights/genre-trends?genre=Rock", "insights:genre-trends:Rock"),
-    ("/api/insights/label-longevity?limit=10", "insights:label-longevity:10"),
+    ("/api/insights/label-longevity?limit=10", "insights:label-longevity:10:real"),
+    ("/api/insights/label-longevity?limit=10&include_placeholders=true", "insights:label-longevity:10:placeholders"),
     ("/api/insights/release-rarity?limit=10", "insights:release-rarity:10"),
     ("/api/insights/data-completeness", "insights:data-completeness"),
     ("/api/insights/style-atlas", "insights:style-atlas"),
