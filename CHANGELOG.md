@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented here by Commitizen.
 
+## v0.7.0 (2026-11-07)
+
+### Release notes
+
+Needs the database-schema release with `label_longevity.is_placeholder` first. Stores placeholder labels after the real ranks and adds include_placeholders to /api/insights/label-longevity, off by default. Promotes internal-insights 1.10.0.
+
+### Feat
+
+- **insights**: let callers include placeholder labels in label longevity
+- **contracts**: promote internal-insights 1.10.0 and pin database-schema 0810604
+
 ## v0.6.2 (2026-11-06)
 
 ### Release notes
