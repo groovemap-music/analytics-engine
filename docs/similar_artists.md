@@ -51,7 +51,7 @@ The 9.37M × 9.37M score matrix is never materialized, so the job computes it in
 
 Each database step takes its own pool connection, so none is held open across the multi-hour compute.
 
-The create, publish and retire helpers, and the release-table lock they take, are database-schema's own (`groovemap_schema.postgres`), imported at runtime. `groovemap-database-schema` is a first-party runtime dependency pinned to database-schema `b24a01d8537ba7e26e0e812032a1e9f413d2caea` (v0.8.0), which carries the compact per-artist shape from gm-database-schema-hqjp. No copy of the producer's SQL lives in this repository, so it cannot drift. `scripts/prepare-runtime-wheel.sh` stages that wheel next to the `python-libraries` runtime wheel for the image, and `scripts/check-repository-compliance.py` fails if the two places that name the pin disagree.
+The create, publish and retire helpers, and the release-table lock they take, are database-schema's own (`groovemap_schema.postgres`), imported at runtime. `groovemap-database-schema` is a first-party runtime dependency pinned to database-schema `08106040f3c4d7e6494dfbbc495c43d91a0dfb38` (v0.9.0 line, main after the tag, adds insights.label_longevity.is_placeholder), which carries the compact per-artist shape from gm-database-schema-hqjp. No copy of the producer's SQL lives in this repository, so it cannot drift. `scripts/prepare-runtime-wheel.sh` stages that wheel next to the `python-libraries` runtime wheel for the image, and `scripts/check-repository-compliance.py` fails if the two places that name the pin disagree.
 
 ## Memory guard
 

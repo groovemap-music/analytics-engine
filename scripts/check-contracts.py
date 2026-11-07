@@ -17,15 +17,21 @@ def digest(path: Path) -> str:
 source = json.loads((CONTRACT_ROOT / "source.json").read_text())
 assert source["producer_repository"] == "https://github.com/groovemap-music/catalog-api"
 assert len(source["producer_commit"]) == 40
-assert source["version"] == "1.7.0"
+assert source["version"] == "1.10.0"
 assert digest(CONTRACT_ROOT / "openapi.yaml") == source["contract_sha256"]
 assert digest(ROOT / source["binding"]) == source["binding_sha256"]
 
 binding = (ROOT / source["binding"]).read_text()
-assert 'CONTRACT_VERSION = "1.7.0"' in binding
+assert 'CONTRACT_VERSION = "1.10.0"' in binding
 assert "COMMUNITY_ENRICHMENT_MAX_PROCESSING_SECONDS = 1500" in binding
+assert "GENRE_TRENDS_MAX_PROCESSING_SECONDS = 300" in binding
+assert "LABEL_LONGEVITY_MAX_PROCESSING_SECONDS = 300" in binding
 assert "STYLE_YEAR_COUNTS_MAX_PROCESSING_SECONDS = 300" in binding
 assert "STYLE_LANDMARKS_MAX_PROCESSING_SECONDS = 300" in binding
 assert "STYLE_COTAGS_MAX_PROCESSING_SECONDS = 300" in binding
 assert "RARITY_PAGE_MAX_PROCESSING_SECONDS = 300" in binding
 assert "RARITY_QUALITY_COUNTS_MAX_PROCESSING_SECONDS = 300" in binding
+
+contract = (CONTRACT_ROOT / "openapi.yaml").read_text()
+assert "name: include_placeholders" in contract
+assert '$ref: "#/components/parameters/LabelLongevityIncludePlaceholders"' in contract
