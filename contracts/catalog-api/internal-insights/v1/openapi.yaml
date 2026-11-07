@@ -2,7 +2,7 @@
 openapi: 3.1.0
 info:
   title: GrooveMap internal insights API
-  version: 1.7.0
+  version: 1.10.0
   description: Catalog API-owned contract consumed by the analytics engine.
 security:
   - InternalSecret: []
@@ -17,8 +17,15 @@ paths:
   /api/internal/insights/genre-trends:
     get:
       operationId: genre_trends
+      description: >-
+        Release counts per genre and decade of the release's own year; undated releases are
+        left out. The read scans every release-genre tag, so it runs under a long internal
+        budget.
+      x-groovemap-max-processing-seconds: 300
       responses:
         "200": {$ref: "#/components/responses/Items"}
+        "503":
+          description: Neo4j gave up on the read with a retryable error, or is not ready.
   /api/internal/insights/style-year-counts:
     get:
       operationId: style_year_counts
@@ -40,8 +47,8 @@ paths:
         Landmark masters per style: up to 25 masters of each style, ranked by the number of
         releases that carry the style and derive from the master, ties broken by master id
         ascending. Releases without a master do not count. The year is the master's own,
-        `null` when it has none. The read ranks every style-master pair, so it runs under a
-        long internal budget.
+        `null` when it has none. The read visits every release-style tag one style at a time,
+        so it runs under a long internal budget.
       x-groovemap-max-processing-seconds: 300
       responses:
         "200": {$ref: "#/components/responses/StyleLandmarks"}
@@ -54,8 +61,8 @@ paths:
         Co-tagged styles per style: up to 25 other styles for each style, ranked by the number
         of releases tagged with both, ties broken by the other style's name ascending. A style
         is never paired with itself. Each pair appears under both of its styles, with the same
-        count. The read counts every release's style pairs, so it runs under a long internal
-        budget.
+        count. The read counts every release's style pairs one style at a time, so it runs
+        under a long internal budget.
       x-groovemap-max-processing-seconds: 300
       responses:
         "200": {$ref: "#/components/responses/StyleCotags"}
@@ -64,10 +71,25 @@ paths:
   /api/internal/insights/label-longevity:
     get:
       operationId: label_longevity
+      description: >-
+        Longest-running labels: first and last release year, years active, dated releases and
+        peak decade per label, ranked by years active, then releases, then label id ascending.
+        Ties for the peak decade go to the earlier decade. Undated releases are left out, and
+        labels with no name or no dated release are not ranked. The read takes the year of every
+        release-label edge, so it runs under a long internal budget. Every row carries
+        is_placeholder, which marks a Discogs entry for releases with no label, such as Not On
+        Label, rather than a label. Placeholders are left out by default, so limit real labels are
+        ranked. With include_placeholders, the same real labels come back with the placeholders
+        that rank among them, at most limit more. Those rows take no place from a real label: a
+        real label's rank is its position among the rows with is_placeholder false.
+      x-groovemap-max-processing-seconds: 300
       parameters:
         - $ref: "#/components/parameters/LabelLongevityLimit"
+        - $ref: "#/components/parameters/LabelLongevityIncludePlaceholders"
       responses:
         "200": {$ref: "#/components/responses/Items"}
+        "503":
+          description: Neo4j gave up on the read with a retryable error, or is not ready.
   /api/internal/insights/anniversaries:
     get:
       operationId: anniversaries
@@ -146,6 +168,11 @@ components:
       in: query
       required: false
       schema: {type: integer, minimum: 1, maximum: 500, default: 50}
+    LabelLongevityIncludePlaceholders:
+      name: include_placeholders
+      in: query
+      required: false
+      schema: {type: boolean, default: false}
     AnniversaryYear:
       name: year
       in: query

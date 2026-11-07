@@ -58,6 +58,7 @@ class TestLabelLongevityItem:
         )
         assert item.years_active == 86
         assert item.still_active is True
+        assert item.is_placeholder is False
 
 
 class TestAnniversaryItem:

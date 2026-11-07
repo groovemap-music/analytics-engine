@@ -8,7 +8,7 @@ supplies every environment variable `_required_env` below reads. See that script
 
 The schema applied here is the real one: `groovemap_schema.postgres.create_postgres_schema`,
 from the pinned `groovemap-database-schema` runtime dependency (rev
-`b24a01d8537ba7e26e0e812032a1e9f413d2caea`, version 0.8.0), the same way `catalog-api` applies
+`08106040f3c4d7e6494dfbbc495c43d91a0dfb38`, version 0.9.0, main after the tag, adds insights.label_longevity.is_placeholder), the same way `catalog-api` applies
 it in its own `postgres_pool` fixture. Without pgvector (the PG18 tier) it skips the vector
 extension and `public.artist_embeddings` without counting a failure, and still creates the
 `embedding_pipeline` role, the compact similarity tables (`gm-database-schema-hqjp`) and their

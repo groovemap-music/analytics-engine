@@ -335,12 +335,22 @@ async def genre_trends(genre: str = Query(...)) -> JSONResponse:
 
 
 @app.get("/api/insights/label-longevity")
-async def label_longevity(limit: int = Query(50, ge=1, le=200)) -> JSONResponse:
-    """Return labels ranked by years of active operation (precomputed)."""
+async def label_longevity(
+    limit: int = Query(50, ge=1, le=200),
+    include_placeholders: bool = Query(False),
+) -> JSONResponse:
+    """Return labels ranked by years of active operation (precomputed).
+
+    Placeholders (Discogs entries for releases with no label, such as Not On Label) are left out
+    unless ``include_placeholders`` is true. Then the top ``limit`` real labels come back with the
+    placeholders that rank among them, in ranking order (years active, then releases, then label id),
+    each flagged ``is_placeholder``. A real label's ``rank`` is the same either way.
+    """
     if not _pool:
         return JSONResponse(content={"error": "Service not ready"}, status_code=503)
 
-    cache_key = f"insights:label-longevity:{limit}"
+    # The two responses differ, so the flag is part of the key.
+    cache_key = f"insights:label-longevity:{limit}:{'placeholders' if include_placeholders else 'real'}"
     # Read the generation BEFORE the DB read — see insights/cache.py.
     generation = await _cache.generation() if _cache else 0
     if _cache:
@@ -348,15 +358,27 @@ async def label_longevity(limit: int = Query(50, ge=1, le=200)) -> JSONResponse:
         if cached is not None:
             return JSONResponse(content=cached)
 
+    columns = "rank, label_id, label_name, first_year, last_year, years_active, total_releases, peak_decade, still_active, is_placeholder"
     async with _pool.connection() as conn, conn.cursor() as cursor:
         cursor = cast("Any", cursor)
-        await cursor.execute(
-            "SELECT rank, label_id, label_name, first_year, last_year, "
-            "years_active, total_releases, peak_decade, still_active "
-            "FROM insights.label_longevity ORDER BY rank LIMIT %s",
-            (limit,),
-        )
-        rows = await cursor.fetchall()
+        if include_placeholders:
+            # Real labels hold ranks 1..N and placeholders N+1 on, so rank alone would put a
+            # placeholder last. Order by the ranking's own key so it appears where it ranks, and
+            # keep only the placeholders that sort at or before the limit-th real label.
+            await cursor.execute(
+                f"SELECT {columns} FROM insights.label_longevity "  # noqa: S608 -- constant column list
+                "WHERE rank <= %s OR is_placeholder "
+                "ORDER BY years_active DESC, total_releases DESC, label_id ASC",
+                (limit,),
+            )
+            rows = _trim_trailing_placeholders(list(await cursor.fetchall()), limit)
+        else:
+            await cursor.execute(
+                f"SELECT {columns} FROM insights.label_longevity "  # noqa: S608 -- constant column list
+                "WHERE NOT is_placeholder ORDER BY rank LIMIT %s",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
 
     items = [
         LabelLongevityItem(
@@ -369,6 +391,7 @@ async def label_longevity(limit: int = Query(50, ge=1, le=200)) -> JSONResponse:
             total_releases=r[6],
             peak_decade=r[7],
             still_active=r[8],
+            is_placeholder=r[9],
         ).model_dump()
         for r in rows
     ]
@@ -376,6 +399,20 @@ async def label_longevity(limit: int = Query(50, ge=1, le=200)) -> JSONResponse:
     if _cache:
         await _cache.set(cache_key, result, generation)
     return JSONResponse(content=result)
+
+
+def _trim_trailing_placeholders(rows: list[Any], limit: int) -> list[Any]:
+    """Drop the placeholders that rank after the last of the first ``limit`` real labels.
+
+    ``rows`` is every real label up to ``rank <= limit`` plus every stored placeholder, in ranking
+    order. With ``limit`` real labels, a placeholder ranking behind the last of them is not among
+    them; with fewer, every label is listed and so is every placeholder.
+    """
+    real = [r for r in rows if not r[9]]
+    if len(real) < limit:
+        return rows
+    last_real = max(i for i, r in enumerate(rows) if not r[9])
+    return rows[: last_real + 1]
 
 
 @app.get("/api/insights/release-rarity")

@@ -518,7 +518,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.143.2" },
-    { name = "groovemap-database-schema", git = "https://github.com/groovemap-music/database-schema.git?rev=b24a01d8537ba7e26e0e812032a1e9f413d2caea" },
+    { name = "groovemap-database-schema", git = "https://github.com/groovemap-music/database-schema.git?rev=08106040f3c4d7e6494dfbbc495c43d91a0dfb38" },
     { name = "groovemap-runtime", extras = ["postgres", "otel", "otel-http"], git = "https://github.com/groovemap-music/python-libraries.git?rev=5f35c03f68b0dd2c1955c731886c0ad8d8f9de63" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "numpy", specifier = ">=2.5.4" },
@@ -548,8 +548,8 @@ dev = [
 
 [[package]]
 name = "groovemap-database-schema"
-version = "0.8.0"
-source = { git = "https://github.com/groovemap-music/database-schema.git?rev=b24a01d8537ba7e26e0e812032a1e9f413d2caea#b24a01d8537ba7e26e0e812032a1e9f413d2caea" }
+version = "0.9.0"
+source = { git = "https://github.com/groovemap-music/database-schema.git?rev=08106040f3c4d7e6494dfbbc495c43d91a0dfb38#08106040f3c4d7e6494dfbbc495c43d91a0dfb38" }
 dependencies = [
     { name = "groovemap-runtime", extra = ["neo4j", "otel", "otel-http", "postgres"] },
     { name = "psycopg", extra = ["binary"] },

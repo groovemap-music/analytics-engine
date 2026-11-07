@@ -659,27 +659,55 @@ async def compute_and_store_style_cotags(client: httpx.AsyncClient, pool: Any) -
     return len(rows)
 
 
+def _label_longevity_ranks(results: list[dict[str, Any]]) -> list[int]:
+    """Return the stored ``rank`` of each label longevity row, in response order.
+
+    ``rank`` is the table's primary key and a real label's public rank, so a placeholder (a Discogs
+    entry such as Not On Label, flagged ``is_placeholder``) must not take a real label's place. Real
+    labels keep ``1..N`` by their position among the real rows; placeholders are stored from ``N + 1``
+    on, in the order the API ranked them.
+    """
+    real_count = sum(1 for row in results if not row.get("is_placeholder", False))
+    real_rank = 0
+    placeholder_rank = real_count
+    ranks: list[int] = []
+    for row in results:
+        if row.get("is_placeholder", False):
+            placeholder_rank += 1
+            ranks.append(placeholder_rank)
+        else:
+            real_rank += 1
+            ranks.append(real_rank)
+    return ranks
+
+
 @_record_lifecycle("label_longevity", "❌ Label longevity computation failed")
 async def compute_and_store_label_longevity(client: httpx.AsyncClient, pool: Any, limit: int = 50) -> int:
-    """Compute label longevity and store results."""
-    results = await _fetch_from_api(client, LABEL_LONGEVITY_PATH, {"limit": limit})
+    """Compute label longevity and store results, placeholders included and flagged.
+
+    The stored rows are the top ``limit`` real labels plus the placeholders that rank among them, so
+    the table holds more than ``limit`` rows when a placeholder qualifies. The read endpoint hides
+    placeholders unless a caller asks for them.
+    """
+    results = await _fetch_from_api(client, LABEL_LONGEVITY_PATH, {"limit": limit, "include_placeholders": "true"})
     if not results:
         return 0
 
+    ranks = _label_longevity_ranks(results)
     current_year = datetime.now(UTC).year
     async with pool.connection() as conn:
         await conn.set_autocommit(False)
         async with conn.transaction(), conn.cursor() as cursor:
             cursor = cast("Any", cursor)
             await cursor.execute("DELETE FROM insights.label_longevity")
-            for rank, row in enumerate(results, 1):
+            for rank, row in zip(ranks, results, strict=True):
                 still_active = row["last_year"] is not None and row["last_year"] >= current_year - 2
                 await cursor.execute(
                     """
                         INSERT INTO insights.label_longevity
                             (rank, label_id, label_name, first_year, last_year,
-                             years_active, total_releases, peak_decade, still_active)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                             years_active, total_releases, peak_decade, still_active, is_placeholder)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                     (
                         rank,
@@ -691,9 +719,14 @@ async def compute_and_store_label_longevity(client: httpx.AsyncClient, pool: Any
                         row["total_releases"],
                         row.get("peak_decade"),
                         still_active,
+                        bool(row.get("is_placeholder", False)),
                     ),
                 )
-    logger.info("💾 Label longevity stored", count=len(results))
+    logger.info(
+        "💾 Label longevity stored",
+        count=len(results),
+        placeholders=sum(1 for row in results if row.get("is_placeholder", False)),
+    )
     return len(results)
 
 
