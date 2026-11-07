@@ -1,5 +1,8 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+# Digest-pinned official PostgreSQL 18 image for the integration tier. CI pulls it; the local script never does.
+pg18_image := "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2"
+
 default:
     @just --list
 
@@ -47,9 +50,14 @@ coverage: test
 # Neither needs pgvector, so the bare image is enough.
 # There is no PostgreSQL 19 GA image yet; this is the tier that stands in for it.
 test-integration-pg18:
-    POSTGRES_INTEGRATION_IMAGE=postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2 \
+    POSTGRES_INTEGRATION_IMAGE={{pg18_image}} \
         INTEGRATION_TESTS="tests/integration/test_similar_artists_integration.py tests/integration/test_style_atlas_integration.py tests/integration/test_rarity_integration.py tests/integration/test_label_longevity_integration.py" \
-        bash scripts/test-integration.sh
+        bash scripts/test-integration.sh -v
+
+# CI entry point: pull the pinned PG18 image (the script itself never pulls), then run the tier verbosely.
+test-integration-ci:
+    docker pull {{pg18_image}}
+    just test-integration-pg18
 
 # Advisory tier: the same schema, plus the vector extension and public.artist_embeddings, on
 # the existing local PG19 beta + pgvector image, running the whole integration suite including
