@@ -49,9 +49,11 @@ coverage: test
 # rarity replacement, including a dropped connection mid-run.
 # Neither needs pgvector, so the bare image is enough.
 # There is no PostgreSQL 19 GA image yet; this is the tier that stands in for it.
+# Also runs the data-completeness and interrupted-run suites, which need only the shared schema.
+# Not run here: test_embedding_pipeline_integration.py, which needs pgvector (artist_embeddings, halfvec).
 test-integration-pg18:
     POSTGRES_INTEGRATION_IMAGE={{pg18_image}} \
-        INTEGRATION_TESTS="tests/integration/test_similar_artists_integration.py tests/integration/test_style_atlas_integration.py tests/integration/test_rarity_integration.py tests/integration/test_label_longevity_integration.py" \
+        INTEGRATION_TESTS="tests/integration/test_similar_artists_integration.py tests/integration/test_style_atlas_integration.py tests/integration/test_rarity_integration.py tests/integration/test_label_longevity_integration.py tests/integration/test_data_completeness_integration.py tests/integration/test_interrupted_runs_integration.py" \
         bash scripts/test-integration.sh -v
 
 # CI entry point: pull the pinned PG18 image (the script itself never pulls), then run the tier verbosely.
