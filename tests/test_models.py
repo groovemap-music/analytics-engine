@@ -89,6 +89,16 @@ class TestDataCompletenessItem:
         )
         assert item.completeness_pct == 89.67
 
+    def test_null_completeness_is_allowed_and_not_defaulted_to_zero(self) -> None:
+        from insights.models import DataCompletenessItem
+
+        explicit_null = DataCompletenessItem(entity_type="artists", total_count=10, completeness_pct=None)
+        assert explicit_null.completeness_pct is None
+        assert explicit_null.model_dump()["completeness_pct"] is None
+
+        unspecified = DataCompletenessItem(entity_type="labels", total_count=10)
+        assert unspecified.completeness_pct is None
+
 
 class TestComputationStatus:
     def test_valid(self) -> None:

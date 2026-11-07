@@ -63,7 +63,9 @@ class DataCompletenessItem(BaseModel):
     with_year: int = 0
     with_country: int = 0
     with_genre: int = 0
-    completeness_pct: float = 0.0
+    # None means the entity has no scorable field (artists and labels: no images in the score).
+    # It must not default to 0.0, which would read as a measured zero.
+    completeness_pct: float | None = None
 
 
 class ReleaseRarity(BaseModel):

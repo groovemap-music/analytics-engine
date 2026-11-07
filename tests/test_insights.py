@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 from datetime import UTC
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -69,6 +70,29 @@ class TestDataCompletenessEndpoint:
     def test_returns_200(self, test_client: TestClient) -> None:
         response = test_client.get("/api/insights/data-completeness")
         assert response.status_code == 200
+
+
+class TestDataCompletenessNullScore:
+    def test_null_completeness_is_served_as_null_not_zero(self, mock_pg_pool: AsyncMock) -> None:
+        """A NULL completeness_pct (artists, labels) must read back as null, not raise or become 0.0."""
+        import insights.insights as _module
+
+        mock_cursor = mock_pg_pool.connection.return_value.__aenter__.return_value.cursor.return_value.__aenter__.return_value
+        mock_cursor.fetchall = AsyncMock(
+            return_value=[
+                ("artists", 1000, 0, 900, 800, 700, None),
+                ("releases", 2000, 1500, 1900, 1800, 1700, Decimal("89.67")),
+            ]
+        )
+        _module._pool = mock_pg_pool
+        _module._cache = None
+
+        client = TestClient(_module.app)
+        response = client.get("/api/insights/data-completeness")
+
+        assert response.status_code == 200
+        by_type = {item["entity_type"]: item["completeness_pct"] for item in response.json()["items"]}
+        assert by_type == {"artists": None, "releases": 89.67}
 
 
 class TestComputationStatusEndpoint:
