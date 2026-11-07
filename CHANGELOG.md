@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented here by Commitizen.
 
+## v0.6.2 (2026-11-06)
+
+### Release notes
+
+Stores and serves a null completeness_pct. Needs database-schema v0.8.0 or later, and must be live before catalog-api v0.8.1, which returns null for artists and labels.
+
+### Fix
+
+- **insights**: store and serve a null completeness_pct
+
 ## v0.6.1 (2026-11-06)
 
 ### Release notes
