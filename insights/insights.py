@@ -506,7 +506,7 @@ async def data_completeness() -> JSONResponse:
             with_year=r[3],
             with_country=r[4],
             with_genre=r[5],
-            completeness_pct=float(r[6]),
+            completeness_pct=float(r[6]) if r[6] is not None else None,
         ).model_dump()
         for r in rows
     ]
