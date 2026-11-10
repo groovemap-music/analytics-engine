@@ -292,6 +292,15 @@ def _scale(weight: float, squared_norms: NDArray[np.float64], selected: NDArray[
     return (weight / norms).astype(np.float32)
 
 
+# Interpreter, NumPy/SciPy and import footprint of an idle pipeline process (measured 89 MB).
+_PROCESS_OVERHEAD: Final = 100_000_000
+# A Python ``str`` artist id (about 8 characters, 57 bytes) plus its slot in the id list.
+_ARTIST_ID_BYTES: Final = 65
+# The set that de-duplicates artist ids while the edge stream runs (table of 16-byte slots at
+# 5/3 load, rounded up to a power of two).
+_ARTIST_SEEN_BYTES: Final = 32
+
+
 def estimate_peak_bytes(
     n_nodes: int,
     undirected_edges: int,
@@ -300,27 +309,45 @@ def estimate_peak_bytes(
     *,
     block_columns: int = DEFAULT_BLOCK_COLUMNS,
     out_itemsize: int = 4,
+    streamed_edges: int | None = None,
+    retained_edge_buffers: bool = False,
 ) -> dict[str, int]:
-    """Estimate peak array memory of building the adjacency and running ``fastrp``.
+    """Estimate the peak memory of the embeddings job, phase by phase, in bytes.
 
-    Counts the NumPy/SciPy arrays alive at each phase's high-water mark. The measured
-    process footprint runs above it by the interpreter and allocator overhead: see
-    ``docs/embeddings.md`` for the scaling test. Returns the build and compute phase
-    peaks and their max, in bytes.
+    Covers the whole ``insights.embedding_pipeline`` run, not only ``fastrp``: the vertex read
+    (``read``), the edge stream (``stream``: every streamed edge as two ``uint64`` keys, 16 bytes,
+    before dedupe -- ``streamed_edges`` defaults to ``undirected_edges``), the adjacency
+    build (``build``, which includes converting the key pairs to positions), ``compute`` (FastRP
+    itself) and ``write`` (the COPY phase, with the adjacency still alive). The artist-id
+    strings (``n_rows`` of them) and a fixed process overhead are resident throughout.
+
+    ``retained_edge_buffers`` models the pre-y01w pipeline, whose 50,000-row key arrays sat in
+    the allocator heap: freeing them left holes the later large arrays could not use, so the
+    stream's key pairs stayed resident through ``compute`` and ``write``. The pipeline now
+    merges them into large, individually mapped arrays, so the default is no retention.
     """
     config = config or FastRPConfig()
+    streamed = undirected_edges if streamed_edges is None else streamed_edges
     entries = 2 * undirected_edges
     index = 4 if entries <= np.iinfo(np.int32).max else 8
     keys = 8 * n_nodes
+    ids = _ARTIST_ID_BYTES * n_rows
+    base = _PROCESS_OVERHEAD + ids
+    stream_keys = 16 * streamed
     csr = entries * (index + 4) + (n_nodes + 1) * index
-    # Buffered int32 edge pairs, CSR indices and indptr, and the per-node counts and
-    # cursor, all live while the counting sort scatters.
-    build = 8 * undirected_edges + entries * index + (n_nodes + 1) * index + 16 * n_nodes + keys
+    read = base + _ARTIST_SEEN_BYTES * n_rows + keys
+    stream = read + stream_keys
+    # Buffered int32 edge pairs, CSR indices and indptr, the float32 data and its sum_duplicates
+    # working copy, and the per-node counts and cursor, all live while the counting sort scatters.
+    assemble = 8 * undirected_edges + entries * (index + 4) + (n_nodes + 1) * index + 16 * n_nodes + keys
+    build = base + keys + max(stream_keys, assemble)
+    retained = stream_keys if retained_edge_buffers else 0
     width = min(block_columns, config.dim)
     # The self term (self_weight != 0) holds its own float64 row-norm sum through pass 1 and
     # its own float32 scale through pass 2, exactly like one more nonzero propagation weight.
     active = sum(1 for w in config.weights if w) + (1 if config.self_weight else 0)
-    resident = csr + keys + 8 * n_nodes + n_rows * config.dim * out_itemsize  # + degree, output
+    output = n_rows * config.dim * out_itemsize
+    resident = csr + keys + 8 * n_nodes + output  # + degree, output
     blocks = 2 * 4 * n_nodes * width  # a block and its product with P
     # Pass 1 (two-pass only): float64 squared norms per active power, plus the float64
     # column and its square while accumulating.
@@ -328,5 +355,13 @@ def estimate_peak_bytes(
     # Pass 2: the returned rows' scales, the block accumulator, and the gathered rows;
     # single-pass also holds one power's float64 squared norms and temporaries.
     second = 4 * active * n_rows + 2 * 4 * n_rows * width + (0 if first else 24 * n_nodes)
-    compute = resident + blocks + max(first, second)
-    return {"build": build, "compute": compute, "peak": max(build, compute)}
+    compute = base + retained + resident + blocks + max(first, second)
+    write = base + retained + csr + keys + 8 * n_nodes + output
+    return {
+        "read": read,
+        "stream": stream,
+        "build": build,
+        "compute": compute,
+        "write": write,
+        "peak": max(read, stream, build, compute, write),
+    }

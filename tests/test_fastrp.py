@@ -418,3 +418,18 @@ class TestMemoryEstimate:
         assert recommended["build"] < recommended["compute"]
         assert estimate_peak_bytes(nodes, edges, artists, block_columns=128)["peak"] > 40 * GiB
         assert estimate_peak_bytes(10, 3_000_000_000, 1)["build"] > 3_000_000_000 * 16
+
+    def test_pinned_to_the_lux_run(self) -> None:
+        # discogs-2026-11 on lux (gm-analytics-engine-y01w): 27,887,579 vertex_degree rows plus
+        # 4,798,084 artists discovered only from the edge stream, about 307.2M streamed edges
+        # (pre-dedupe, taken as the undirected count), 9,152,168 float16 artist rows. The
+        # pre-fix pipeline measured 15.8 GiB of container memory at its peak.
+        nodes, streamed, artists = 27_887_579 + 4_798_084, 307_200_000, 9_152_168
+        config = FastRPConfig(self_weight=0.05)
+        legacy = estimate_peak_bytes(nodes, streamed, artists, config, out_itemsize=2, retained_edge_buffers=True)
+        assert legacy["peak"] == legacy["compute"]
+        assert abs(legacy["peak"] - 15.8 * GiB) < 0.15 * 15.8 * GiB
+        fixed = estimate_peak_bytes(nodes, streamed, artists, config, out_itemsize=2)
+        # Merging the key batches returns the stream's 16 bytes per edge to the OS before compute.
+        assert legacy["peak"] - fixed["peak"] == 16 * streamed
+        assert fixed["peak"] == fixed["compute"]

@@ -529,6 +529,20 @@ class TestReadVertices:
 
 class TestStreamEdgeBlocks:
     @pytest.mark.asyncio
+    async def test_merges_small_fetch_batches_into_large_key_arrays(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # One array per fetch batch fragments the allocator heap (gm-analytics-engine-y01w), so
+        # the batches are merged; with a one-row chunk every row flushes, with the default one
+        # block holds every edge. Either way the same edges come out.
+        conn = _fresh_connection()
+        vertices = await pipeline._read_vertices(conn)
+        merged = await pipeline._stream_edge_blocks(conn, vertices)
+        monkeypatch.setattr(pipeline, "_EDGE_CHUNK_ROWS", 1)
+        per_batch = await pipeline._stream_edge_blocks(_fresh_connection(), await pipeline._read_vertices(_fresh_connection()))
+        assert len(merged) == 1
+        assert len(per_batch) > 1
+        assert sum(len(sources) for sources, _ in merged) == sum(len(sources) for sources, _ in per_batch)
+
+    @pytest.mark.asyncio
     async def test_builds_an_adjacency_connecting_every_shared_release_and_master(self) -> None:
         from insights.embeddings import node_key
 
