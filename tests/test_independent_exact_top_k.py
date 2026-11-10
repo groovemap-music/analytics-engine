@@ -1,16 +1,9 @@
 """Synthetic independent-comparator validation; no real catalog payloads."""
 
-import importlib.util
-from pathlib import Path
-
 import numpy as np
 import pytest
 
-
-spec = importlib.util.spec_from_file_location("independent", Path(__file__).parents[1] / "scripts/independent_exact_top_k.py")
-assert spec and spec.loader
-independent = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(independent)
+from insights.embeddings import independent_exact_top_k as independent
 
 
 def test_every_candidate_chunk_matches_brute_force_with_self_and_ties():
