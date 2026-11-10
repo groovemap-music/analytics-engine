@@ -295,6 +295,13 @@ _DISCOVERY_QUERIES: Final[tuple[tuple[str, str, tuple[Any, ...], str], ...]] = (
 # catalog scale (docs/embeddings.md) — is never materialized in one piece.
 _CURSOR_FETCH_SIZE: Final = 50_000
 
+# Edges accumulated before the 50,000-row key arrays are merged into one large array. Small
+# arrays come from the allocator's heap, where freeing them leaves holes the large later
+# allocations (the CSR matrix, the projection blocks) cannot use, so the process held ~0.4x
+# the edge list's size on top of its live arrays; a chunk this big is mapped on its own and
+# returned to the operating system when it is freed (docs/embeddings.md, "Where the peak is").
+_EDGE_CHUNK_ROWS: Final = 1 << 22
+
 # Rows encoded and handed to one `COPY` write at a time.
 _COPY_BATCH_SIZE: Final = 5_000
 
@@ -636,6 +643,18 @@ async def _stream_edge_blocks(conn: Any, vertices: _VertexSet) -> list[tuple[NDA
     holds 16 bytes per streamed edge until then, against the 8 the position blocks cost.
     """
     blocks: list[tuple[NDArray[np.uint64], NDArray[np.uint64]]] = []
+    pending_sources: list[NDArray[np.uint64]] = []
+    pending_targets: list[NDArray[np.uint64]] = []
+    pending = 0
+
+    def flush() -> None:
+        nonlocal pending
+        if pending:
+            blocks.append((np.concatenate(pending_sources), np.concatenate(pending_targets)))
+            pending_sources.clear()
+            pending_targets.clear()
+            pending = 0
+
     async with conn.transaction():
         for name, query, params, source_kind, target_kind in _EDGE_RELATIONS:
             cursor_name = f"embedding_pipeline_{name.replace('.', '_')}"
@@ -651,7 +670,12 @@ async def _stream_edge_blocks(conn: Any, vertices: _VertexSet) -> list[tuple[NDA
                         vertices.add_artists(sources)
                     if target_kind == "a":
                         vertices.add_artists(targets)
-                    blocks.append((node_keys((source_kind, key) for key in sources), node_keys((target_kind, key) for key in targets)))
+                    pending_sources.append(node_keys((source_kind, key) for key in sources))
+                    pending_targets.append(node_keys((target_kind, key) for key in targets))
+                    pending += len(batch)
+                    if pending >= _EDGE_CHUNK_ROWS:
+                        flush()
+    flush()
     return blocks
 
 
