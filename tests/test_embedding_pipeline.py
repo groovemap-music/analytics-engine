@@ -540,7 +540,22 @@ class TestStreamEdgeBlocks:
         per_batch = await pipeline._stream_edge_blocks(_fresh_connection(), await pipeline._read_vertices(_fresh_connection()))
         assert len(merged) == 1
         assert len(per_batch) > 1
-        assert sum(len(sources) for sources, _ in merged) == sum(len(sources) for sources, _ in per_batch)
+        np.testing.assert_array_equal(np.concatenate([sources for sources, _ in merged]), np.concatenate([sources for sources, _ in per_batch]))
+        np.testing.assert_array_equal(np.concatenate([targets for _, targets in merged]), np.concatenate([targets for _, targets in per_batch]))
+
+    @pytest.mark.asyncio
+    async def test_chunk_size_does_not_change_the_embeddings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from insights.embeddings import FastRPConfig, fastrp
+
+        async def embed() -> np.ndarray:
+            conn = _fresh_connection()
+            nodes, artist_ids, adjacency = await pipeline._read_graph(conn)
+            rows = nodes.positions(pipeline.node_keys(("a", a) for a in artist_ids))
+            return fastrp(adjacency, FastRPConfig(dim=8), rows=rows, block_columns=4)
+
+        default = await embed()
+        monkeypatch.setattr(pipeline, "_EDGE_CHUNK_ROWS", 1)
+        np.testing.assert_array_equal(await embed(), default)
 
     @pytest.mark.asyncio
     async def test_builds_an_adjacency_connecting_every_shared_release_and_master(self) -> None:
