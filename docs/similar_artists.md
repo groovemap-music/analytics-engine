@@ -1,6 +1,6 @@
 # Exact similar-artist lists
 
-The maintainer's 2026-09-29 serving-mode decision ("D", `docs/embedding_tie_break.md`) is to serve precomputed monthly exact top-K similar-artist lists, not live HNSW search. gm-analytics-engine-8ts measured the index against the three serving thresholds and it failed all three. Exact top-10 lists were stable month over month (churn 0.9519). This document covers the batch job that computes those lists: `insights/embeddings/exact_top_k.py` (the kernel) and `insights/similar_artists.py` (spool, write, publish). The job runs as the last stage of `analytics-engine-embeddings` only with explicit `ENABLE_SIMILAR_ARTISTS=true`. The default is `false`, and any value other than exactly `true` or `false` fails closed. Configuring `SIMILAR_ARTISTS_SPOOL_DIR` alone does not enable it. The flag stays off in production until [gm-analytics-engine-3am](#sizing-and-validation-pending-gm-analytics-engine-3am) has sized the full-catalog run and validated the stored lists on a real dump.
+The maintainer's 2026-09-29 serving-mode decision ("D", `docs/embedding_tie_break.md`) is to serve precomputed monthly exact top-K similar-artist lists, not live HNSW search. gm-analytics-engine-8ts measured the index against the three serving thresholds and it failed all three. Exact top-10 lists were stable month over month (churn 0.9519). This document covers the batch job that computes those lists: `insights/embeddings/exact_top_k.py` (the kernel) and `insights/similar_artists.py` (spool, write, publish). The job runs as the last stage of `analytics-engine-embeddings` only with explicit `ENABLE_SIMILAR_ARTISTS=true`. The default is `false`, and any value other than exactly `true` or `false` fails closed. Configuring `SIMILAR_ARTISTS_SPOOL_DIR` alone does not enable it. The flag stays off in production until [gm-analytics-engine-3am](#sizing-run) has sized the full-catalog run and validated the stored lists on a real dump.
 
 No provider-derived data (ids, names, vectors, lists) is committed anywhere in this repository. The tests use synthetic vectors, and the sizing below reports only aggregates.
 
@@ -87,17 +87,108 @@ The create, publish and retire helpers, and the release-table lock they take, ar
 All tests use synthetic vectors and ids.
 
 - `tests/test_exact_top_k.py` checks the kernel against an independent brute force over block sizes, thread counts and ragged final blocks. It also covers self exclusion when an exact duplicate exists, deterministic tie order on vectors whose dot products are exact in `float32`, zero vectors, and resuming from a checkpoint.
+- `tests/test_similar_artists_sizing.py` checks that a slice's lists equal the full run's first rows position for position (with real ties, ragged blocks and a resume), the extrapolation arithmetic, that a corrupted list fails the exactness check, and that a writable session or an ambiguous `model_version` stops the sizing pass.
 - `tests/test_similar_artists.py` covers the spool, checkpoint resume, the COPY rows, publish and rotate, and the monthly stage against in-memory fakes. Its memory-guard tests include one that runs the compute in a fresh process with the real `getrusage` peak and a budget the running lists must exceed, and checks that the guard stops the run and leaves the spool incomplete.
 - `just test-integration-pg18` starts a disposable official PostgreSQL 18 container (the digest database-schema's required tier pins), applies database-schema's own `create_postgres_schema`, and runs `tests/integration/test_similar_artists_integration.py` as the real `embedding_pipeline` role. That covers COPY quoting and order, rollback of a failed COPY, refusing to overwrite a published release, publication, keeping the current and previous releases, and retiring older ones. The similarity tables need no pgvector, so the bare image is enough. There is no PostgreSQL 19 GA image yet, so this PG18 tier is the one to run. `just test-integration-pg19` runs the same suite, plus the embedding pipeline's, on the local PG19 beta + pgvector image when one is built. It is advisory.
 
-## Sizing and validation: pending gm-analytics-engine-3am
+## Sizing run
 
-This repository's tests do not size the full-catalog run or validate stored lists on real data. Both moved to gm-analytics-engine-3am (scope split, 2026-10-20):
+gm-analytics-engine-3am sizes the full-catalog run and checks exactness before `ENABLE_SIMILAR_ARTISTS` is ever turned on in production. The operator's decision (2026-11-10) is to run it **on Lux, read-only, against the production `public.artist_embeddings`** (9,152,168 rows, one `model_version`, discogs-2026-11), not on the Mac. It publishes nothing. The full-catalog run needs its own operator approval after these numbers are reported.
 
-- **Sizing.** Measure throughput on a 500k–1M-artist slice, then extrapolate wall-clock time and peak RSS for the full catalog against the 12 GB budget and the roughly six-hour window before any full run. `scripts/measure-exact-top-k-sizing.py` does this from a local snapshot. It reads only the requested prefix of the vectors and never the artist ids.
-- **Validation.** On the real 2026-09 dump, compare the stored top-10 lists for a 2,000-artist sample against an independent exact computation (`scripts/independent_exact_top_k.py`, which does not import the production kernel): recall 1.0, ties within 1e-4. Then check that Aug → Sept top-10 Jaccard is about 0.95, consistent with 8ts.
+The tool is `insights/similar_artists_sizing.py`, shipped in the image as `python -m insights.similar_artists_sizing`. It reuses the production kernel and the production halfvec reader, so the numbers are the job's own.
 
-Both run locally only, on real data that is never committed. Until 3am reports, `ENABLE_SIMILAR_ARTISTS` stays off in production.
+### What it does
+
+1. **Read-only session.** It connects with `-c default_transaction_read_only=on`, so the server rejects any write, and refuses to start if `SHOW default_transaction_read_only` is not `on`. It never imports the write, publish or retire path, and it does not consult `artist_embedding_releases`, so a published current release does not make it skip.
+2. **Resolve the version.** With no `--model-version` it requires exactly one `model_version` in `artist_embeddings`; `--expect-rows 9152168` also fails if the row count differs.
+3. **Slice against the full catalog.** It reads every vector (`artist_id` order, so position order and tie order match the job) and computes exact top-50 for the **first N artists** only. d4d's algorithm exploits symmetry (only the upper block triangle is multiplied, each block updating both its row and column lists), and a prefix of artists has no symmetric shortcut: a slice list is exact only if it sees every candidate. So a slice of N artists multiplies the full `N × 9.15M` block and selects from its row side only (`exact_top_k(query_rows=N)`). That is not the same as running d4d on a catalog truncated to N artists, which would produce wrong lists and a quadratic cost. The slice's lists are identical, position for position, to the first N rows of a full run (`tests/test_similar_artists_sizing.py`).
+4. **Exactness check.** For a seeded random sample of 2,000 slice artists (`--seed`, default 20261110) it takes the job's stored-order top-10 and compares them with `insights/embeddings/independent_exact_top_k.py`, a brute force that does not import the kernel and streams the whole catalog in bounded chunks. It re-scores every neighbour independently and requires tie-tolerant recall 1.0 with scores within 1e-4 (`exactness.passed`). The process exits 2 if it fails.
+5. **Report.** One JSON document of aggregates (no ids, names or vectors): wall-clock per phase, peak RSS after each phase, kernel thread-seconds split into upcast, multiply and selection, and the extrapolation below.
+
+### Run command
+
+The sizing run needs a writable scratch directory owned by uid 1000 with about 1.6 GB free for a 1M slice (the spool plus checkpoints; the tool checks before it reads), on disk rather than tmpfs so it does not count against the container. The image must be built from a revision that contains `insights/similar_artists_sizing.py`.
+
+```sh
+mkdir -p /srv/scratch/similar-sizing && chown 1000:1000 /srv/scratch/similar-sizing
+
+for SLICE in 500000 1000000; do
+  docker run --rm \
+    --network <network that reaches the production postgres> \
+    --memory 16g --memory-swap 16g --cpus <cores free on Lux> \
+    -v /srv/scratch/similar-sizing:/scratch \
+    -e POSTGRES_HOST=<host or host:port> -e POSTGRES_DATABASE=<catalog database> \
+    -e EMBEDDING_PIPELINE_POSTGRES_USERNAME_FILE=/run/secrets/ae_user \
+    -e EMBEDDING_PIPELINE_POSTGRES_PASSWORD_FILE=/run/secrets/ae_password \
+    -v <secret file>:/run/secrets/ae_user:ro -v <secret file>:/run/secrets/ae_password:ro \
+    --entrypoint /app/.venv/bin/python \
+    <analytics-engine image, pinned by digest> \
+    -m insights.similar_artists_sizing \
+      --slice-rows "$SLICE" --expect-rows 9152168 \
+      --validate-sample 2000 --seed 20261110 \
+      --threads 8 --scratch-dir /scratch --budget-gb 12 \
+      --output /scratch/sizing-"$SLICE".json
+done
+```
+
+Notes:
+
+- Use the existing `embedding_pipeline` login (`EMBEDDING_PIPELINE_POSTGRES_*`, `_FILE` form preferred), the login the monthly pipeline already uses to read `artist_embeddings`. If the dispatcher has a narrower read-only role on Lux, use it in its place; the read-only session option makes the role's write privileges irrelevant either way. No other variable is needed: `ENABLE_SIMILAR_ARTISTS` and `SOURCE_DUMP_*` are not read.
+- `--memory 16g` is a safety cap on a host that has ~45 GB free; the tool's own guard aborts at `--budget-gb 12`, so a run that would not fit the budget stops and reports instead of being OOM-killed. Do not raise the guard to see how far it goes: the budget is the question being answered.
+- `--threads` and `--cpus` should match; the earlier measurements used 8 threads. Run when Lux is quiet, and say what else was running in the report.
+- Run the two slices one after the other, as separate processes, so each has its own peak RSS (`ru_maxrss` is a process-lifetime maximum). Each re-reads the catalog.
+- Expected output: JSON on stdout (logs go to stderr) and in `/scratch/sizing-<N>.json`, shaped as below, ending with `"exactness": {"passed": true, ...}`. Delete `/scratch/sizing-*.json` when done; the spool is removed automatically.
+
+```text
+{
+  "mode": "dry_run_read_only", "writes_to_postgres": false,
+  "slice_rows": <N>, "catalog_rows": 9152168, "dimensions": 128, "k": 50,
+  "phases": {"read_embeddings_s": <R>, "compute_slice_s": <T>, "exactness_check_s": <V>},
+  "peak_rss_bytes": {"after_read": <P0>, "after_compute": <P1>, "after_exactness_check": <P2>},
+  "throughput": {"artists_per_second": <A>, "seconds_per_block_row": <S>},
+  "kernel_thread_seconds": {"upcast": <U>, "matmul": <M>, "select": <L>, "score_blocks": <B>},
+  "exactness": {"queries": 2000, "exact_set_recall": <r>, "tie_tolerant_recall": 1.0,
+                "score_max_abs_error": <e>, "score_violation_count": 0,
+                "canonical_order_violations": 0, "passed": true, "tolerance": 0.0001},
+  "extrapolation": {"scale": <9152168/N>, "matmul_fraction": <f>, "full_wall_s": <W>,
+                    "full_wall_upper_bound_s": <Wmax>, "full_peak_rss_bytes": <Pfull>,
+                    "estimate_peak_bytes": <E>, "within_six_hours": <bool>,
+                    "within_six_hours_upper_bound": <bool>, "within_memory_budget": <bool>},
+  "model_version_hash": "<12 hex>"
+}
+```
+
+### Extrapolating to the 9.15M catalog
+
+Let `N = 9,152,168`, `Q` the slice, `T = compute_slice_s`, `scale = N / Q`.
+
+- **Wall-clock.** The slice's work is linear in `Q` (every row block sees all `N` columns), so `T × scale` is what the same method costs for all `N` rows **without** symmetry: `full_wall_upper_bound_s`. The production kernel multiplies only the upper triangle, which halves the upcast and the multiply but not the selection (every block is selected from on both its row and column side). With `f` the multiply-plus-upcast share of kernel thread-seconds, `(upcast + matmul) / (upcast + matmul + select)`:
+
+  `full_wall_s = T × scale × (0.5 f + (1 − f))`
+
+  Report `full_wall_s` as the estimate and `full_wall_upper_bound_s` as the ceiling, and compare both with the six-hour quiet-host target. Two slices (500k and 1M) should agree on seconds per query block row; if they differ by more than ~10%, say so and trust the larger slice. The real symmetric run has a slightly cheaper column-side selection than this model assumes, so the model leans high. Real-data selection cost also depends on how fast thresholds rise, which a prefix of `artist_id` order may not represent. The slice is a first-N prefix, not a random sample, so name that bias in the report. A full run's first checkpoints (every 30 minutes, block index in the log) give the first real check of the projection.
+- **Peak RSS.** The slice process already holds the whole catalog's vectors, norms, ids and read buffers, so the part that grows is the running lists, `K × 8 + 8 = 408` bytes per artist:
+
+  `full_peak = P1 + (N − Q) × 408`
+
+  where `P1 = peak_rss_bytes.after_compute` (the exactness check is not in it). Compare `full_peak` with the 12 GB budget, and against `estimate_peak_bytes` (the closed-form estimate the guard logs) as a cross-check; the two should agree to within a few hundred MB. The spool and checkpoints are file writes and do not count toward RSS, but the first full-run checkpoint transient has not been measured at this size, so leave at least 1 GB of margin below 12 GB before recommending a full run.
+
+Record the measured numbers here once the dispatcher returns them:
+
+| Slice | Read | Kernel wall `T` | `f` | Peak RSS `P1` | `full_wall_s` | Upper bound | `full_peak` | vs 12 GB / 6 h |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 500k | `<R>` | `<T>` | `<f>` | `<P1>` | `<W>` | `<Wmax>` | `<Pfull>` | `<verdict>` |
+| 1M | `<R>` | `<T>` | `<f>` | `<P1>` | `<W>` | `<Wmax>` | `<Pfull>` | `<verdict>` |
+
+Exactness (2,000-artist sample, seed 20261110): recall `<r>`, tie-tolerant recall `<1.0>`, max score error `<e>`, host `<Lux load at the time>`.
+
+### Month-over-month Jaccard
+
+The Aug → Sept top-10 Jaccard check (about 0.95, consistent with 8ts) **waits for a second month of embeddings**. Lux holds only discogs-2026-11 and the 2026-09 dump the bead named is no longer the data there, so the sizing run cannot measure it. It moves to the next monthly run, where the previous release's stored lists are still present for comparison (only releases older than the previous one are retired).
+
+### Local development
+
+`scripts/measure-exact-top-k-sizing.py` still measures a local snapshot slice (500k–1M) on a workstation, as a truncated catalog. It is not a substitute for the Lux run: it sizes a different, smaller problem.
 
 Earlier bounded measurements give 3am a starting point. They are not acceptance results. All used the 2026-09 `edges-v3, w0=0, self=0.05` vectors, K=50, 4096-row blocks and eight kernel threads:
 
