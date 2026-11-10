@@ -37,8 +37,9 @@ block reached the row first.
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
 import numpy as np
@@ -193,6 +194,26 @@ def _update(
         _merge(state, row_start + touched, local_rows, (col_start + cols).astype(np.int32), cand_scores)
 
 
+@dataclass
+class PhaseProfile:
+    """Thread-seconds spent in each phase of the kernel's tasks, summed over all threads (so
+    they exceed wall time when threads overlap). Filled by ``exact_top_k(profile=...)`` for
+    the sizing pass; ``tasks`` counts the ``B x B`` score blocks multiplied."""
+
+    upcast_s: float = 0.0
+    matmul_s: float = 0.0
+    select_s: float = 0.0
+    tasks: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def add(self, *, upcast_s: float = 0.0, matmul_s: float = 0.0, select_s: float = 0.0) -> None:
+        with self._lock:
+            self.upcast_s += upcast_s
+            self.matmul_s += matmul_s
+            self.select_s += select_s
+            self.tasks += 1
+
+
 def exact_top_k(
     vectors: NDArray[np.floating],
     k: int = DEFAULT_K,
@@ -204,6 +225,8 @@ def exact_top_k(
     on_block: Callable[[int, NDArray[np.float32], NDArray[np.int32]], None] | None = None,
     after_block: Callable[[int, TopKState], None] | None = None,
     inv_norms: NDArray[np.float32] | None = None,
+    query_rows: int | None = None,
+    profile: PhaseProfile | None = None,
 ) -> TopKState:
     """Exact top-``k`` cosine neighbours of every row of ``vectors`` among all other rows.
 
@@ -211,27 +234,61 @@ def exact_top_k(
     lists, sorted (see ``sorted_lists``); ``after_block(next_block, state)`` runs after
     it, for checkpointing. Pass a checkpointed ``state`` with ``start_block`` to resume.
     Returns the final state (unsorted lists).
+
+    ``query_rows`` (the sizing pass's *slice* mode) computes lists only for the first
+    ``query_rows`` rows, each against the **whole** ``vectors`` catalog as candidates, so
+    every list is exactly the one the full run produces. The score matrix is then not
+    symmetric-halved: the slice's ``query_rows x n_rows`` block is multiplied in full and
+    only the row side of each block is selected from, so the state has ``query_rows``
+    rows and there is no upper-triangle shortcut. Cost is linear in ``query_rows``.
+    ``profile`` accumulates per-phase thread-seconds.
     """
     if block_rows % SEGMENT:
         raise ValueError(f"block_rows must be a multiple of {SEGMENT}, got {block_rows}")
     n_rows = vectors.shape[0]
+    slice_mode = query_rows is not None
+    n_queries = n_rows if query_rows is None else query_rows
+    if not 0 < n_queries <= n_rows:
+        raise ValueError(f"query_rows must be in 1..{n_rows}, got {query_rows}")
     if inv_norms is None:
         inv_norms = reciprocal_norms(vectors)
     if state is None:
-        state = TopKState.empty(n_rows, k)
+        state = TopKState.empty(n_queries, k)
     n_blocks = -(-n_rows // block_rows)
-    locks = [threading.Lock() for _ in range(n_blocks)]
+    n_query_blocks = -(-n_queries // block_rows)
+    locks = [threading.Lock() for _ in range(n_query_blocks if slice_mode else n_blocks)]
 
-    def upcast(block: int) -> NDArray[np.float32]:
+    def upcast(block: int, limit: int = n_rows) -> NDArray[np.float32]:
         # Zero-padded to a whole number of segments; padding scores are set to -inf.
-        lo, hi = block * block_rows, min(n_rows, (block + 1) * block_rows)
+        lo, hi = block * block_rows, min(limit, (block + 1) * block_rows)
         out = np.zeros((-(-(hi - lo) // SEGMENT) * SEGMENT, vectors.shape[1]), dtype=np.float32)
         np.multiply(vectors[lo:hi], inv_norms[lo:hi, None], out=out[: hi - lo])
         return out
 
-    def task(i: int, left: NDArray[np.float32], j: int) -> None:
-        right = left if j == i else upcast(j)
+    def slice_task(i: int, left: NDArray[np.float32], j: int) -> None:
+        started = time.perf_counter()
+        right = upcast(j)
+        multiplying = time.perf_counter()
         scores = left @ right.T
+        selecting = time.perf_counter()
+        valid_i = min(n_queries - i * block_rows, block_rows)
+        valid_j = min(n_rows - j * block_rows, block_rows)
+        scores[valid_i:] = -np.inf
+        scores[:, valid_j:] = -np.inf
+        if j == i:
+            # The slice is a prefix, so its row r is catalog row r: exclude self on the diagonal.
+            diagonal = np.arange(valid_i)
+            scores[diagonal, diagonal] = -np.inf
+        _update(state, locks[i], i * block_rows, j * block_rows, scores, valid_i, scores.reshape(scores.shape[0], -1, SEGMENT))
+        if profile is not None:
+            profile.add(upcast_s=multiplying - started, matmul_s=selecting - multiplying, select_s=time.perf_counter() - selecting)
+
+    def task(i: int, left: NDArray[np.float32], j: int) -> None:
+        started = time.perf_counter()
+        right = left if j == i else upcast(j)
+        multiplying = time.perf_counter()
+        scores = left @ right.T
+        selecting = time.perf_counter()
         valid_i = min(n_rows - i * block_rows, block_rows)
         valid_j = min(n_rows - j * block_rows, block_rows)
         scores[valid_i:] = -np.inf
@@ -248,13 +305,19 @@ def exact_top_k(
             # contiguous rows, the cheap direction.
             by_column = scores.reshape(-1, _COLUMN_SEGMENT, scores.shape[1]).transpose(2, 0, 1)
             _update(state, locks[j], j * block_rows, i * block_rows, scores.T, valid_j, by_column)
+        if profile is not None:
+            profile.add(upcast_s=multiplying - started, matmul_s=selecting - multiplying, select_s=time.perf_counter() - selecting)
 
     with ThreadPoolExecutor(max_workers=threads) as pool:
-        for i in range(start_block, n_blocks):
-            left = upcast(i)
-            for future in [pool.submit(task, i, left, j) for j in range(i, n_blocks)]:
+        for i in range(start_block, n_query_blocks if slice_mode else n_blocks):
+            left = upcast(i, n_queries)
+            if slice_mode:
+                futures = [pool.submit(slice_task, i, left, j) for j in range(n_blocks)]
+            else:
+                futures = [pool.submit(task, i, left, j) for j in range(i, n_blocks)]
+            for future in futures:
                 future.result()
-            lo, hi = i * block_rows, min(n_rows, (i + 1) * block_rows)
+            lo, hi = i * block_rows, min(n_queries, (i + 1) * block_rows)
             if on_block is not None:
                 on_block(lo, *sorted_lists(state.scores[lo:hi], state.positions[lo:hi]))
             if after_block is not None:

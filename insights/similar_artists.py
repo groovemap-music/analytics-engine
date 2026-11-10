@@ -46,7 +46,7 @@ import numpy as np
 import structlog
 from groovemap_schema import postgres as schema_postgres
 
-from insights.embeddings.exact_top_k import DEFAULT_BLOCK_ROWS, DEFAULT_K, EMPTY_POSITION, TopKState, exact_top_k, reciprocal_norms
+from insights.embeddings.exact_top_k import DEFAULT_BLOCK_ROWS, DEFAULT_K, EMPTY_POSITION, PhaseProfile, TopKState, exact_top_k, reciprocal_norms
 
 
 if TYPE_CHECKING:
@@ -216,15 +216,31 @@ def compute_to_spool(
     checkpoint_every_s: float = DEFAULT_CHECKPOINT_EVERY_S,
     guard: MemoryGuard | None = None,
     clock: Callable[[], float] = time.monotonic,
+    query_rows: int | None = None,
+    profile: PhaseProfile | None = None,
 ) -> Spool:
     """Compute every artist's exact top-``k`` into a spool under ``directory``, resuming from
     its checkpoint when one exists for the same ``model_version`` and shape. Returns the
-    finished spool (``meta.json`` then records ``complete: true``)."""
+    finished spool (``meta.json`` then records ``complete: true``).
+
+    ``query_rows`` is the sizing pass's slice: only the first ``query_rows`` artists get
+    lists (each against the whole catalog, see ``exact_top_k``), so the spool has that many
+    rows. Production runs leave it ``None``."""
     guard = guard or MemoryGuard()
-    n_artists = vectors.shape[0]
+    n_catalog = vectors.shape[0]
+    n_artists = n_catalog if query_rows is None else query_rows
     spool = Spool(directory, n_artists, k)
     directory.mkdir(parents=True, exist_ok=True)
-    identity = {"model_version": model_version, "n_artists": n_artists, "dim": int(vectors.shape[1]), "k": k, "block_rows": block_rows}
+    identity: dict[str, Any] = {
+        "model_version": model_version,
+        "n_artists": n_artists,
+        "dim": int(vectors.shape[1]),
+        "k": k,
+        "block_rows": block_rows,
+    }
+    if query_rows is not None:
+        # A slice must never resume a full run's spool (or another slice's): same key, different lists.
+        identity["catalog_rows"] = n_catalog
 
     meta: dict[str, Any] = json.loads(spool.meta_path.read_text()) if spool.meta_path.exists() else {}
     state: TopKState | None = None
@@ -273,6 +289,8 @@ def compute_to_spool(
         on_block=on_block,
         after_block=after_block,
         inv_norms=reciprocal_norms(vectors),
+        query_rows=query_rows,
+        profile=profile,
     )
     meta["complete"] = True
     _atomic_write(spool.meta_path, lambda p: p.write_text(json.dumps(meta)))

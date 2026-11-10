@@ -6,10 +6,16 @@ The full candidate catalog is streamed once per bounded query batch.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 import numpy as np
 
 
-def _select(scores, positions, k):
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
+
+def _select(scores: NDArray[np.float32], positions: NDArray[np.int64], k: int) -> tuple[NDArray[np.float32], NDArray[np.int64]]:
     count = min(k, len(scores))
     boundary = np.partition(scores, len(scores) - count)[len(scores) - count]
     above = np.flatnonzero(scores > boundary)
@@ -20,7 +26,9 @@ def _select(scores, positions, k):
     return scores[selected[order]], positions[selected[order]]
 
 
-def independent_top_k(vectors, queries, *, k=10, query_rows=32, candidate_rows=65536):
+def independent_top_k(
+    vectors: NDArray[np.floating], queries: Any, *, k: int = 10, query_rows: int = 32, candidate_rows: int = 65536
+) -> tuple[NDArray[np.int64], NDArray[np.float32]]:
     """Return exact cosine rankings using bounded float32 dot products and merges.
 
     At defaults the score matrix is at most 32*65536 float32 (~8MiB), not
@@ -60,7 +68,16 @@ def independent_top_k(vectors, queries, *, k=10, query_rows=32, candidate_rows=6
     return result_positions, result_scores
 
 
-def compare_stored_top10(vectors, queries, stored_positions, stored_scores, exact_positions, exact_scores, *, tolerance=1e-4):
+def compare_stored_top10(
+    vectors: NDArray[np.floating],
+    queries: Any,
+    stored_positions: NDArray[Any],
+    stored_scores: NDArray[np.float32],
+    exact_positions: NDArray[Any],
+    exact_scores: NDArray[np.float32],
+    *,
+    tolerance: float = 1e-4,
+) -> dict[str, Any]:
     """Rescore each DB neighbour independently; DB scores never establish recall.
 
     All catalog positions refer to the same lexically ordered snapshot. Structural
