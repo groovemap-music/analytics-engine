@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented here by Commitizen.
 
+## v0.8.0 (2026-11-10)
+
+### Release notes
+
+The embeddings job's memory estimate now models the whole run, not only FastRP's arrays: it counted about half of the 15.8 GiB peak lux measured at 9,152,168 rows, and is now pinned to that run (gm-analytics-engine-y01w). The edge stream is merged into ~4M-edge mapped arrays so freed batches no longer fragment the heap and keep the stream resident through compute; output edges and embeddings are unchanged (pinned by tests across chunk sizes). Re-measure the peak on the next monthly embeddings run. Adds `python -m insights.similar_artists_sizing`, a read-only sizing and exactness pass for the exact similar-artist job (gm-analytics-engine-3am): it connects with `default_transaction_read_only=on`, writes nothing to PostgreSQL, publishes nothing, and reports per-phase timing, peak RSS and a full-catalog extrapolation for a slice of artists, plus a seeded 2,000-artist check against an independent brute force. `ENABLE_SIMILAR_ARTISTS` stays off; the full-catalog run needs its own operator approval. The PostgreSQL 18 and pgvector integration suites now run in CI. No schema dependency.
+
+### Feat
+
+- **embeddings**: add a read-only slice sizing pass for the exact similar-artist job
+
+### Fix
+
+- **embeddings**: model the whole job's peak and stop the edge stream fragmenting the heap
+- **release**: keep breaking changes below 1.0 with major_version_zero
+
 ## v0.7.0 (2026-11-07)
 
 ### Release notes
