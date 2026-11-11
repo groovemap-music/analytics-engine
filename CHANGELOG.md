@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented here by Commitizen.
 
+## v0.9.0 (2026-11-11)
+
+### Release notes
+
+Adds `analytics-engine-similar-artists` (`insights/similar_artists_job.py`, gm-analytics-engine-dhit), the exact similar-artist job run on its own for an existing embeddings `model_version`, without recomputing embeddings. It is bounded by `--deadline` or `--max-runtime`: at the first block boundary past the deadline it checkpoints atomically and exits 75 (paused), and the next run resumes from the spool. It needs a persistent `--spool-dir` (a `/tmp` spool is refused for resumable runs), publishes once, idempotently, when complete, and ends with a JSON status line. Exit 0 means done or skipped, 75 paused, 1 or 2 failed; see docs/similar_artists.md "Nightly runs". Before each run it checks for load activity (gm-analytics-engine-d6vm): it skips with `status=skipped` and exit 0 while a Discogs or MusicBrainz `loader_extraction_latch` is unrefreshed and under 48 h old, or while the embeddings pipeline holds its run lock. The embeddings pipeline now holds a session advisory lock (key 7419286113405217) for its whole run, so two embeddings runs serialise, and its pool grows from 1 to 2 connections (`embedding_pipeline_login` allows 5 on lux). **Paired floor:** the load check reads `public.loader_extraction_latch` as `embedding_pipeline`, which needs the database-schema release with that grant (gm-database-schema-37cl); without it the job exits failed. Nothing schedules the job yet (gm-deployment-h0d4, homelab-dfmy), and `ENABLE_SIMILAR_ARTISTS` is unchanged.
+
+### Feat
+
+- **similar-artists**: run the exact job on its own, deadline-bounded and resumable
+- **similar-artists**: skip the nightly run while a load or embeddings write is running
+- **similar-artists**: hold an advisory lock for the embeddings run and check it in the load check
+
 ## v0.8.0 (2026-11-10)
 
 ### Release notes
