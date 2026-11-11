@@ -52,7 +52,7 @@ coverage: test
 # Neither needs pgvector, so the bare image is enough.
 # There is no PostgreSQL 19 GA image yet; this is the tier that stands in for it.
 # Also runs the data-completeness and interrupted-run suites, which need only the shared schema.
-# Not run here: test_embedding_pipeline_integration.py, which needs pgvector (artist_embeddings, halfvec).
+# Not run here: test_embedding_pipeline_integration.py and test_similar_artists_job_role_integration.py, which need pgvector (artist_embeddings, halfvec).
 test-integration-pg18:
     POSTGRES_INTEGRATION_IMAGE={{pg18_image}} \
         INTEGRATION_TESTS="tests/integration/test_similar_artists_integration.py tests/integration/test_style_atlas_integration.py tests/integration/test_rarity_integration.py tests/integration/test_label_longevity_integration.py tests/integration/test_data_completeness_integration.py tests/integration/test_interrupted_runs_integration.py" \
@@ -65,12 +65,13 @@ test-integration-ci:
     just test-integration-pg18
     just test-integration-pgvector
 
-# pgvector tier: the embedding-pipeline suite on the digest-pinned pgvector PG18 image. CI-only: it pulls
-# the image first, because the local script never does.
+# pgvector tier: the embedding-pipeline suite and the nightly similar-artist job run as the restricted
+# embedding_pipeline LOGIN role, on the digest-pinned pgvector PG18 image. CI-only: it pulls the image
+# first, because the local script never does.
 test-integration-pgvector:
     docker pull {{pgvector_pg18_image}}
     POSTGRES_INTEGRATION_IMAGE={{pgvector_pg18_image}} \
-        INTEGRATION_TESTS="tests/integration/test_embedding_pipeline_integration.py" \
+        INTEGRATION_TESTS="tests/integration/test_embedding_pipeline_integration.py tests/integration/test_similar_artists_job_role_integration.py" \
         bash scripts/test-integration.sh -v
 
 # Advisory tier: the same schema, plus the vector extension and public.artist_embeddings, on

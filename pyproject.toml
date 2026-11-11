@@ -27,7 +27,7 @@ license-files = [
 ]
 dependencies = [
     "fastapi>=0.143.2",
-    "groovemap-database-schema==0.9.0",
+    "groovemap-database-schema==0.15.1",
     "groovemap-runtime[postgres,otel,otel-http]==0.1.0",
     "httpx>=0.28.1",
     "numpy>=2.5.4",
@@ -74,7 +74,7 @@ override-dependencies = ["groovemap-runtime[neo4j,otel,otel-http,postgres] @ git
 
 [tool.uv.sources]
 groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "5f35c03f68b0dd2c1955c731886c0ad8d8f9de63" }
-groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "08106040f3c4d7e6494dfbbc495c43d91a0dfb38" }
+groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "c3a76c9971e7c781d028ba4b488e0073793e755d" }
 
 [tool.ruff]
 extend-exclude = ["insights/catalog_api_contract.py"]
