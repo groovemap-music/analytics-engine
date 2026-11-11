@@ -67,6 +67,22 @@ class TestJudgeLoads:
         assert check.skip is True
         assert check.reason == "1 session(s) have uncommitted writes to public.artist_embeddings: the embeddings pipeline is loading"
 
+    def test_the_pipeline_lock_held_means_skip_even_with_nothing_else_running(self) -> None:
+        check = job.judge_loads([], 0, now=NOW, pipeline_lock_held=True)
+
+        assert check.skip is True
+        assert check.reason == "the embeddings pipeline holds its run lock: an embeddings run is in progress"
+
+    def test_an_unheld_pipeline_lock_is_not_a_signal(self) -> None:
+        assert job.judge_loads([], 0, now=NOW, pipeline_lock_held=False) == job.LoadCheck(skip=False, reason=None)
+
+    def test_the_lock_key_is_split_the_way_pg_locks_reports_it(self) -> None:
+        key = job._PIPELINE_LOCK_KEY
+        high, low = key >> 32, key & 0xFFFFFFFF
+
+        assert (high << 32) + low == key
+        assert 0 < high < 2**31 and 0 <= low < 2**32  # positive, so classid and objid compare as plain ints
+
     def test_a_normal_start_has_no_reason(self) -> None:
         check = job.judge_loads([], 0, now=NOW)
 
@@ -89,14 +105,17 @@ class _LoadCursor(_DbCursor):
             return list(self.conn.latches)
         if self._last_sql == job._WRITES_IN_FLIGHT_SQL:
             return [(self.conn.writes,)]
+        if self._last_sql == job._PIPELINE_LOCK_HELD_SQL:
+            return [(self.conn.lock_holders,)]
         return await super().fetchall()
 
 
 class _LoadDb(_Db):
-    def __init__(self, vectors: Any, *, latches: tuple[tuple[Any, ...], ...] = (), writes: int = 0, **kwargs: Any) -> None:
+    def __init__(self, vectors: Any, *, latches: tuple[tuple[Any, ...], ...] = (), writes: int = 0, lock_holders: int = 0, **kwargs: Any) -> None:
         super().__init__(vectors, **kwargs)
         self.latches = list(latches)
         self.writes = writes
+        self.lock_holders = lock_holders
 
     def cursor(self, name: str | None = None) -> _LoadCursor:
         return _LoadCursor(self, name)
@@ -112,6 +131,17 @@ class TestReadLoadCheck:
         assert check.skip is True
         assert check.reason is not None
         assert "discogs extraction 20261101" in check.reason
+
+    @pytest.mark.asyncio
+    async def test_a_held_pipeline_lock_is_read_and_skips(self) -> None:
+        db = _LoadDb(_vectors(10, dim=8), lock_holders=1)
+
+        check = await job.read_load_check(db, NOW)
+
+        assert check.skip is True
+        assert "run lock" in (check.reason or "")
+        lock_calls = [params for sql, params in db.log if sql == job._PIPELINE_LOCK_HELD_SQL]
+        assert lock_calls == [((job._PIPELINE_LOCK_KEY >> 32), (job._PIPELINE_LOCK_KEY & 0xFFFFFFFF))]
 
     @pytest.mark.asyncio
     async def test_a_null_signals_array_reads_as_none_recorded(self) -> None:
@@ -151,6 +181,18 @@ class TestRunJobLoadCheck:
         assert "uncommitted writes to public.artist_embeddings" in (status.reason or "")
         assert registry.calls == []
         assert not (tmp_path / "m2").exists()
+
+    @pytest.mark.asyncio
+    async def test_a_held_pipeline_lock_skips_the_run_without_computing(self, tmp_path: Path) -> None:
+        db = _LoadDb(_vectors(100, dim=8), lock_holders=1)
+        registry = _PublishingRegistry(db)
+
+        status = await _run(db, tmp_path, registry)
+
+        assert (status.status, status.exit_code, status.decision, status.published) == ("skipped", 0, "skip", False)
+        assert "run lock" in (status.reason or "")
+        assert registry.calls == []
+        assert [p.name for p in tmp_path.iterdir()] == [".lock"]
 
     @pytest.mark.asyncio
     async def test_a_stale_latch_proceeds_and_says_so_in_the_reason(self, tmp_path: Path) -> None:

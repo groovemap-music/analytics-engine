@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn
 import structlog
 from common import setup_logging
 
+from insights.embedding_pipeline import EMBEDDING_PIPELINE_LOCK_KEY
 from insights.similar_artists import (
     DEFAULT_CHECKPOINT_EVERY_S,
     DEFAULT_MEMORY_BUDGET_BYTES,
@@ -83,6 +84,12 @@ _WRITES_IN_FLIGHT_SQL: Final = (
     "SELECT count(*) FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid = l.pid "
     "WHERE l.relation = 'public.artist_embeddings'::regclass AND l.mode = 'RowExclusiveLock' AND l.granted "
     "AND a.backend_xid IS NOT NULL AND a.pid <> pg_backend_pid()"
+)
+# The embeddings run's advisory lock (`insights.embedding_pipeline.EMBEDDING_PIPELINE_LOCK_KEY`),
+# split into the (classid, objid) pair pg_locks reports for a single bigint key.
+_PIPELINE_LOCK_KEY: Final = EMBEDDING_PIPELINE_LOCK_KEY
+_PIPELINE_LOCK_HELD_SQL: Final = (
+    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND classid = %s AND objid = %s AND objsubid = 1"
 )
 # A latch open longer than this is treated as abandoned or superseded, and no longer blocks.
 LATCH_STALE_AFTER: Final = timedelta(hours=48)
@@ -297,16 +304,19 @@ class LoadCheck:
     reason: str | None
 
 
-def judge_loads(latches: Sequence[LatchRow], writes_in_flight: int, *, now: datetime) -> LoadCheck:
+def judge_loads(latches: Sequence[LatchRow], writes_in_flight: int, *, now: datetime, pipeline_lock_held: bool = False) -> LoadCheck:
     """Decide whether this night's run must not compute.
 
     A latch with ``refreshed_at`` set is finished. An open latch younger than ``LATCH_STALE_AFTER``
     blocks. An older open latch does not block: it is reported as the reason and the run proceeds.
     Any uncommitted write to ``artist_embeddings`` blocks, because the embeddings pipeline is
-    loading that table and the stage would read a half-loaded catalog.
+    loading that table and the stage would read a half-loaded catalog. So does the pipeline's
+    advisory lock: it is held for the whole run, including the FastRP compute that writes nothing.
     """
     blocking: list[str] = []
     stale: list[str] = []
+    if pipeline_lock_held:
+        blocking.append("the embeddings pipeline holds its run lock: an embeddings run is in progress")
     for row in sorted(latches, key=lambda r: r.created_at):
         if row.refreshed_at is not None:
             continue
@@ -331,7 +341,7 @@ def judge_loads(latches: Sequence[LatchRow], writes_in_flight: int, *, now: date
 async def read_load_check(conn: Any, now: datetime) -> LoadCheck:
     """Read the loader latches and the embeddings write locks, then judge them.
 
-    Read-only. Raises if either query fails (for example, the latch table is not deployed or the
+    Read-only. Raises if a query fails (for example, the latch table is not deployed or the
     role cannot read it): the caller turns that into ``failed``, so a run never proceeds unchecked.
     """
     latches = [
@@ -339,7 +349,9 @@ async def read_load_check(conn: Any, now: datetime) -> LoadCheck:
         for loader, version, signals, created_at, refreshed_at in await _fetch_all(conn, _LATCH_SQL, (list(LATCH_LOADERS),))
     ]
     ((writes_in_flight,),) = await _fetch_all(conn, _WRITES_IN_FLIGHT_SQL)
-    return judge_loads(latches, int(writes_in_flight), now=now)
+    high, low = _PIPELINE_LOCK_KEY >> 32, _PIPELINE_LOCK_KEY & 0xFFFFFFFF
+    ((lock_holders,),) = await _fetch_all(conn, _PIPELINE_LOCK_HELD_SQL, (high, low))
+    return judge_loads(latches, int(writes_in_flight), now=now, pipeline_lock_held=int(lock_holders) > 0)
 
 
 # ── The run ──────────────────────────────────────────────────────────────────────────────────

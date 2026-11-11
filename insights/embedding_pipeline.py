@@ -797,6 +797,18 @@ async def load_embeddings(pool: AsyncPostgreSQLPool, config: FastRPConfig, dump_
     return LoadResult(method_version=config.model_version, model_version=version, rows_written=rows_written, skipped=False)
 
 
+# The session-level Postgres advisory lock an embeddings run holds from its first step to its last
+# (the FastRP compute, the write, and the similar-artist stage), so a catalog-side job can tell a run
+# is in progress by asking `pg_locks`. Key: a fixed bigint, never reused for another lock.
+# `insights/similar_artists_job.py` reads it back: `classid` is the high 32 bits, `objid` the low 32,
+# `objsubid` 1 (docs/similar_artists.md, "Load check"). Blocking acquisition: a second run waits for
+# the first instead of racing it. The lock is released in `finally`, and the server releases it if
+# the session dies.
+EMBEDDING_PIPELINE_LOCK_KEY: Final = 7_419_286_113_405_217
+_ADVISORY_LOCK_SQL: Final = "SELECT pg_advisory_lock(%s)"
+_ADVISORY_UNLOCK_SQL: Final = "SELECT pg_advisory_unlock(%s)"
+
+
 async def run_embedding_pipeline(
     pool: AsyncPostgreSQLPool,
     dump_id: str,
@@ -819,16 +831,23 @@ async def run_embedding_pipeline(
     config = config or PRODUCTION_FASTRP_CONFIG
     started = time.perf_counter()
     try:
-        with computation_span(COMPUTATION_NAME):
-            result = await load_embeddings(pool, config, dump_id, dump_date)
-            if similar_artists_spool_dir is not None:
-                await run_similar_artists(
-                    pool,
-                    model_version=result.model_version,
-                    source_dump_id=dump_id,
-                    source_dump_date=dump_date,
-                    spool_root=similar_artists_spool_dir,
-                )
+        # One dedicated connection carries the advisory lock for the whole run. The pool allows
+        # two (see `_initialize_pool`): one for this lock, one for the steps below.
+        async with pool.connection() as lock_conn:
+            await lock_conn.execute(_ADVISORY_LOCK_SQL, (EMBEDDING_PIPELINE_LOCK_KEY,))
+            try:
+                with computation_span(COMPUTATION_NAME):
+                    result = await load_embeddings(pool, config, dump_id, dump_date)
+                    if similar_artists_spool_dir is not None:
+                        await run_similar_artists(
+                            pool,
+                            model_version=result.model_version,
+                            source_dump_id=dump_id,
+                            source_dump_date=dump_date,
+                            spool_root=similar_artists_spool_dir,
+                        )
+            finally:
+                await lock_conn.execute(_ADVISORY_UNLOCK_SQL, (EMBEDDING_PIPELINE_LOCK_KEY,))
     except Exception as error:
         record_computation(COMPUTATION_NAME, time.perf_counter() - started, success=False)
         record_embedding_pipeline_failure()
@@ -856,7 +875,9 @@ async def _initialize_pool(config: EmbeddingPipelineConfig) -> AsyncPostgreSQLPo
             "password": config.postgres_password,
         },
         min_connections=1,
-        max_connections=1,
+        # Two, not one: the run's advisory-lock connection is held for the whole run, next to the
+        # connection the steps use. Nothing else changes with the second connection.
+        max_connections=2,
     )
     await pool.initialize()
     return pool

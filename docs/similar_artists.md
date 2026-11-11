@@ -109,7 +109,7 @@ It connects with the `embedding_pipeline` login (`EMBEDDING_PIPELINE_POSTGRES_US
 
 ### Load check
 
-Cronduit cannot see the other containers, so the rule that the nightly run waits for a catalog load and the embeddings pipeline lives in the job. The check runs after the argument and spool checks and after target resolution, under the spool lock, and before anything is computed. Two signals, both read-only:
+Cronduit cannot see the other containers, so the rule that the nightly run waits for a catalog load and the embeddings pipeline lives in the job. The check runs after the argument and spool checks and after target resolution, under the spool lock, and before anything is computed. Three signals, all read-only:
 
 **1. Loader extraction latches.** `public.loader_extraction_latch` has one row per `(loader, version)`, with `loader` either `'discogs'` or `'musicbrainz'`. A row with `refreshed_at IS NULL` is an extraction the loaders have started and not finished refreshing. Each loader writes it as follows:
 
@@ -122,15 +122,19 @@ A latch counts as **in progress** when `refreshed_at IS NULL` and it is at most 
 
 A latch open for more than 48 h is **stale**, and the run does not block on it. The usual cause is an extraction superseded by a newer dump, which never gets stamped, or an abandoned one. Blocking on it would stop the nightly run until someone cleared the row by hand. The run proceeds, and the `reason` field names the stale latch. The 48 h bound is a judgment, not a measured figure: revisit it if a real full extraction ever runs longer than that.
 
-**2. Uncommitted writes to `public.artist_embeddings`.** The embeddings pipeline's `_write_embeddings` replaces a version's rows in one transaction: `DELETE`, then `COPY`, then commit (`insights/embedding_pipeline.py:703`, transaction at `:726`). Until that commit the rows are invisible to readers, and the pipeline holds `RowExclusiveLock` on the table. The job counts sessions that hold that lock on `public.artist_embeddings` and have an open transaction with a write (`pg_locks` joined to `pg_stat_activity.backend_xid`). Any such session blocks the run.
+**2. The embeddings pipeline's run lock.** `run_embedding_pipeline` (`insights/embedding_pipeline.py`, the `EMBEDDING_PIPELINE_LOCK_KEY` block) takes a session-level Postgres advisory lock on one dedicated connection before its first step, and releases it in a `finally` after its last. The key is the fixed bigint `7419286113405217`. The lock covers the whole run: the FastRP compute, which writes nothing to Postgres until the write, the write, and the similar-artist stage. The job reads it in `pg_locks` with `locktype = 'advisory'`, `granted`, `classid` = the high 32 bits of the key, `objid` = the low 32 bits, and `objsubid = 1`. A held lock blocks the run. Releasing is in `finally`, and the server releases it on its own if the session dies, so a crashed run cannot leave the lock behind.
 
-Why this signal and not the others:
+The pipeline's pool went from one connection to two for this (`_initialize_pool`): one carries the lock, one the steps. Nothing else in the pipeline changes. The acquire blocks, so a second embeddings run waits for the first instead of racing it. That serialises two embeddings runs, which the pipeline did not do before.
+
+**3. Uncommitted writes to `public.artist_embeddings`.** The pipeline's `_write_embeddings` replaces a version's rows in one transaction: `DELETE`, then `COPY`, then commit (`insights/embedding_pipeline.py`, `_write_embeddings`, transaction opened inside it). Until that commit the rows are invisible to readers. The job counts sessions that hold `RowExclusiveLock` on `public.artist_embeddings` with an open transaction that has written (`pg_locks` joined to `pg_stat_activity.backend_xid`). Any such session blocks the run. This is a second, independent signal: the lock covers the pipeline's own runs, and this one covers any other writer to the table.
+
+Why these signals and not the others:
 
 - **A pending version is not a signal.** A `model_version` in `artist_embeddings` with no published release is the normal target of the nightly run. Treating it as "embeddings running" would skip every night after a monthly load.
 - **A release row with `artists = 0` is not a signal.** `write_similar_artists` creates that row inside the same transaction as the lists it writes (`insights/similar_artists.py:437`), so it exists only between that commit and publish, or after a crash between them. It says nothing about the embeddings pipeline.
-- **Limit: the FastRP compute is invisible.** The pipeline does its compute (`embedding_pipeline.py:784`) before any write, and nothing reaches Postgres during it. The job can see the write, not the compute. A run still in the compute phase will not be detected. Keep the nightly window clear of the monthly embeddings load, or add a durable in-progress marker to the pipeline (a follow-up, not done here).
+- **Limit: the job cannot see a run that is not the pipeline.** The lock is only as good as its holders. The job does not take it, so a run started a moment after the job's check is not stopped, and a job run and a pipeline run can still overlap in that window. Keep the nightly window clear of the monthly embeddings load.
 
-If either signal blocks, the run does not compute, writes nothing, and exits `skipped` with the reason. If the check itself fails (the query errors, or the role cannot read the latch table), the run exits `failed` (exit 1). It never proceeds unchecked.
+If the lock or an embeddings write blocks, or a latch is in progress, the run does not compute, writes nothing, and exits `skipped` with the reason. If the check itself fails (the query errors, or the role cannot read the latch table), the run exits `failed` (exit 1). It never proceeds unchecked.
 
 ### What one run does
 

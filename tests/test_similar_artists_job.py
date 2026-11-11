@@ -191,6 +191,8 @@ class _DbCursor(_FakeCursor):
             return []  # no loader latch open: the load check passes
         if sql == job._WRITES_IN_FLIGHT_SQL:
             return [(0,)]  # no embeddings write in flight
+        if sql == job._PIPELINE_LOCK_HELD_SQL:
+            return [(0,)]  # the embeddings pipeline does not hold its run lock
         if sql in (job._PUBLISHED_VERSIONS_SQL, sa._RELEASES_BY_RECENCY_SQL):
             return [(v,) for v in reversed(self.conn.published)]
         if sql == job._EMBEDDING_LINEAGE_SQL:
