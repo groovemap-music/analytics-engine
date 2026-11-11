@@ -187,6 +187,10 @@ class _DbCursor(_FakeCursor):
         sql = self._last_sql
         if sql == job._EMBEDDING_VERSIONS_SQL:
             return [(v,) for v in self.conn.versions]
+        if sql == job._LATCH_SQL:
+            return []  # no loader latch open: the load check passes
+        if sql == job._WRITES_IN_FLIGHT_SQL:
+            return [(0,)]  # no embeddings write in flight
         if sql in (job._PUBLISHED_VERSIONS_SQL, sa._RELEASES_BY_RECENCY_SQL):
             return [(v,) for v in reversed(self.conn.published)]
         if sql == job._EMBEDDING_LINEAGE_SQL:

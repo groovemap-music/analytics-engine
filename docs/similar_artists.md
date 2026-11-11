@@ -103,8 +103,34 @@ analytics-engine-similar-artists --spool-dir /srv/analytics-engine/similar-artis
 | `--budget-gb G` | `MemoryGuard` budget, default 12. Over it, the run fails. |
 | `--checkpoint-every SECONDS` | The crash-safety checkpoint interval, default 1800. The deadline writes its own checkpoint regardless. |
 | `--status-file FILE` | Also write the final status JSON here, atomically (temporary name, then rename). |
+| `--skip-check-only` | Run the [load check](#load-check) only: report its decision as `status: "checked"` (`decision: "run"` or `"skip"`), exit 0, and stop without computing or touching the spool. Use it to test the rule against a live database. |
 
 It connects with the `embedding_pipeline` login (`EMBEDDING_PIPELINE_POSTGRES_USERNAME`/`_PASSWORD`, `_FILE` form preferred, plus `POSTGRES_HOST`, `POSTGRES_PORT` and `POSTGRES_DATABASE`), the same one `analytics-engine-embeddings` uses. `SOURCE_DUMP_*` and `ENABLE_SIMILAR_ARTISTS` are not read: the release's lineage comes from the `source_dump_id`/`source_dump_date` stored with the embeddings (exactly one pair per `model_version`, or the run fails). Logs go to stdout as JSON lines, and to `/logs/analytics-engine-similar-artists.log`.
+
+### Load check
+
+Cronduit cannot see the other containers, so the rule that the nightly run waits for a catalog load and the embeddings pipeline lives in the job. The check runs after the argument and spool checks and after target resolution, under the spool lock, and before anything is computed. Two signals, both read-only:
+
+**1. Loader extraction latches.** `public.loader_extraction_latch` has one row per `(loader, version)`, with `loader` either `'discogs'` or `'musicbrainz'`. A row with `refreshed_at IS NULL` is an extraction the loaders have started and not finished refreshing. Each loader writes it as follows:
+
+- **discogs** (`discogs-sql-loader`). The row is inserted by the first `extraction_complete` signal of an extraction (`tableinator/extraction_latch.py:440`, `record_extraction_signal`), and `signals` is the union of the entity types that have signalled so far. The derived refresh waits for all four (`extraction_latch.py:3-25`, the all-four check). `refreshed_at` is stamped in the same transaction as the refresh, so a failed pass leaves it open (`extraction_latch.py:479`, `mark_extraction_refreshed`). The key is `loader = 'discogs'` (`extraction_latch.py:93`).
+- **musicbrainz** (`musicbrainz-sql-loader`). The row is inserted when the refresh is claimed (`brainztableinator/_derived_refresh.py:88`), with the discriminator `'musicbrainz'` (`brainztableinator/_purge_veto.py:19`). It does not record signals, so `signals` is empty. `refreshed_at` is stamped at `_derived_refresh.py:170`, and a claim that finds it set does nothing (`_derived_refresh.py:95`).
+
+The table is declared once, in `database-schema/src/groovemap_schema/postgres.py:824-833`, with primary key `(loader, version)`.
+
+A latch counts as **in progress** when `refreshed_at IS NULL` and it is at most **48 hours** old, measured from `created_at`. For discogs that is the first signal, and for musicbrainz the first claim. Within that bound the run exits `skipped`.
+
+A latch open for more than 48 h is **stale**, and the run does not block on it. The usual cause is an extraction superseded by a newer dump, which never gets stamped, or an abandoned one. Blocking on it would stop the nightly run until someone cleared the row by hand. The run proceeds, and the `reason` field names the stale latch. The 48 h bound is a judgment, not a measured figure: revisit it if a real full extraction ever runs longer than that.
+
+**2. Uncommitted writes to `public.artist_embeddings`.** The embeddings pipeline's `_write_embeddings` replaces a version's rows in one transaction: `DELETE`, then `COPY`, then commit (`insights/embedding_pipeline.py:703`, transaction at `:726`). Until that commit the rows are invisible to readers, and the pipeline holds `RowExclusiveLock` on the table. The job counts sessions that hold that lock on `public.artist_embeddings` and have an open transaction with a write (`pg_locks` joined to `pg_stat_activity.backend_xid`). Any such session blocks the run.
+
+Why this signal and not the others:
+
+- **A pending version is not a signal.** A `model_version` in `artist_embeddings` with no published release is the normal target of the nightly run. Treating it as "embeddings running" would skip every night after a monthly load.
+- **A release row with `artists = 0` is not a signal.** `write_similar_artists` creates that row inside the same transaction as the lists it writes (`insights/similar_artists.py:437`), so it exists only between that commit and publish, or after a crash between them. It says nothing about the embeddings pipeline.
+- **Limit: the FastRP compute is invisible.** The pipeline does its compute (`embedding_pipeline.py:784`) before any write, and nothing reaches Postgres during it. The job can see the write, not the compute. A run still in the compute phase will not be detected. Keep the nightly window clear of the monthly embeddings load, or add a durable in-progress marker to the pipeline (a follow-up, not done here).
+
+If either signal blocks, the run does not compute, writes nothing, and exits `skipped` with the reason. If the check itself fails (the query errors, or the role cannot read the latch table), the run exits `failed` (exit 1). It never proceeds unchecked.
 
 ### What one run does
 
@@ -126,6 +152,7 @@ Because the lists come out of the same checkpointed kernel state, a run split ov
 
 | Exit | `status` | Meaning | Scheduler action |
 | ---: | --- | --- | --- |
+| 0 | `skipped` | A loader latch or an embeddings write blocked the run ([Load check](#load-check)). Nothing was computed or written; `reason` names the blocker. | Nothing. The next night checks again. Cronduit treats 0 as success, so the skip does not alert. |
 | 0 | `done` | Published by this run (`published: true`), already published (`already_published: true`), or nothing pending (`model_version: null`). | Nothing until the next month's embeddings. Running again is harmless. |
 | 75 | `paused` | The deadline came first. The spool holds a valid checkpoint (or, with `blocks_done == blocks_total`, the finished lists awaiting the write). | Run again in the next window with the same `--spool-dir`. 75 is `EX_TEMPFAIL`; a systemd unit should list it in `SuccessExitStatus=`. |
 | 1 | `failed` | A runtime failure: database error, memory budget exceeded, lock held, inconsistent lineage, failed publish. The spool keeps its last checkpoint. | Alert. A later run resumes from the checkpoint once the cause is fixed. |
@@ -137,7 +164,7 @@ The last line on stdout, and the content of `--status-file`, is one JSON object 
 {"already_published":false,"artists":9152168,"blocks_done":210,"blocks_total":2235,"elapsed_s":21633.4,"error":null,"eta_s":99360.0,"exit_code":75,"kind":"similar_artists_status","model_version":"<model_version>","published":false,"rows_written":0,"status":"paused"}
 ```
 
-`blocks_done`, `blocks_total` and `eta_s` are `null` when no compute ran (already published, nothing pending, or a failure before the compute). `rows_written` is non-zero only on the run that publishes. `error` is `"<ExceptionType>: <message>"` on `failed`, else `null`.
+`decision` is `"run"` or `"skip"` whenever the load check ran, and `reason` is the blocker, or, when the run proceeded past a stale latch, that latch. Both are `null` otherwise. `status` is `"checked"` only under `--skip-check-only`, which exits 0. `blocks_done`, `blocks_total` and `eta_s` are `null` when no compute ran (already published, nothing pending, or a failure before the compute). `rows_written` is non-zero only on the run that publishes. `error` is `"<ExceptionType>: <message>"` on `failed`, else `null`.
 
 ### Scheduling notes
 
