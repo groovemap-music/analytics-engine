@@ -173,14 +173,41 @@ Let `N = 9,152,168`, `Q` the slice, `T = compute_slice_s`, `scale = N / Q`.
 
   where `P1 = peak_rss_bytes.after_compute` (the exactness check is not in it). Compare `full_peak` with the 12 GB budget, and against `estimate_peak_bytes` (the closed-form estimate the guard logs) as a cross-check; the two should agree to within a few hundred MB. The spool and checkpoints are file writes and do not count toward RSS, but the first full-run checkpoint transient has not been measured at this size, so leave at least 1 GB of margin below 12 GB before recommending a full run.
 
-Record the measured numbers here once the dispatcher returns them:
+Measured on Lux on 2026-11-11, read-only (`writes_to_postgres: false`), publishing nothing. Per-run result JSON is not committed; only these aggregates are recorded.
 
-| Slice | Read | Kernel wall `T` | `f` | Peak RSS `P1` | `full_wall_s` | Upper bound | `full_peak` | vs 12 GB / 6 h |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 500k | `<R>` | `<T>` | `<f>` | `<P1>` | `<W>` | `<Wmax>` | `<Pfull>` | `<verdict>` |
-| 1M | `<R>` | `<T>` | `<f>` | `<P1>` | `<W>` | `<Wmax>` | `<Pfull>` | `<verdict>` |
+Run facts: analytics-engine v0.8.0 image; `insights.similar_artists_sizing`; catalog 9,152,168 artists, 128 dimensions, one `model_version` (hash `e7dd9162b4ef`); K = 50; 4,096-row blocks; 8 threads; `--memory 16g`; `--budget-gb 12`; validation seed 20261110 with 2,000 queries. The two slices ran as separate containers, one after the other.
 
-Exactness (2,000-artist sample, seed 20261110): recall `<r>`, tie-tolerant recall `<1.0>`, max score error `<e>`, host `<Lux load at the time>`.
+- 500k slice: 04:32Z to 07:58Z (3 h 26 min).
+- 1M slice: 07:58Z to 14:03Z (6 h 05 min).
+- Lux load during each run is not captured in the result JSON, so it is not recorded here.
+
+Per-slice measurements (`R` read, `T` compute, `V` exactness check):
+
+| Slice | `R` read | `T` compute | `V` exactness | Artists/s | s per block row | Peak RSS after read | Peak RSS after compute `P1` | matmul fraction `f` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 500k (5.5% of catalog) | 45.6 s | 12,147 s (3.37 h) | 157.5 s | 41.16 | 98.76 | 3.12 GB | 4.87 GB | 0.809 |
+| 1M (10.9% of catalog) | 42.0 s | 21,754 s (6.04 h) | 156.7 s | 45.97 | 88.79 | 3.12 GB | 4.96 GB | 0.784 |
+
+Peak RSS did not change during the exactness check in either run. Kernel thread-seconds (matmul / select / upcast / score blocks): 500k 77,261 / 18,405 / 723 / 274,905; 1M 133,847 / 37,180 / 1,481 / 547,575.
+
+Exactness (both slices, 2,000-artist seeded sample, checked against an independent brute force over the whole catalog): exact set recall 1.0 and tie-tolerant recall 1.0 in both. Max absolute score error 6.56e-7 (500k) and 5.96e-7 (1M), against a tolerance of 1e-4. Score violations 0 and canonical-order violations 0 in both. Both runs passed.
+
+Full-catalog extrapolation (N = 9,152,168; the 500k scale is 18.30 and the 1M scale is 9.15):
+
+| Slice | Full wall, estimate | Full wall, upper bound | Full peak RSS | vs 12 GB budget | vs 6 h window |
+| --- | ---: | ---: | ---: | --- | --- |
+| 500k | 132,400 s = 36.8 h | 222,345 s = 61.8 h | 8.40 GB | fits, 3.6 GB below budget | not within, estimate or upper bound |
+| 1M | 121,004 s = 33.6 h | 199,098 s = 55.3 h | 8.28 GB | fits, 3.7 GB below budget | not within, estimate or upper bound |
+
+- The closed-form `estimate_peak_bytes` is 8.22 GB for both slices, within 0.2 GB of the extrapolated peak.
+- The two slices give 98.76 and 88.79 s per block row, 11% apart. That is over the doc's 10% threshold, so per the rule above the 1M slice is the one to trust: 33.6 h estimate, 55.3 h upper bound. The 500k figures are shown for the spread.
+
+Conclusion (facts only):
+
+- **Memory fits.** The extrapolated full-catalog peak is 8.3–8.4 GB against the 12 GB budget, with more than 1 GB of margin.
+- **Time does not fit the 6 h window.** The exact full-catalog run measures about 34–37 h at 8 threads (33.6 h from the 1M slice, the one to trust). The upper bound is 55–62 h. Neither the estimate nor the upper bound is within 6 h.
+- **Caveats.** Both slices are first-N prefixes by `artist_id`, not random samples, so the projection carries that bias. The selection-cost model leans high. The first real check of the projection will be the first full-run checkpoint. The full-run checkpoint transient at this size is still unmeasured.
+- **Still deferred.** The Aug→Sept Jaccard check waits for a second month of embeddings (see above).
 
 ### Month-over-month Jaccard
 
