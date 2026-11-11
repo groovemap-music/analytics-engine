@@ -1,6 +1,6 @@
 # Exact similar-artist lists
 
-The maintainer's 2026-09-29 serving-mode decision ("D", `docs/embedding_tie_break.md`) is to serve precomputed monthly exact top-K similar-artist lists, not live HNSW search. gm-analytics-engine-8ts measured the index against the three serving thresholds and it failed all three. Exact top-10 lists were stable month over month (churn 0.9519). This document covers the batch job that computes those lists: `insights/embeddings/exact_top_k.py` (the kernel) and `insights/similar_artists.py` (spool, write, publish). The job runs as the last stage of `analytics-engine-embeddings` only with explicit `ENABLE_SIMILAR_ARTISTS=true`. The default is `false`, and any value other than exactly `true` or `false` fails closed. Configuring `SIMILAR_ARTISTS_SPOOL_DIR` alone does not enable it. The flag stays off in production until [gm-analytics-engine-3am](#sizing-run) has sized the full-catalog run and validated the stored lists on a real dump.
+The maintainer's 2026-09-29 serving-mode decision ("D", `docs/embedding_tie_break.md`) is to serve precomputed monthly exact top-K similar-artist lists, not live HNSW search. gm-analytics-engine-8ts measured the index against the three serving thresholds and it failed all three. Exact top-10 lists were stable month over month (churn 0.9519). This document covers the batch job that computes those lists: `insights/embeddings/exact_top_k.py` (the kernel) and `insights/similar_artists.py` (spool, write, publish). The job runs as the last stage of `analytics-engine-embeddings` only with explicit `ENABLE_SIMILAR_ARTISTS=true`. The default is `false`, and any value other than exactly `true` or `false` fails closed. Configuring `SIMILAR_ARTISTS_SPOOL_DIR` alone does not enable it. The flag stays off in production until [gm-analytics-engine-3am](#sizing-run) has sized the full-catalog run and validated the stored lists on a real dump. The same stage also runs on its own, for a `model_version` already in `artist_embeddings`, as `analytics-engine-similar-artists`, bounded by a deadline and resumable across nights: see [Nightly runs](#nightly-runs).
 
 No provider-derived data (ids, names, vectors, lists) is committed anywhere in this repository. The tests use synthetic vectors, and the sizing below reports only aggregates.
 
@@ -78,9 +78,73 @@ The create, publish and retire helpers, and the release-table lock they take, ar
   17.6 GB for current/previous compact releases, before WAL/temp-file headroom. On an
   ongoing monthly rotation, the next target coexists with both retained releases until
   publication/retirement, so peak lists alone can be about 26.4 GB (three releases). It must survive a process restart for a stopped run to resume. The directory for a published `model_version` is removed after publishing.
-- **Stopping and resuming.** Killing the process loses at most one checkpoint interval (30 minutes). Rerunning the pipeline for the same dump skips the already-loaded embeddings, reads them back, and resumes the spool from its checkpoint.
+- **Stopping and resuming.** Killing the process loses at most one checkpoint interval (30 minutes). Rerunning the pipeline for the same dump skips the already-loaded embeddings, reads them back, and resumes the spool from its checkpoint. To stop cleanly at a planned time, use `analytics-engine-similar-artists --deadline` ([Nightly runs](#nightly-runs)) rather than a kill.
 - **Rolling back.** Republishing the previous `model_version` with `publish_artist_embedding_release` switches `catalog-api` back. Its rows are still present, because only releases older than the previous one are retired.
 - **Run window.** Run the full catalog only when the host is quiet. A run that does not finish in one window may resume from its block checkpoint on a later night. There is no approximate first pass and no degree cutoff.
+
+## Nightly runs
+
+The full catalog takes about 34 h at 8 threads (55 h upper bound, [Sizing run](#sizing-run)), far more than one ~6 h quiet window. The operator's decision (2026-11-11) is to keep the lists exact and spread the run over several nightly windows, resuming from checkpoints: d4d's run policy allows that, and there is still no approximate first pass and no degree cutoff. `analytics-engine-similar-artists` (`insights/similar_artists_job.py`) is that entry point. It is the stage above, `run_similar_artists`, with a deadline; the kernel, spool, checkpoint, write and publish code are the same. The deployment job that runs it (gm-deployment-h0d4) and the homelab nightly timer (homelab-dfmy) are separate beads and use only the interface below.
+
+### Command
+
+```sh
+analytics-engine-similar-artists --spool-dir /srv/analytics-engine/similar-artists \
+  --deadline 2026-11-12T06:00:00Z --threads 8 --status-file /srv/analytics-engine/similar-artists/status.json
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--model-version V` | The `model_version` to compute. Default: the one `model_version` in `artist_embeddings` without a published release. If every version there is published, the run is `done` and does nothing; if several are unpublished, it fails with exit 2 and asks for this option. |
+| `--spool-dir DIR` | **Required** (or `SIMILAR_ARTISTS_SPOOL_DIR`). An absolute path on persistent disk. The run refuses anything under `/tmp` (including the pipeline's container default, `/tmp/analytics-engine-similar-artists`), `/var/tmp` or `/dev/shm`, checked after resolving symlinks, because a paused run's checkpoint there would not survive to the next night. |
+| `--deadline TIME` | Absolute ISO 8601 stop time with a UTC offset (`Z` or `+hh:mm`). A time without an offset is refused. |
+| `--max-runtime SECONDS` | Stop after this long, counted from process start. With both, the earlier one wins. With neither, the run goes until it is done. |
+| `--threads N` | Kernel threads, default 8. Thread count does not change the lists. |
+| `--budget-gb G` | `MemoryGuard` budget, default 12. Over it, the run fails. |
+| `--checkpoint-every SECONDS` | The crash-safety checkpoint interval, default 1800. The deadline writes its own checkpoint regardless. |
+| `--status-file FILE` | Also write the final status JSON here, atomically (temporary name, then rename). |
+
+It connects with the `embedding_pipeline` login (`EMBEDDING_PIPELINE_POSTGRES_USERNAME`/`_PASSWORD`, `_FILE` form preferred, plus `POSTGRES_HOST`, `POSTGRES_PORT` and `POSTGRES_DATABASE`), the same one `analytics-engine-embeddings` uses. `SOURCE_DUMP_*` and `ENABLE_SIMILAR_ARTISTS` are not read: the release's lineage comes from the `source_dump_id`/`source_dump_date` stored with the embeddings (exactly one pair per `model_version`, or the run fails). Logs go to stdout as JSON lines, and to `/logs/analytics-engine-similar-artists.log`.
+
+### What one run does
+
+1. **Lock.** It takes an exclusive `flock` on `<spool-dir>/.lock`, so two runs never write one spool. If another run holds it, this one fails (exit 1) without touching anything.
+2. **Resolve the target** and its lineage (above). It never recomputes embeddings.
+3. **Skip if published.** If the release is already published (`artists > 0`), the run is `done` with `already_published: true`, and it removes any spool left behind for that version. Re-running after a publish is therefore a no-op.
+4. **Read** the stored vectors, as the pipeline stage does (about 45 s for the catalog on Lux, every window).
+5. **Compute or resume** into `<spool-dir>/<blake2b(model_version)>/`, the same layout the pipeline stage uses. A spool whose identity (`model_version`, artist count, dimensions, K, block size) matches resumes from its checkpoint; a different one starts over, as before.
+   - The deadline is checked between row blocks only. A block in progress always finishes, its rows are written and `fsync`ed, and at the first block boundary at or past the deadline the running state is checkpointed atomically (temporary file, `fsync`, rename, directory `fsync`). The run then exits `paused`. Nothing is ever written half-way: a crash mid-block leaves the previous checkpoint and `meta.json` intact, and the next run recomputes from there.
+   - If the deadline has already passed when the compute would start, nothing is computed and the run is `paused` at its current block.
+   - A run can overrun its deadline by at most one row block. Block 0 is the longest (it multiplies against every column block, the same work as one full block row of the sizing slice, measured at 88.8 s on Lux at 8 threads); later blocks are shorter, since each multiplies only the upper triangle. Allow about 2 minutes past the deadline, plus process start and the read.
+6. **Write and publish once,** only when every block is done: the same `write_similar_artists` and `publish_and_rotate` as the stage (one transaction for the COPY, then the publish and the retire of older releases). If the compute finishes but the deadline has passed by then, the run reports `paused` with every block done, and the next window writes and publishes first thing, instead of overrunning this one by the COPY. After a successful publish, the spool directory is removed.
+
+Progress (`blocks_done`, `blocks`, `eta_s`) is logged about once a minute. The ETA weights each block by its kernel tasks (block `i` of `n` runs `n − i`), so it does not mistake the fast late blocks for the slow early ones; it is projected from the current run's own rate, so it reflects tonight's host load.
+
+Because the lists come out of the same checkpointed kernel state, a run split over N windows produces lists byte-identical to one uninterrupted run (`tests/test_similar_artists_job.py`).
+
+### Exit codes and status line
+
+| Exit | `status` | Meaning | Scheduler action |
+| ---: | --- | --- | --- |
+| 0 | `done` | Published by this run (`published: true`), already published (`already_published: true`), or nothing pending (`model_version: null`). | Nothing until the next month's embeddings. Running again is harmless. |
+| 75 | `paused` | The deadline came first. The spool holds a valid checkpoint (or, with `blocks_done == blocks_total`, the finished lists awaiting the write). | Run again in the next window with the same `--spool-dir`. 75 is `EX_TEMPFAIL`; a systemd unit should list it in `SuccessExitStatus=`. |
+| 1 | `failed` | A runtime failure: database error, memory budget exceeded, lock held, inconsistent lineage, failed publish. The spool keeps its last checkpoint. | Alert. A later run resumes from the checkpoint once the cause is fixed. |
+| 2 | `failed` | Refused before any work: bad arguments, missing or non-persistent spool directory, missing credentials, unknown `model_version`, or several unpublished versions without `--model-version`. | Fix the configuration. |
+
+The last line on stdout, and the content of `--status-file`, is one JSON object marked `"kind": "similar_artists_status"` (keys sorted; logs before it are other JSON lines):
+
+```json
+{"already_published":false,"artists":9152168,"blocks_done":210,"blocks_total":2235,"elapsed_s":21633.4,"error":null,"eta_s":99360.0,"exit_code":75,"kind":"similar_artists_status","model_version":"<model_version>","published":false,"rows_written":0,"status":"paused"}
+```
+
+`blocks_done`, `blocks_total` and `eta_s` are `null` when no compute ran (already published, nothing pending, or a failure before the compute). `rows_written` is non-zero only on the run that publishes. `error` is `"<ExceptionType>: <message>"` on `failed`, else `null`.
+
+### Scheduling notes
+
+- **Windows.** At the measured 33.6 h (55 h upper bound), a ~6 h window means about 6 nights (up to 10). Give the run a `--deadline` at the end of the quiet window rather than killing it; a kill loses up to `--checkpoint-every` of work. If the scheduler must stop it anyway, give it a stop timeout of a few minutes.
+- **Disk.** The spool directory needs the space in [Operations](#operations): about 11.3 GB free for the full catalog, on disk that survives a restart and the container. The checkpoint stays between windows (about 3.78 GB) next to the 3.75 GB spool.
+- **Memory.** The same as the pipeline stage: about 8.3 GB peak for the catalog, against the 12 GB guard.
+- **One spool root per deployment.** The pipeline stage (`ENABLE_SIMILAR_ARTISTS=true`) and this command share the spool layout, so either can resume the other's spool if both point at the same directory. Run the exact lists through this command only, and keep `ENABLE_SIMILAR_ARTISTS=false`, so the monthly embedding job never starts a 34 h stage of its own.
 
 ## Testing
 
@@ -88,6 +152,7 @@ All tests use synthetic vectors and ids.
 
 - `tests/test_exact_top_k.py` checks the kernel against an independent brute force over block sizes, thread counts and ragged final blocks. It also covers self exclusion when an exact duplicate exists, deterministic tie order on vectors whose dot products are exact in `float32`, zero vectors, and resuming from a checkpoint.
 - `tests/test_similar_artists_sizing.py` checks that a slice's lists equal the full run's first rows position for position (with real ties, ragged blocks and a resume), the extrapolation arithmetic, that a corrupted list fails the exactness check, and that a writable session or an ambiguous `model_version` stops the sizing pass.
+- `tests/test_similar_artists_job.py` covers the nightly entry point. A synthetic catalog is split across several deadline-bounded runs, with the deadline driven by a fake clock that advances per finished block: each pause leaves a valid checkpoint at a block boundary and no temporary file, the final spool is byte-identical to one uninterrupted run, the COPY rows equal the uninterrupted run's, the release is published exactly once, the spool is removed, and re-running after publish is a no-op. It also covers a deadline already past, a compute that finishes past the deadline (publish deferred to the next window), target resolution, the refusal of `/tmp` and other non-persistent spool directories (through symlinks too), the lock, the deadline arithmetic, and the exit codes and status line.
 - `tests/test_similar_artists.py` covers the spool, checkpoint resume, the COPY rows, publish and rotate, and the monthly stage against in-memory fakes. Its memory-guard tests include one that runs the compute in a fresh process with the real `getrusage` peak and a budget the running lists must exceed, and checks that the guard stops the run and leaves the spool incomplete.
 - `just test-integration-pg18` starts a disposable official PostgreSQL 18 container (the digest database-schema's required tier pins), applies database-schema's own `create_postgres_schema`, and runs `tests/integration/test_similar_artists_integration.py` as the real `embedding_pipeline` role. That covers COPY quoting and order, rollback of a failed COPY, refusing to overwrite a published release, publication, keeping the current and previous releases, and retiring older ones. The similarity tables need no pgvector, so the bare image is enough. There is no PostgreSQL 19 GA image yet, so this PG18 tier is the one to run. `just test-integration-pg19` runs the same suite, plus the embedding pipeline's, on the local PG19 beta + pgvector image when one is built. It is advisory.
 

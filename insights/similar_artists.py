@@ -14,6 +14,9 @@ are in `docs/similar_artists.md`. In order:
    Every ``checkpoint_every_s`` the running state and the next block index are saved,
    atomically (write to a temporary name, then `Path.replace`), so a crashed or stopped run
    resumes from its last checkpoint rather than from zero. `MemoryGuard` runs between blocks.
+   With a ``deadline``, the first row-block boundary at or past it saves a checkpoint and
+   raises `PausedAtDeadline`, so a run can be spread over several windows
+   (`insights.similar_artists_job`, the nightly entry point).
 2. **Write atomically** (`write_similar_artists`). One transaction deletes any rows a
    previous, failed attempt left under this `model_version` and streams every list into
    `public.artist_similar_artists` with `COPY`. Nothing is visible to `catalog-api` until
@@ -90,6 +93,7 @@ _COUNT_EMBEDDINGS_SQL: Final = "SELECT count(*) FROM public.artist_embeddings WH
 _READ_EMBEDDINGS_SQL: Final = "SELECT artist_id, embedding FROM public.artist_embeddings WHERE model_version = %s ORDER BY artist_id"
 _HALFVEC_HEADER_HALFWORDS: Final = 2
 _FETCH_SIZE: Final = 50_000
+_PROGRESS_LOG_EVERY_S: Final = 60.0
 
 
 # ── Memory guard ──────────────────────────────────────────────────────────────────────────────
@@ -191,10 +195,54 @@ class Spool:
         return positions.reshape(-1, self.k), scores.reshape(-1, self.k)
 
 
+@dataclass(frozen=True)
+class SpoolProgress:
+    """How far a spool's computation has got: finalized row blocks out of the total, and the
+    remaining time projected from this run's own rate (``None`` before it has finished a block)."""
+
+    blocks_done: int
+    blocks_total: int
+    eta_s: float | None
+
+
+class PausedAtDeadline(Exception):
+    """`compute_to_spool` reached its deadline at a row-block boundary and saved a checkpoint
+    (or had not started a block yet). The next run with the same spool resumes from it."""
+
+    def __init__(self, progress: SpoolProgress) -> None:
+        super().__init__(f"paused at block {progress.blocks_done}/{progress.blocks_total}")
+        self.progress = progress
+
+
+def spool_directory(spool_root: Path, model_version: str) -> Path:
+    """The per-``model_version`` spool directory under ``spool_root``. The pipeline stage and
+    the nightly entry point use the same one, so either can resume the other's run."""
+    return spool_root / hashlib.blake2b(model_version.encode(), digest_size=8).hexdigest()
+
+
+def _cumulative_tasks(blocks: int, n_blocks: int, n_column_blocks: int, *, slice_mode: bool) -> int:
+    """Kernel tasks run before row block ``blocks``: the full run multiplies only the upper
+    triangle, so block ``i`` runs ``n_blocks - i`` tasks; a slice's every block runs one task
+    per catalog block."""
+    if slice_mode:
+        return blocks * n_column_blocks
+    return blocks * n_blocks - blocks * (blocks - 1) // 2
+
+
 def _atomic_write(path: Path, write: Callable[[Path], object]) -> None:
+    """Write to a temporary name, flush it to disk, then rename it into place, so a reader
+    (or a resumed run after a crash or power loss) sees the old file or the new one, never
+    a partial one."""
     tmp = path.with_name(f".{path.name}.tmp")
     write(tmp)
+    with tmp.open("rb") as fh:
+        os.fsync(fh.fileno())
     tmp.replace(path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _write_rows(path: Path, start_row: int, row_bytes: int, data: NDArray[Any]) -> None:
@@ -218,6 +266,7 @@ def compute_to_spool(
     clock: Callable[[], float] = time.monotonic,
     query_rows: int | None = None,
     profile: PhaseProfile | None = None,
+    deadline: float | None = None,
 ) -> Spool:
     """Compute every artist's exact top-``k`` into a spool under ``directory``, resuming from
     its checkpoint when one exists for the same ``model_version`` and shape. Returns the
@@ -225,7 +274,13 @@ def compute_to_spool(
 
     ``query_rows`` is the sizing pass's slice: only the first ``query_rows`` artists get
     lists (each against the whole catalog, see ``exact_top_k``), so the spool has that many
-    rows. Production runs leave it ``None``."""
+    rows. Production runs leave it ``None``.
+
+    ``deadline`` is a ``clock()`` reading. A block in progress always finishes; at the first
+    row-block boundary at or past the deadline the running state is checkpointed atomically
+    and `PausedAtDeadline` is raised. If the deadline has already passed before the first
+    block, nothing is computed. The lists a resumed run produces are byte-identical to an
+    uninterrupted run's: the checkpoint is the kernel's exact state, not an approximation."""
     guard = guard or MemoryGuard()
     n_catalog = vectors.shape[0]
     n_artists = n_catalog if query_rows is None else query_rows
@@ -263,18 +318,48 @@ def compute_to_spool(
         meta = {"identity": identity, "complete": False}
         _atomic_write(spool.meta_path, lambda p: p.write_text(json.dumps(meta)))
 
-    guard.check("before exact top-K")
-    last_checkpoint = clock()
     n_blocks = -(-n_artists // block_rows)
+    n_column_blocks = -(-n_catalog // block_rows)
+    slice_mode = query_rows is not None
+
+    def progress(blocks_done: int) -> SpoolProgress:
+        done = _cumulative_tasks(blocks_done, n_blocks, n_column_blocks, slice_mode=slice_mode)
+        ran = done - _cumulative_tasks(start_block, n_blocks, n_column_blocks, slice_mode=slice_mode)
+        total = _cumulative_tasks(n_blocks, n_blocks, n_column_blocks, slice_mode=slice_mode)
+        eta = (clock() - run_started) / ran * (total - done) if ran > 0 else None
+        return SpoolProgress(blocks_done, n_blocks, None if eta is None else round(eta, 1))
+
+    def past_deadline() -> bool:
+        return deadline is not None and clock() >= deadline
+
+    if past_deadline():
+        logger.info(
+            "⏸️ Similar-artist deadline already passed, nothing computed", model_version=model_version, next_block=start_block, blocks=n_blocks
+        )
+        raise PausedAtDeadline(SpoolProgress(start_block, n_blocks, None))
+    guard.check("before exact top-K")
+    run_started = last_checkpoint = clock()
+    last_progress_log = last_checkpoint
 
     def on_block(row_start: int, scores: NDArray[np.float32], positions: NDArray[np.int32]) -> None:
         _write_rows(spool.positions_path, row_start, k * 4, positions)
         _write_rows(spool.scores_path, row_start, k * 4, scores)
 
     def after_block(next_block: int, running: TopKState) -> None:
-        nonlocal last_checkpoint
+        nonlocal last_checkpoint, last_progress_log
         guard.check(f"block {next_block}/{n_blocks}")
-        if next_block < n_blocks and clock() - last_checkpoint >= checkpoint_every_s:
+        if clock() - last_progress_log >= _PROGRESS_LOG_EVERY_S or next_block == n_blocks:
+            last_progress_log = clock()
+            now = progress(next_block)
+            logger.info("📈 Similar-artist progress", blocks_done=now.blocks_done, blocks=now.blocks_total, eta_s=now.eta_s)
+        if next_block >= n_blocks:
+            return
+        if past_deadline():
+            _save_checkpoint(spool, running, next_block)
+            paused = progress(next_block)
+            logger.info("⏸️ Similar-artist deadline reached, checkpointed", next_block=next_block, blocks=n_blocks, eta_s=paused.eta_s)
+            raise PausedAtDeadline(paused)
+        if clock() - last_checkpoint >= checkpoint_every_s:
             _save_checkpoint(spool, running, next_block)
             last_checkpoint = clock()
             logger.info("💾 Similar-artist checkpoint", next_block=next_block, blocks=n_blocks, peak_rss_gb=round(guard.peak_rss() / 1e9, 2))
@@ -482,11 +567,17 @@ async def read_embeddings(conn: Any, model_version: str) -> tuple[list[str], NDA
 
 @dataclass(frozen=True)
 class SimilarArtistsResult:
+    """One stage run. ``skipped``: the release was already published, nothing done.
+    ``paused``: the deadline came first; the spool keeps a checkpoint and nothing was written
+    to Postgres. Otherwise the lists were written and published."""
+
     model_version: str
     artists: int
     rows_written: int
     skipped: bool
     rotation: RotateResult | None = None
+    paused: bool = False
+    progress: SpoolProgress | None = None
 
 
 async def run_similar_artists(
@@ -500,16 +591,31 @@ async def run_similar_artists(
     k: int = DEFAULT_K,
     threads: int = DEFAULT_THREADS,
     guard: MemoryGuard | None = None,
+    block_rows: int = DEFAULT_BLOCK_ROWS,
+    checkpoint_every_s: float = DEFAULT_CHECKPOINT_EVERY_S,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> SimilarArtistsResult:
     """Compute, write, and publish ``model_version``'s similar-artist lists, or no-op if that
     release has already been published. Pending targets remain retryable. Each database step takes its own connection, so none is held
-    open across the hours-long compute."""
+    open across the hours-long compute.
+
+    With a ``deadline`` (a ``clock()`` reading), the compute pauses at the first row-block
+    boundary at or past it (see `compute_to_spool`) and the result is ``paused``; a finished
+    compute that reaches the write step past the deadline also pauses, so the write and
+    publish run at the start of the next window instead of overrunning this one. Publishing
+    happens once, only after every block is done; the spool is removed after it, and a
+    re-run that finds the release published removes any spool left behind."""
     registry = registry or SchemaReleaseRegistry()
+    spool_dir = spool_directory(spool_root, model_version)
     async with pool.connection() as conn:
         async with conn.cursor() as cursor:
             await cursor.execute(_RELEASE_EXISTS_SQL, (model_version,))
             if await cursor.fetchone() is not None:
                 logger.info("⏭️ Similar-artist release already published", model_version=model_version)
+                if spool_dir.exists():
+                    shutil.rmtree(spool_dir)
+                    logger.info("🧹 Removed the spool of an already published release", directory=str(spool_dir))
                 return SimilarArtistsResult(model_version, 0, 0, skipped=True)
         artist_ids, vectors = await read_embeddings(conn, model_version)
     if not artist_ids:
@@ -525,9 +631,28 @@ async def run_similar_artists(
         threads=threads,
         estimated_peak_gb=round(estimate / 1e9, 2),
     )
-    spool_dir = spool_root / hashlib.blake2b(model_version.encode(), digest_size=8).hexdigest()
-    spool = await asyncio.to_thread(compute_to_spool, vectors, spool_dir, model_version=model_version, k=k, threads=threads, guard=guard)
+    try:
+        spool = await asyncio.to_thread(
+            compute_to_spool,
+            vectors,
+            spool_dir,
+            model_version=model_version,
+            k=k,
+            block_rows=block_rows,
+            threads=threads,
+            checkpoint_every_s=checkpoint_every_s,
+            guard=guard,
+            clock=clock,
+            deadline=deadline,
+        )
+    except PausedAtDeadline as paused:
+        return SimilarArtistsResult(model_version, len(artist_ids), 0, skipped=False, paused=True, progress=paused.progress)
     del vectors
+    n_blocks = -(-spool.n_artists // block_rows)
+    complete = SpoolProgress(n_blocks, n_blocks, 0.0)
+    if deadline is not None and clock() >= deadline:
+        logger.info("⏸️ Similar-artist lists complete; deadline reached before the write, publishing next run", model_version=model_version)
+        return SimilarArtistsResult(model_version, len(artist_ids), 0, skipped=False, paused=True, progress=complete)
 
     async with pool.connection() as conn:
         rows = await write_similar_artists(
@@ -547,4 +672,4 @@ async def run_similar_artists(
             artists=len(artist_ids),
         )
     shutil.rmtree(spool_dir, ignore_errors=True)
-    return SimilarArtistsResult(model_version, len(artist_ids), rows, skipped=False, rotation=rotation)
+    return SimilarArtistsResult(model_version, len(artist_ids), rows, skipped=False, rotation=rotation, progress=complete)
