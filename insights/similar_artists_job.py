@@ -26,7 +26,7 @@ import os
 import sys
 import time
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from os import getenv
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn
@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn
 import structlog
 from common import setup_logging
 
+from insights.embedding_pipeline import EMBEDDING_PIPELINE_LOCK_KEY
 from insights.similar_artists import (
     DEFAULT_CHECKPOINT_EVERY_S,
     DEFAULT_MEMORY_BUDGET_BYTES,
@@ -46,7 +47,7 @@ from insights.similar_artists import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
 
 
 logger = structlog.get_logger(__name__)
@@ -60,6 +61,9 @@ EXIT_FAILED: Final = 1
 EXIT_USAGE: Final = 2
 # sysexits.h EX_TEMPFAIL: "temporary failure, the user is invited to retry".
 EXIT_PAUSED: Final = 75
+# A load is in progress, so the run did not compute. Exit 0, not a dedicated code: Cronduit
+# treats 0 and 75 as success, and `status` carries the difference. See docs/similar_artists.md.
+EXIT_SKIPPED: Final = EXIT_DONE
 
 # Directories that do not survive a reboot or a container: a spool there cannot resume.
 NON_PERSISTENT_ROOTS: Final = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"))  # noqa: S108 -- refused, never written.
@@ -68,8 +72,29 @@ _EMBEDDING_VERSIONS_SQL: Final = "SELECT DISTINCT model_version FROM public.arti
 _PUBLISHED_VERSIONS_SQL: Final = "SELECT model_version FROM public.artist_embedding_releases WHERE artists > 0"
 _EMBEDDING_LINEAGE_SQL: Final = "SELECT DISTINCT source_dump_id, source_dump_date FROM public.artist_embeddings WHERE model_version = %s"
 _RELEASE_LINEAGE_SQL: Final = "SELECT source_dump_id, source_dump_date FROM public.artist_embedding_releases WHERE model_version = %s"
+# The loader family's extraction latch, one row per (loader, version). Both loaders write it.
+LATCH_LOADERS: Final = ("discogs", "musicbrainz")
+_LATCH_SQL: Final = (
+    "SELECT loader, version, signals, created_at, refreshed_at FROM public.loader_extraction_latch WHERE loader = ANY(%s) ORDER BY created_at"
+)
+# Write locks held on the embeddings table by a session that has an open transaction with a write
+# (`backend_xid` is set only once the transaction has written). The pipeline's DELETE + COPY hold
+# RowExclusiveLock until commit; a read-only session holds only AccessShareLock and is not counted.
+_WRITES_IN_FLIGHT_SQL: Final = (
+    "SELECT count(*) FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid = l.pid "
+    "WHERE l.relation = 'public.artist_embeddings'::regclass AND l.mode = 'RowExclusiveLock' AND l.granted "
+    "AND a.backend_xid IS NOT NULL AND a.pid <> pg_backend_pid()"
+)
+# The embeddings run's advisory lock (`insights.embedding_pipeline.EMBEDDING_PIPELINE_LOCK_KEY`),
+# split into the (classid, objid) pair pg_locks reports for a single bigint key.
+_PIPELINE_LOCK_KEY: Final = EMBEDDING_PIPELINE_LOCK_KEY
+_PIPELINE_LOCK_HELD_SQL: Final = (
+    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND classid = %s AND objid = %s AND objsubid = 1"
+)
+# A latch open longer than this is treated as abandoned or superseded, and no longer blocks.
+LATCH_STALE_AFTER: Final = timedelta(hours=48)
 
-Status = Literal["done", "paused", "failed"]
+Status = Literal["done", "paused", "failed", "skipped", "checked"]
 
 
 class UsageError(ValueError):
@@ -100,6 +125,10 @@ class JobStatus:
     rows_written: int = 0
     elapsed_s: float = 0.0
     error: str | None = None
+    # The load check's verdict, "run" or "skip", set whenever the check ran. `reason` is why the
+    # job skipped, or, when it ran despite a stale latch, the stale latch it ignored.
+    decision: Literal["run", "skip"] | None = None
+    reason: str | None = None
 
     def to_json(self) -> str:
         return json.dumps({"kind": STATUS_KIND, **asdict(self)}, sort_keys=True, separators=(",", ":"))
@@ -187,6 +216,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--checkpoint-every", type=float, default=DEFAULT_CHECKPOINT_EVERY_S, metavar="SECONDS", help="crash-safety checkpoint interval"
     )
     parser.add_argument("--status-file", type=Path, help="also write the final status JSON here (atomically)")
+    parser.add_argument(
+        "--skip-check-only",
+        action="store_true",
+        help="run the load check (loader latches, embeddings writes), report the decision as status 'checked', and stop without computing",
+    )
     return parser.parse_args(argv)
 
 
@@ -252,6 +286,74 @@ def spool_lock(spool_root: Path) -> Iterator[None]:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
+# ── Load check (skip while a catalog load or the embeddings pipeline is running) ────────────
+
+
+@dataclass(frozen=True)
+class LatchRow:
+    loader: str
+    version: str
+    signals: tuple[str, ...]
+    created_at: datetime
+    refreshed_at: datetime | None
+
+
+@dataclass(frozen=True)
+class LoadCheck:
+    skip: bool
+    reason: str | None
+
+
+def judge_loads(latches: Sequence[LatchRow], writes_in_flight: int, *, now: datetime, pipeline_lock_held: bool = False) -> LoadCheck:
+    """Decide whether this night's run must not compute.
+
+    A latch with ``refreshed_at`` set is finished. An open latch younger than ``LATCH_STALE_AFTER``
+    blocks. An older open latch does not block: it is reported as the reason and the run proceeds.
+    Any uncommitted write to ``artist_embeddings`` blocks, because the embeddings pipeline is
+    loading that table and the stage would read a half-loaded catalog. So does the pipeline's
+    advisory lock: it is held for the whole run, including the FastRP compute that writes nothing.
+    """
+    blocking: list[str] = []
+    stale: list[str] = []
+    if pipeline_lock_held:
+        blocking.append("the embeddings pipeline holds its run lock: an embeddings run is in progress")
+    for row in sorted(latches, key=lambda r: r.created_at):
+        if row.refreshed_at is not None:
+            continue
+        age = now - row.created_at
+        detail = (
+            f"{row.loader} extraction {row.version} latch open since {row.created_at:%Y-%m-%d %H:%M}Z, "
+            f"not refreshed (signals: {', '.join(row.signals) or 'none recorded'})"
+        )
+        if age <= LATCH_STALE_AFTER:
+            blocking.append(f"{detail}: extraction in progress")
+        else:
+            stale.append(
+                f"{detail}, open {age.total_seconds() / 3600:.0f} h, past the {LATCH_STALE_AFTER.total_seconds() / 3600:.0f} h bound: ignored"
+            )
+    if writes_in_flight > 0:
+        blocking.append(f"{writes_in_flight} session(s) have uncommitted writes to public.artist_embeddings: the embeddings pipeline is loading")
+    if blocking:
+        return LoadCheck(skip=True, reason="; ".join(blocking))
+    return LoadCheck(skip=False, reason="; ".join(stale) or None)
+
+
+async def read_load_check(conn: Any, now: datetime) -> LoadCheck:
+    """Read the loader latches and the embeddings write locks, then judge them.
+
+    Read-only. Raises if a query fails (for example, the latch table is not deployed or the
+    role cannot read it): the caller turns that into ``failed``, so a run never proceeds unchecked.
+    """
+    latches = [
+        LatchRow(loader, version, tuple(signals or ()), created_at, refreshed_at)
+        for loader, version, signals, created_at, refreshed_at in await _fetch_all(conn, _LATCH_SQL, (list(LATCH_LOADERS),))
+    ]
+    ((writes_in_flight,),) = await _fetch_all(conn, _WRITES_IN_FLIGHT_SQL)
+    high, low = _PIPELINE_LOCK_KEY >> 32, _PIPELINE_LOCK_KEY & 0xFFFFFFFF
+    ((lock_holders,),) = await _fetch_all(conn, _PIPELINE_LOCK_HELD_SQL, (high, low))
+    return judge_loads(latches, int(writes_in_flight), now=now, pipeline_lock_held=int(lock_holders) > 0)
+
+
 # ── The run ──────────────────────────────────────────────────────────────────────────────────
 
 
@@ -266,18 +368,43 @@ async def run_job(
     threads: int = DEFAULT_THREADS,
     guard: MemoryGuard | None = None,
     checkpoint_every_s: float = DEFAULT_CHECKPOINT_EVERY_S,
+    check_only: bool = False,
+    wall_now: datetime | None = None,
     **stage_options: Any,
 ) -> JobStatus:
-    """Resolve the target, then run (or resume) the existing stage under the spool lock.
-    ``deadline`` is a ``clock()`` reading. Exceptions propagate; `main` turns them into a
-    ``failed`` status."""
+    """Resolve the target, check for a running load, then run (or resume) the existing stage
+    under the spool lock. ``deadline`` is a ``clock()`` reading. ``check_only`` stops after the
+    load check and reports its decision without computing. Exceptions propagate; `main` turns
+    them into a ``failed`` status."""
     started = clock()
     with spool_lock(spool_root):
         async with pool.connection() as conn:
             target = await resolve_target(conn, model_version)
-        if target is None:
-            logger.info("⏭️ Every model_version in artist_embeddings is already published; nothing to do")
-            return JobStatus(status="done", exit_code=EXIT_DONE, elapsed_s=round(clock() - started, 1))
+            if target is None:
+                logger.info("⏭️ Every model_version in artist_embeddings is already published; nothing to do")
+                return JobStatus(status="done", exit_code=EXIT_DONE, elapsed_s=round(clock() - started, 1))
+            load_check = await read_load_check(conn, wall_now or datetime.now(UTC))
+        if check_only:
+            return JobStatus(
+                status="checked",
+                exit_code=EXIT_DONE,
+                model_version=target.model_version,
+                decision="skip" if load_check.skip else "run",
+                reason=load_check.reason,
+                elapsed_s=round(clock() - started, 1),
+            )
+        if load_check.skip:
+            logger.warning("⏭️ Skipping the similar-artist run: a load is in progress", reason=load_check.reason)
+            return JobStatus(
+                status="skipped",
+                exit_code=EXIT_SKIPPED,
+                model_version=target.model_version,
+                decision="skip",
+                reason=load_check.reason,
+                elapsed_s=round(clock() - started, 1),
+            )
+        if load_check.reason:
+            logger.warning("⚠️ Running despite a stale loader latch", reason=load_check.reason)
         result = await run_similar_artists(
             pool,
             model_version=target.model_version,
@@ -292,7 +419,7 @@ async def run_job(
             clock=clock,
             **stage_options,
         )
-    return JobStatus.from_result(result, clock() - started)
+    return replace(JobStatus.from_result(result, clock() - started), decision="run", reason=load_check.reason)
 
 
 def failed_status(error: BaseException, elapsed_s: float) -> JobStatus:
@@ -341,6 +468,7 @@ async def _connect_and_run(
             threads=args.threads,
             guard=MemoryGuard(budget_bytes=int(args.budget_gb * 1024**3)),
             checkpoint_every_s=args.checkpoint_every,
+            check_only=args.skip_check_only,
         )
     finally:
         await pool.close()

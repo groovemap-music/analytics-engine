@@ -7,9 +7,10 @@ permission and idempotency regressions live in `tests/integration/test_embedding
 
 from __future__ import annotations
 
+import contextlib
 import struct
 from datetime import date
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, Mock
 
 import numpy as np
@@ -19,6 +20,10 @@ import scipy
 from insights import embedding_pipeline as pipeline
 from insights import similar_artists
 from insights.embeddings import FastRPConfig
+
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 
 # ── Fakes standing in for psycopg's async connection/cursor protocol ────────────────────────
@@ -288,7 +293,7 @@ class TestEmbeddingPipelineConfig:
         load = AsyncMock(return_value=result)
         stage = AsyncMock()
         publish = AsyncMock()
-        monkeypatch.setattr(pipeline, "_initialize_pool", AsyncMock(return_value=Mock(close=AsyncMock())))
+        monkeypatch.setattr(pipeline, "_initialize_pool", AsyncMock(return_value=_LockPool(close=True)))
         monkeypatch.setattr(pipeline, "load_embeddings", load)
         monkeypatch.setattr(pipeline, "run_similar_artists", stage)
         monkeypatch.setattr(similar_artists, "publish_and_rotate", publish)
@@ -1173,7 +1178,7 @@ class TestRunEmbeddingPipeline:
         monkeypatch.setattr(pipeline, "record_computation", Mock())
         monkeypatch.setattr(pipeline, "record_embedding_rows_written", Mock())
 
-        await pipeline.run_embedding_pipeline(pool=object(), dump_id="dump-1", dump_date=date(2026, 9, 1))
+        await pipeline.run_embedding_pipeline(pool=_LockPool(), dump_id="dump-1", dump_date=date(2026, 9, 1))
 
         config = load.call_args.args[1]
         assert config == pipeline.PRODUCTION_FASTRP_CONFIG
@@ -1193,7 +1198,7 @@ class TestRunEmbeddingPipeline:
         monkeypatch.setattr(pipeline, "run_similar_artists", stage)
         monkeypatch.setattr(pipeline, "record_computation", Mock())
         monkeypatch.setattr(pipeline, "record_embedding_rows_written", Mock())
-        pool = object()
+        pool = _LockPool()
 
         await pipeline.run_embedding_pipeline(pool=pool, dump_id="dump-1", dump_date=date(2026, 9, 1), similar_artists_spool_dir=tmp_path)
 
@@ -1212,7 +1217,7 @@ class TestRunEmbeddingPipeline:
         monkeypatch.setattr(pipeline, "record_embedding_pipeline_failure", record_failure)
 
         with pytest.raises(RuntimeError, match="publish failed"):
-            await pipeline.run_embedding_pipeline(pool=object(), dump_id="dump-1", dump_date=date(2026, 9, 1), similar_artists_spool_dir=tmp_path)
+            await pipeline.run_embedding_pipeline(pool=_LockPool(), dump_id="dump-1", dump_date=date(2026, 9, 1), similar_artists_spool_dir=tmp_path)
 
         assert record_computation.call_args.kwargs == {"success": False}
         record_failure.assert_called_once_with()
@@ -1228,7 +1233,7 @@ class TestRunEmbeddingPipeline:
         record_failure = Mock()
         monkeypatch.setattr(pipeline, "record_embedding_pipeline_failure", record_failure)
 
-        outcome = await pipeline.run_embedding_pipeline(pool=object(), dump_id="dump-1", dump_date=date(2026, 9, 1))
+        outcome = await pipeline.run_embedding_pipeline(pool=_LockPool(), dump_id="dump-1", dump_date=date(2026, 9, 1))
 
         assert outcome is result
         assert record_computation.call_args.args[0] == pipeline.COMPUTATION_NAME
@@ -1247,11 +1252,83 @@ class TestRunEmbeddingPipeline:
         monkeypatch.setattr(pipeline, "record_embedding_rows_written", record_rows)
 
         with pytest.raises(RuntimeError, match="boom"):
-            await pipeline.run_embedding_pipeline(pool=object(), dump_id="dump-1", dump_date=date(2026, 9, 1))
+            await pipeline.run_embedding_pipeline(pool=_LockPool(), dump_id="dump-1", dump_date=date(2026, 9, 1))
 
         assert record_computation.call_args.kwargs == {"success": False}
         record_failure.assert_called_once_with()
         record_rows.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_holds_the_run_lock_from_the_first_step_to_the_last(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        log: list[str] = []
+        result = pipeline.LoadResult(method_version="m", model_version="m@dump-1", rows_written=5, skipped=False)
+
+        async def load(*_args: Any, **_kwargs: Any) -> pipeline.LoadResult:
+            log.append("load")
+            return result
+
+        async def stage(*_args: Any, **_kwargs: Any) -> None:
+            log.append("similar")
+
+        monkeypatch.setattr(pipeline, "load_embeddings", load)
+        monkeypatch.setattr(pipeline, "run_similar_artists", stage)
+        monkeypatch.setattr(pipeline, "record_computation", Mock())
+        monkeypatch.setattr(pipeline, "record_embedding_rows_written", Mock())
+
+        pool = _LockPool(log)
+        await pipeline.run_embedding_pipeline(pool=pool, dump_id="dump-1", dump_date=date(2026, 9, 1), similar_artists_spool_dir=tmp_path)
+
+        assert log == [f"sql:{pipeline._ADVISORY_LOCK_SQL}", "load", "similar", f"sql:{pipeline._ADVISORY_UNLOCK_SQL}"]
+        assert pool.keys == [(pipeline.EMBEDDING_PIPELINE_LOCK_KEY,), (pipeline.EMBEDDING_PIPELINE_LOCK_KEY,)]
+
+    @pytest.mark.asyncio
+    async def test_releases_the_run_lock_when_a_step_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log: list[str] = []
+        monkeypatch.setattr(pipeline, "load_embeddings", AsyncMock(side_effect=RuntimeError("boom")))
+        monkeypatch.setattr(pipeline, "record_computation", Mock())
+        monkeypatch.setattr(pipeline, "record_embedding_pipeline_failure", Mock())
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await pipeline.run_embedding_pipeline(pool=_LockPool(log), dump_id="dump-1", dump_date=date(2026, 9, 1))
+
+        assert log == [f"sql:{pipeline._ADVISORY_LOCK_SQL}", f"sql:{pipeline._ADVISORY_UNLOCK_SQL}"]
+
+    @pytest.mark.asyncio
+    async def test_a_lock_that_cannot_be_taken_fails_before_any_work(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        load = AsyncMock()
+        monkeypatch.setattr(pipeline, "load_embeddings", load)
+        monkeypatch.setattr(pipeline, "record_embedding_pipeline_failure", Mock())
+        monkeypatch.setattr(pipeline, "record_computation", Mock())
+
+        with pytest.raises(RuntimeError, match="lock lost"):
+            await pipeline.run_embedding_pipeline(pool=_LockPool(fail_lock=True), dump_id="dump-1", dump_date=date(2026, 9, 1))
+
+        load.assert_not_awaited()
+
+
+class _LockConnection:
+    def __init__(self, pool: _LockPool) -> None:
+        self.pool = pool
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        if sql == pipeline._ADVISORY_LOCK_SQL and self.pool.fail_lock:
+            raise RuntimeError("lock lost")
+        self.pool.log.append(f"sql:{sql}")
+        self.pool.keys.append(tuple(params))
+
+
+class _LockPool:
+    """A pool whose one `connection()` records the advisory-lock calls in order, into `log`."""
+
+    def __init__(self, log: list[str] | None = None, *, fail_lock: bool = False, close: bool = False) -> None:
+        self.log = log if log is not None else []
+        self.fail_lock = fail_lock
+        self.keys = []
+        self.close = AsyncMock() if close else None  # `_run` closes its pool
+
+    @contextlib.asynccontextmanager
+    async def connection(self) -> AsyncIterator[_LockConnection]:
+        yield _LockConnection(self)
 
 
 @pytest.mark.asyncio
@@ -1268,7 +1345,7 @@ async def test_monthly_entrypoint_keeps_unaccepted_publication_off_by_default(mo
         enable_similar_artists=enabled,
     )
     result = pipeline.LoadResult(method_version="m", model_version="m@dump-1", rows_written=0, skipped=True)
-    pool = Mock(close=AsyncMock())
+    pool = _LockPool(close=True)
     load = AsyncMock(return_value=result)
     stage = AsyncMock()
     monkeypatch.setattr(pipeline, "_initialize_pool", AsyncMock(return_value=pool))
