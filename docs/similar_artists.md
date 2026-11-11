@@ -136,6 +136,19 @@ Why these signals and not the others:
 
 If the lock or an embeddings write blocks, or a latch is in progress, the run does not compute, writes nothing, and exits `skipped` with the reason. If the check itself fails (the query errors, or the role cannot read the latch table), the run exits `failed` (exit 1). It never proceeds unchecked.
 
+### Role privileges
+
+The job connects as a LOGIN role that is a member of the NOLOGIN `embedding_pipeline` group role (ADR 0013). Every query it runs must be covered by the grants database-schema gives that group role (`_PIPELINE_ROLE_STATEMENTS` and the similarity grants in `groovemap_schema/postgres.py`), which are the only privileges the role has:
+
+| Query | Needs |
+| --- | --- |
+| Target resolution: `artist_embeddings` and `artist_embedding_releases` reads | `SELECT` on both |
+| Load check: loader latch read | `SELECT` on `public.loader_extraction_latch` (**gm-database-schema-37cl**) |
+| Load check: `pg_locks`, `pg_stat_activity`, `pg_backend_pid()` | None beyond `PUBLIC`. `backend_xid` is shown only for sessions of the same role (or a `pg_read_all_stats` member), so the write signal sees the pipeline's own transaction and nothing else's. |
+| Read, write and publish the lists | `SELECT`, `INSERT`, `UPDATE`, `DELETE` on `public.artist_similar_artists` and `public.artist_embedding_releases`, `USAGE` on `artist_embedding_releases_release_id_seq` |
+
+Until database-schema releases 37cl, the role cannot read the latch and the load check raises, so the job exits `failed` every night. `tests/integration/test_similar_artists_job_role_integration.py` guards this: see [Testing](#testing).
+
 ### What one run does
 
 1. **Lock.** It takes an exclusive `flock` on `<spool-dir>/.lock`, so two runs never write one spool. If another run holds it, this one fails (exit 1) without touching anything.
@@ -186,6 +199,7 @@ All tests use synthetic vectors and ids.
 - `tests/test_similar_artists_job.py` covers the nightly entry point. A synthetic catalog is split across several deadline-bounded runs, with the deadline driven by a fake clock that advances per finished block: each pause leaves a valid checkpoint at a block boundary and no temporary file, the final spool is byte-identical to one uninterrupted run, the COPY rows equal the uninterrupted run's, the release is published exactly once, the spool is removed, and re-running after publish is a no-op. It also covers a deadline already past, a compute that finishes past the deadline (publish deferred to the next window), target resolution, the refusal of `/tmp` and other non-persistent spool directories (through symlinks too), the lock, the deadline arithmetic, and the exit codes and status line.
 - `tests/test_similar_artists.py` covers the spool, checkpoint resume, the COPY rows, publish and rotate, and the monthly stage against in-memory fakes. Its memory-guard tests include one that runs the compute in a fresh process with the real `getrusage` peak and a budget the running lists must exceed, and checks that the guard stops the run and leaves the spool incomplete.
 - `just test-integration-pg18` starts a disposable official PostgreSQL 18 container (the digest database-schema's required tier pins), applies database-schema's own `create_postgres_schema`, and runs `tests/integration/test_similar_artists_integration.py` as the real `embedding_pipeline` role. That covers COPY quoting and order, rollback of a failed COPY, refusing to overwrite a published release, publication, keeping the current and previous releases, and retiring older ones. The similarity tables need no pgvector, so the bare image is enough. There is no PostgreSQL 19 GA image yet, so this PG18 tier is the one to run. `just test-integration-pg19` runs the same suite, plus the embedding pipeline's, on the local PG19 beta + pgvector image when one is built. It is advisory.
+- `tests/integration/test_similar_artists_job_role_integration.py` runs `analytics-engine-similar-artists` as a child process on PostgreSQL 18 with pgvector, connected as a LOGIN member of `embedding_pipeline` (`just test-integration-pgvector`, so CI's integration tier runs it). The schema and the role's grants come from the pinned `groovemap-database-schema` revision's own `create_postgres_schema`, never from a copy here. The child's environment holds only that login's credentials, so no job query runs as the owner or a superuser; the owner connection seeds and reads back. On a small synthetic catalog it covers `--skip-check-only` (run, skip on an in-progress latch, run past a finished or stale latch, skip with the embeddings advisory lock held from another session, skip with an uncommitted write to `artist_embeddings`), a skipped run that writes nothing, a deadline-bounded paused run, the resume, the publish, and the no-op rerun. It asserts exit codes and the status JSON. While the pinned database-schema lacks the latch grant (gm-database-schema-37cl), `test_load_check_fails_on_the_latch_read_without_the_grant` asserts the `permission denied` failure and the other cases report XFAIL naming the bead. When the pin is bumped to a release that carries it, that test skips and the others must pass. To bump: change the one `groovemap-database-schema` `rev` in `pyproject.toml`, run `uv lock`.
 
 ## Sizing run
 
