@@ -34,7 +34,9 @@ def test_similar_artists_forwards_argv_verbatim_and_exit_code(monkeypatch: pytes
     assert seen == [argv]
 
 
-def test_similar_artists_status_line_and_exit_match_script(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+def test_similar_artists_status_line_and_exit_match_script(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
     """Through the real job `main` with an injected run: same JSON status line and exit code as the script."""
     status = similar_artists_job.failed_status(RuntimeError("boom"), 1.0)
 
