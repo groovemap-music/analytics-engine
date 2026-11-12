@@ -14,6 +14,7 @@ and ``--help`` stay cheap and never start the server.
 import sys
 from typing import NoReturn
 
+
 USAGE = """\
 usage: analytics-engine [similar-artists|embeddings] [args...]
 
