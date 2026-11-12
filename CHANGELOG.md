@@ -2,11 +2,15 @@
 
 All notable changes to this project will be documented here by Commitizen.
 
-## Unreleased
+## v0.10.0 (2026-11-12)
 
 ### Release notes
 
 `analytics-engine` (the image's ENTRYPOINT) is now a subcommand dispatcher (`insights/cli.py`, gm-analytics-engine-ej6s): `similar-artists [args]` runs `analytics-engine-similar-artists`, `embeddings` runs `analytics-engine-embeddings`, no arguments still starts insights, and an unknown subcommand prints usage and exits 2 without binding a port. Schedulers that can only set arguments (Cronduit, Kubernetes args, Ofelia) can now run the jobs from the published image. The two job scripts are unchanged.
+
+### Feat
+
+- **cli**: dispatch similar-artists and embeddings subcommands from the image entrypoint
 
 ## v0.9.0 (2026-11-11)
 
