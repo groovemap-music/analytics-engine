@@ -93,6 +93,14 @@ analytics-engine-similar-artists --spool-dir /srv/analytics-engine/similar-artis
   --deadline 2026-11-12T06:00:00Z --threads 8 --status-file /srv/analytics-engine/similar-artists/status.json
 ```
 
+The same job is a subcommand of the image's default entrypoint (`/app/.venv/bin/analytics-engine`), for schedulers that can only set arguments (Cronduit `cmd`, Kubernetes `args`, Ofelia): leave the entrypoint alone and pass the rest as the command. Arguments are forwarded verbatim, and the exit codes and the final JSON status line are the script's.
+
+```sh
+docker run --rm <image> similar-artists --spool-dir /spool --max-runtime 19800 --threads 8
+```
+
+`analytics-engine` with no arguments still starts the insights server, `embeddings` runs the monthly load, and an unknown subcommand prints usage and exits 2 without starting the server. The image's `HEALTHCHECK` probes the insights port (8009), which a job container does not serve, so a job run can show as `unhealthy` while it runs. Nothing acts on that state (Docker does not stop containers for it); read the job's exit code and status line instead.
+
 | Option | Meaning |
 | --- | --- |
 | `--model-version V` | The `model_version` to compute. Default: the one `model_version` in `artist_embeddings` without a published release. If every version there is published, the run is `done` and does nothing; if several are unpublished, it fails with exit 2 and asks for this option. |

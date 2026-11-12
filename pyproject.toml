@@ -39,7 +39,7 @@ dependencies = [
 ]
 
 [project.scripts]
-analytics-engine = "insights.insights:main"
+analytics-engine = "insights.cli:main"
 analytics-engine-embeddings = "insights.embedding_pipeline:main"
 analytics-engine-similar-artists = "insights.similar_artists_job:main"
 
