@@ -102,6 +102,10 @@ image: build prepare-runtime-wheel
     bash scripts/build-image.sh
     docker run --rm --entrypoint /app/.venv/bin/python analytics-engine:local -c 'import insights.insights'
     test "$(docker run --rm --entrypoint /usr/bin/id analytics-engine:local -u):$(docker run --rm --entrypoint /usr/bin/id analytics-engine:local -g)" = "1000:1000"
+    # The default entrypoint dispatches subcommands (args-only schedulers); an unknown one exits 2, never serving.
+    docker run --rm analytics-engine:local similar-artists --help | grep -q -- --spool-dir
+    docker run --rm analytics-engine:local --help | grep -q 'usage: analytics-engine'
+    test "$(docker run --rm analytics-engine:local bogus >/dev/null 2>&1; echo $?)" = "2"
     uv run python scripts/check-image-metadata.py analytics-engine:local
 
 bump-preview:
