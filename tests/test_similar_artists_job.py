@@ -224,7 +224,14 @@ class _PublishingRegistry(_FakeRegistry):
 
 
 async def _run(
-    db: _Db, root: Path, registry: _FakeRegistry, clock: _BlockClock | None = None, *, window_s: float | None = None, model_version: str | None = None
+    db: _Db,
+    root: Path,
+    registry: _FakeRegistry,
+    clock: _BlockClock | None = None,
+    *,
+    window_s: float | None = None,
+    model_version: str | None = None,
+    wall_now: datetime | None = None,
 ) -> job.JobStatus:
     deadline = None if clock is None or window_s is None else clock.now + window_s
     return await job.run_job(
@@ -239,6 +246,7 @@ async def _run(
         checkpoint_every_s=10**9,
         k=K,
         block_rows=BLOCK_ROWS,
+        wall_now=wall_now,
     )
 
 

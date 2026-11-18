@@ -161,7 +161,7 @@ class TestRunJobLoadCheck:
         db = _LoadDb(_vectors(100, dim=8), latches=(("discogs", "20261101", ["artist"], NOW - timedelta(hours=2), None),))
         registry = _PublishingRegistry(db)
 
-        status = await _run(db, tmp_path, registry)
+        status = await _run(db, tmp_path, registry, wall_now=NOW)
 
         assert (status.status, status.exit_code, status.decision, status.published) == ("skipped", 0, "skip", False)
         assert status.model_version == "m2"
@@ -175,7 +175,7 @@ class TestRunJobLoadCheck:
         db = _LoadDb(_vectors(100, dim=8), writes=1)
         registry = _PublishingRegistry(db)
 
-        status = await _run(db, tmp_path, registry)
+        status = await _run(db, tmp_path, registry, wall_now=NOW)
 
         assert (status.status, status.exit_code, status.decision) == ("skipped", 0, "skip")
         assert "uncommitted writes to public.artist_embeddings" in (status.reason or "")
@@ -187,7 +187,7 @@ class TestRunJobLoadCheck:
         db = _LoadDb(_vectors(100, dim=8), lock_holders=1)
         registry = _PublishingRegistry(db)
 
-        status = await _run(db, tmp_path, registry)
+        status = await _run(db, tmp_path, registry, wall_now=NOW)
 
         assert (status.status, status.exit_code, status.decision, status.published) == ("skipped", 0, "skip", False)
         assert "run lock" in (status.reason or "")
@@ -199,7 +199,7 @@ class TestRunJobLoadCheck:
         db = _LoadDb(_vectors(100, dim=8), latches=(("musicbrainz", "20261001", None, NOW - timedelta(hours=400), None),))
         registry = _PublishingRegistry(db)
 
-        status = await _run(db, tmp_path, registry, _BlockClock())
+        status = await _run(db, tmp_path, registry, _BlockClock(), wall_now=NOW)
 
         assert (status.status, status.exit_code, status.decision, status.published) == ("done", 0, "run", True)
         assert "past the 48 h bound: ignored" in (status.reason or "")
@@ -210,7 +210,7 @@ class TestRunJobLoadCheck:
         db = _LoadDb(_vectors(100, dim=8), latches=(("discogs", "20261101", ["artist", "label"], NOW - timedelta(hours=3), NOW),))
         registry = _PublishingRegistry(db)
 
-        status = await _run(db, tmp_path, registry, _BlockClock())
+        status = await _run(db, tmp_path, registry, _BlockClock(), wall_now=NOW)
 
         assert (status.status, status.exit_code, status.decision, status.reason, status.published) == ("done", 0, "run", None, True)
         assert registry.publishes == 1
